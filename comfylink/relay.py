@@ -154,9 +154,13 @@ class RelayClient:
         return await self._json("POST", f"/v1/jobs/{job_id}/progress",
                                 {"status": status, "progress": value, "max": maximum})
 
-    async def result(self, job_id: str, status: str, images: list[dict], error: str = "") -> None:
-        await self._json("POST", f"/v1/jobs/{job_id}/result",
-                         {"status": status, "images": images, "error": error})
+    async def result(self, job_id: str, status: str, images: list[dict], error: str = "",
+                     error_code: str = "", total_bytes: int = 0) -> None:
+        body: dict = {"status": status, "images": images, "error": error,
+                      "total_bytes": total_bytes}
+        if error_code:
+            body["error_code"] = error_code
+        await self._json("POST", f"/v1/jobs/{job_id}/result", body)
 
     async def sign_upload(self, job_id: str, kind: str, filename: str, content_type: str) -> tuple[str, str]:
         """Request a presigned PUT URL. Returns (r2_key, url)."""

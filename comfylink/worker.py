@@ -19,7 +19,13 @@ import aiohttp
 from .auth import TokenAuth
 from .comfy import ComfyClient
 from .config import RELAY_URL, STATE, detect_comfy_url
-from .jobs import apply_inputs, content_type_for, extract_output_images, progress_event
+from .jobs import (
+    apply_inputs,
+    convert_if_webp,
+    extract_output_images,
+    progress_event,
+    within_cap,
+)
 from .log import log
 from .relay import RelayClient, RelayError
 from .status import STATUS
@@ -61,9 +67,22 @@ class Worker:
             await self._stage_inputs(prompt, inputs)
             await self.relay.progress(job_id, "running", 0, 0)
             prompt_id = await self._run_prompt(job_id, prompt)
-            images = await self._upload_outputs(job_id, prompt_id)
-            await self.relay.result(job_id, "done", images)
-            log.info("job %s done (%d image(s))", job_id, len(images))
+            max_bytes = int(job.get("max_output_bytes") or 0)
+            output_format = job.get("output_format") or "png"
+            images, total = await self._collect_outputs(prompt_id, output_format)
+            if not within_cap(total, max_bytes):
+                await self.relay.result(
+                    job_id, "failed", [], "output exceeds your plan",
+                    error_code="output_too_large", total_bytes=total,
+                )
+                log.warning(
+                    "job %s output %.1f MB exceeds cap %.1f MB — skipped upload",
+                    job_id, total / 1048576, max_bytes / 1048576,
+                )
+                return "failed"
+            uploaded = await self._upload_outputs(job_id, images)
+            await self.relay.result(job_id, "done", uploaded, total_bytes=total)
+            log.info("job %s done (%d image(s), %.1f MB)", job_id, len(uploaded), total / 1048576)
             return "done"
         except JobCanceled:
             await self.relay.result(job_id, "canceled", [], "canceled")
@@ -114,16 +133,36 @@ class Worker:
                     break
         raise JobFailed("websocket closed before completion")
 
-    async def _upload_outputs(self, job_id: str, prompt_id: str) -> list[dict]:
+    async def _collect_outputs(
+        self, prompt_id: str, output_format: str
+    ) -> tuple[list[dict], int]:
+        """Fetch each output's bytes, optionally convert to WebP, and measure.
+
+        Returns ``(items, total_bytes)`` where each item carries the (possibly
+        converted) ``data``/``filename``/``content_type`` plus the original
+        subfolder/type. WebP conversion happens BEFORE measuring so it actually
+        helps the user fit under their cap. No upload happens here.
+        """
         history = await self.comfy.history(prompt_id)
-        out: list[dict] = []
+        items: list[dict] = []
+        total = 0
         for im in extract_output_images(history, prompt_id):
-            data = await self.comfy.view(im["filename"], im["subfolder"], im["type"])
-            ct = content_type_for(im["filename"])
-            key, url = await self.relay.sign_upload(job_id, "output", im["filename"], ct)
-            await self.relay.put_object(url, data, ct)
-            out.append({"r2_key": key, "filename": im["filename"],
-                        "subfolder": im["subfolder"], "type": im["type"]})
+            raw = await self.comfy.view(im["filename"], im["subfolder"], im["type"])
+            data, filename, ct = convert_if_webp(raw, im["filename"], output_format)
+            total += len(data)
+            items.append({"data": data, "filename": filename, "content_type": ct,
+                          "subfolder": im["subfolder"], "type": im["type"]})
+        return items, total
+
+    async def _upload_outputs(self, job_id: str, items: list[dict]) -> list[dict]:
+        """Upload already-collected output bytes to R2; return relay payloads."""
+        out: list[dict] = []
+        for it in items:
+            ct = it["content_type"]
+            key, url = await self.relay.sign_upload(job_id, "output", it["filename"], ct)
+            await self.relay.put_object(url, it["data"], ct)
+            out.append({"r2_key": key, "filename": it["filename"],
+                        "subfolder": it["subfolder"], "type": it["type"]})
         return out
 
 

@@ -6,7 +6,16 @@ ComfyUI.
 
 from __future__ import annotations
 
+import os
+from io import BytesIO
 from typing import Any
+
+from .log import log
+
+# Quality for PNG->WebP re-encode. 90 is a good size/fidelity tradeoff: it
+# shrinks typical diffusion outputs well below their PNG size while staying
+# visually lossless enough for the subscription "convert to WebP" feature.
+WEBP_QUALITY = 90
 
 
 def content_type_for(filename: str) -> str:
@@ -19,6 +28,53 @@ def content_type_for(filename: str) -> str:
     if lower.endswith((".jpg", ".jpeg")):
         return "image/jpeg"
     return "application/octet-stream"
+
+
+def convert_if_webp(data: bytes, filename: str, output_format: str) -> tuple[bytes, str, str]:
+    """Optionally re-encode output image bytes to WebP.
+
+    Returns ``(data, filename, content_type)``. When ``output_format`` is
+    ``"webp"`` the bytes are decoded with Pillow and re-saved as WebP, the
+    filename extension is swapped to ``.webp`` and the content-type becomes
+    ``image/webp``. For any other format (default ``"png"``) the inputs pass
+    through unchanged, with the content-type derived from the filename.
+
+    Conversion is wrapped in try/except: if Pillow can't open/encode the bytes
+    (odd format, truncated data, PIL missing) we fall back to the original
+    bytes/filename so a job is never crashed by the WebP step.
+    """
+    if (output_format or "").lower() != "webp":
+        return data, filename, content_type_for(filename)
+    try:
+        from PIL import Image  # imported lazily — only needed when converting
+
+        im = Image.open(BytesIO(data))
+        buf = BytesIO()
+        im.save(buf, format="WEBP", quality=WEBP_QUALITY)
+        webp = buf.getvalue()
+        new_name = _swap_ext(filename, ".webp")
+        return webp, new_name, "image/webp"
+    except Exception as e:  # noqa: BLE001 - never let conversion crash a job
+        log.warning("webp conversion failed for %s (%s); shipping original", filename, e)
+        return data, filename, content_type_for(filename)
+
+
+def _swap_ext(filename: str, new_ext: str) -> str:
+    """Replace a filename's extension (e.g. ``a.png`` -> ``a.webp``)."""
+    root, _ = os.path.splitext(filename)
+    return (root or filename) + new_ext
+
+
+def within_cap(total_bytes: int, max_output_bytes: int) -> bool:
+    """Decide whether outputs totaling ``total_bytes`` may be uploaded.
+
+    A non-positive ``max_output_bytes`` means "unlimited" (0/absent = legacy
+    safety), so it always allows. Otherwise the total must not exceed the cap.
+    Pure + separately testable (no I/O).
+    """
+    if max_output_bytes <= 0:
+        return True
+    return total_bytes <= max_output_bytes
 
 
 def extract_output_images(history: dict, prompt_id: str) -> list[dict]:
