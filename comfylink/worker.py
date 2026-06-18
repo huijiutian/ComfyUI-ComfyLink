@@ -222,7 +222,7 @@ async def _register(relay: RelayClient, comfy: ComfyClient) -> None:
         raise
     try:
         oi = await comfy.object_info()
-        await relay.put_object_info(STATE.backend_id, oi)
+        await relay.upload_object_info(STATE.backend_id, oi)
         STATUS.set(state="online", node_count=len(oi), error="")
         log.info("registered backend %s (%d node types)", STATE.backend_id, len(oi))
     except Exception as e:  # noqa: BLE001 - online even if object_info upload failed

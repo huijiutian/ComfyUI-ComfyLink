@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import socket
 from typing import Optional
@@ -129,9 +130,25 @@ class RelayClient:
         return await self._json("POST", "/v1/backends/register",
                                 {"backend_id": backend_id, "name": name})
 
-    async def put_object_info(self, backend_id: str, object_info: dict) -> None:
-        await self._json("POST", "/v1/backends/object-info",
-                         {"backend_id": backend_id, "object_info": object_info})
+    async def sign_object_info(self, backend_id: str) -> tuple[str, str]:
+        """Request a presigned PUT URL for this backend's object_info snapshot.
+
+        Returns (key, url). The relay returns 503 if R2 isn't configured.
+        """
+        d = await self._json("POST", "/v1/backends/object-info/sign",
+                             {"backend_id": backend_id})
+        return d["key"], d["url"]
+
+    async def upload_object_info(self, backend_id: str, object_info: dict) -> None:
+        """Snapshot object_info to R2: sign a PUT, then upload the JSON to it.
+
+        The blob no longer goes through the relay (egress fix) — we ship it
+        straight to object storage via a presigned PUT. The SSRF guard in
+        put_object passes for the https R2 URL the relay hands back.
+        """
+        _key, url = await self.sign_object_info(backend_id)
+        data = json.dumps(object_info).encode()
+        await self.put_object(url, data, "application/json")
 
     async def heartbeat(self, backend_id: str) -> None:
         await self._json("POST", "/v1/backends/heartbeat", {"backend_id": backend_id})
