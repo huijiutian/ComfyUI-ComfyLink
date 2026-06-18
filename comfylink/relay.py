@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import ipaddress
+import os
+import socket
 from typing import Optional
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -10,11 +14,89 @@ import aiohttp
 CLAIM_TIMEOUT = aiohttp.ClientTimeout(total=45)
 DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
+# Cap on object-storage downloads (input images). Bounds memory so a malicious
+# or buggy relay can't point get_object at a huge/endless body and OOM the host.
+MAX_OBJECT_BYTES = 64 * 1024 * 1024  # 64 MiB
+_DOWNLOAD_CHUNK = 256 * 1024
+
 
 class RelayError(RuntimeError):
     def __init__(self, message: str, status: int = 0):
         super().__init__(message)
         self.status = status
+
+
+def _insecure_allowed() -> bool:
+    """Dev/integration escape hatch.
+
+    The throwaway integration harness runs a fake ComfyUI + fake R2 on
+    127.0.0.1, which the SSRF block below would otherwise reject. Setting
+    COMFYLINK_ALLOW_INSECURE=1 skips the private-IP check and allows http so
+    that harness keeps working. OFF by default => production is locked down.
+    """
+    return os.environ.get("COMFYLINK_ALLOW_INSECURE", "").strip() in ("1", "true", "yes")
+
+
+def _ip_is_blocked(ip: str) -> bool:
+    """True if `ip` is loopback/private/link-local/reserved — i.e. an SSRF
+    target we must never fetch from (cloud metadata 169.254.169.254, localhost
+    services, internal hosts). Pure + separately testable (no DNS)."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        # Not parseable as an IP -> treat as unsafe rather than fail open.
+        return True
+    return (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+        # IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1) — classify by the embedded v4.
+        or (getattr(addr, "ipv4_mapped", None) is not None and _ip_is_blocked(str(addr.ipv4_mapped)))
+    )
+
+
+def _validate_url(url: str) -> None:
+    """SSRF guard for relay-supplied (presigned R2) URLs.
+
+    The relay hands us arbitrary GET/PUT URLs; a compromised relay or a crafted
+    job payload could aim them at internal services or the cloud metadata
+    endpoint. We require https and reject any URL whose host resolves to a
+    private/loopback/link-local/reserved address.
+
+    Note on host allowlisting: we deliberately do NOT pin an R2 host suffix.
+    The plugin doesn't know the bucket/account host statically (it's chosen by
+    the relay at sign time), so a static allowlist would be brittle. The
+    resolved-IP block is the must-have defense and is sufficient to stop the
+    metadata endpoint and localhost. Raises RelayError on rejection.
+    """
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    host = parts.hostname
+
+    if _insecure_allowed():
+        # Dev harness: allow http + localhost, skip the private-IP block.
+        if scheme not in ("http", "https"):
+            raise RelayError(f"refusing non-http(s) URL: {scheme or '<none>'}")
+        return
+
+    if scheme != "https":
+        raise RelayError(f"refusing non-https URL (scheme {scheme or '<none>'})")
+    if not host:
+        raise RelayError("refusing URL with no host")
+
+    # Resolve and check EVERY returned address (defeats DNS that returns both a
+    # public and a private record, and IPv6/IPv4 splits).
+    try:
+        infos = socket.getaddrinfo(host, parts.port or 443, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        raise RelayError(f"cannot resolve host {host!r}: {e}")
+    for info in infos:
+        ip = info[4][0]
+        if _ip_is_blocked(ip):
+            raise RelayError(f"refusing URL to non-public address ({host} -> {ip})")
 
 
 async def redeem_pair_code(
@@ -85,14 +167,26 @@ class RelayClient:
 
     async def put_object(self, url: str, data: bytes, content_type: str) -> None:
         """Upload bytes to object storage via a presigned PUT URL (no auth header)."""
+        _validate_url(url)  # SSRF guard: relay-supplied URL.
         async with self._session.put(url, data=data, headers={"Content-Type": content_type}) as r:
             if r.status >= 300:
                 raise RelayError(f"storage PUT {r.status}: {await r.text()}")
 
-    async def get_object(self, url: str) -> bytes:
+    async def get_object(self, url: str, max_bytes: int = MAX_OBJECT_BYTES) -> bytes:
+        _validate_url(url)  # SSRF guard: relay-supplied URL.
         async with self._session.get(url) as r:
             r.raise_for_status()
-            return await r.read()
+            # Reject up front if the server advertises an oversized body...
+            clen = r.content_length
+            if clen is not None and clen > max_bytes:
+                raise RelayError(f"object too large: {clen} > {max_bytes} bytes")
+            # ...and enforce while streaming in case Content-Length lies/absent.
+            buf = bytearray()
+            async for chunk in r.content.iter_chunked(_DOWNLOAD_CHUNK):
+                buf.extend(chunk)
+                if len(buf) > max_bytes:
+                    raise RelayError(f"object exceeded {max_bytes} bytes")
+            return bytes(buf)
 
     async def _json(self, method: str, path: str, body: dict) -> dict:
         async with self._session.request(

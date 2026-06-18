@@ -78,18 +78,31 @@ class State:
         return bool(self.device_token)
 
     def save(self) -> None:
+        # The state file holds the device bearer token (clr_..., full capability
+        # to drive this backend, never expires). On a shared/multi-user host a
+        # default-umask 0644 file would let any local user read that token, so we
+        # create it 0600 (owner read/write only) from the start — never even
+        # briefly world-readable. On Windows os.chmod with these mode bits is a
+        # best-effort no-op and does not throw.
         try:
             p = _state_path()
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(
-                json.dumps({
-                    "backend_id": self.backend_id,
-                    "device_token": self.device_token,
-                    "device_id": self.device_id,
-                    "backend_name": self.backend_name,
-                }),
-                "utf-8",
-            )
+            data = json.dumps({
+                "backend_id": self.backend_id,
+                "device_token": self.device_token,
+                "device_id": self.device_id,
+                "backend_name": self.backend_name,
+            })
+            # Create with 0600 atomically (O_CREAT honors the mode only on
+            # creation), then chmod to also tighten a pre-existing file that may
+            # have been written world-readable before this fix landed.
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(data)
+            try:
+                os.chmod(p, 0o600)
+            except OSError:
+                pass
         except Exception:
             pass
 
