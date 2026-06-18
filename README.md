@@ -54,6 +54,13 @@ you can also unpair it from the app. Either way, access stops immediately.
 - A small `comfylink_state.json` is written next to the node to remember the
   pairing; it's local and git-ignored — don't commit it.
 
+## Version
+
+The current version is tracked in `comfylink/version.py` (`__version__`) and
+mirrored in `pyproject.toml`, which follows the
+[Comfy Registry](https://registry.comfy.org) conventions for publishing. The
+sidebar panel shows the running version.
+
 ## License
 
 MIT

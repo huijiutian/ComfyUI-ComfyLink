@@ -15,6 +15,7 @@ from .config import RELAY_URL, STATE
 from .log import log
 from .relay import redeem_pair_code
 from .status import STATUS
+from .version import __version__
 
 
 def register() -> None:
@@ -31,6 +32,7 @@ def register() -> None:
         snap["paired"] = STATE.paired
         snap["backend_name"] = STATE.backend_name
         snap["relay_url"] = RELAY_URL
+        snap["version"] = __version__
         # no-store: the panel polls this; browsers must not serve a stale value.
         return web.json_response(snap, headers=_NO_CACHE)
 

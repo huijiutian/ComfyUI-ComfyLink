@@ -85,7 +85,13 @@ function buildPanel(root) {
 
   const msg = h("div", { style: "margin-top:10px;min-height:18px;color:#f44336;" });
 
-  root.append(statusRow, detail, pairForm, unpairBtn, msg);
+  // small, unobtrusive version line; filled from the status response.
+  const versionLine = h("div", {
+    style: "margin-top:14px;color:var(--descrip-text,#888);font-size:11px;opacity:0.7;",
+    textContent: "ComfyLink",
+  });
+
+  root.append(statusRow, detail, pairForm, unpairBtn, msg, versionLine);
 
   async function refresh() {
     let s;
@@ -103,6 +109,8 @@ function buildPanel(root) {
     if (s.state === "online") lines.push(`Nodes: ${s.node_count}`);
     if (s.error) lines.push(`Note: ${s.error}`);
     detail.textContent = lines.join("\n");
+
+    if (s.version) versionLine.textContent = `ComfyLink v${s.version}`;
 
     const paired = !!s.paired;
     pairForm.style.display = paired ? "none" : "block";

@@ -14,6 +14,7 @@ import asyncio
 import threading
 
 from .comfylink.log import log
+from .comfylink.version import __version__
 from .comfylink.worker import serve
 
 # ComfyUI looks for these. We contribute no nodes, but we ship a web extension.
@@ -21,7 +22,12 @@ NODE_CLASS_MAPPINGS: dict = {}
 NODE_DISPLAY_NAME_MAPPINGS: dict = {}
 WEB_DIRECTORY = "./web"
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
+__all__ = [
+    "NODE_CLASS_MAPPINGS",
+    "NODE_DISPLAY_NAME_MAPPINGS",
+    "WEB_DIRECTORY",
+    "__version__",
+]
 
 # Register the panel's HTTP routes (best-effort; never break ComfyUI startup).
 try:
