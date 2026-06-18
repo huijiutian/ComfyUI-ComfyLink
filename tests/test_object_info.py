@@ -21,6 +21,27 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from comfylink.relay import RelayClient  # noqa: E402
+from comfylink.worker import object_info_hash  # noqa: E402
+
+
+class TestObjectInfoHash(unittest.TestCase):
+    def test_stable_for_equal_dicts(self):
+        a = {"KSampler": {"input": {"x": 1}}, "LoadImage": {}}
+        # Same content, different insertion order — sort_keys makes it identical.
+        b = {"LoadImage": {}, "KSampler": {"input": {"x": 1}}}
+        self.assertEqual(object_info_hash(a), object_info_hash(b))
+        # And idempotent on the exact same object.
+        self.assertEqual(object_info_hash(a), object_info_hash(a))
+
+    def test_differs_when_changed(self):
+        base = {"KSampler": {"input": {}}}
+        added = {"KSampler": {"input": {}}, "NewCustomNode": {"input": {}}}
+        self.assertNotEqual(object_info_hash(base), object_info_hash(added))
+
+    def test_returns_md5_hexdigest(self):
+        h = object_info_hash({"A": {}})
+        self.assertEqual(len(h), 32)
+        int(h, 16)  # hex-decodable
 
 
 class TestUploadObjectInfo(unittest.IsolatedAsyncioTestCase):
@@ -74,7 +95,10 @@ class TestRegisterToleratesUploadFailure(unittest.IsolatedAsyncioTestCase):
         # Upload blows up (e.g. relay 503 because R2 unconfigured).
         relay.upload_object_info.side_effect = RuntimeError("503 R2 not configured")
 
-        with mock.patch.object(worker, "STATUS") as status:
+        # Fresh state object so we don't touch the real on-disk state.
+        fake_state = _FakeState(backend_id="b1", object_info_hash="")
+        with mock.patch.object(worker, "STATUS") as status, \
+                mock.patch.object(worker, "STATE", fake_state):
             # Should NOT raise — failure is tolerated.
             await worker._register(relay, comfy)
 
@@ -83,6 +107,84 @@ class TestRegisterToleratesUploadFailure(unittest.IsolatedAsyncioTestCase):
         # Last STATUS.set still flips us online.
         states = [c.kwargs.get("state") for c in status.set.call_args_list]
         self.assertEqual(states[-1], "online")
+        # Failure path must NOT persist the hash — next start retries.
+        self.assertEqual(fake_state.object_info_hash, "")
+        self.assertEqual(fake_state.save_calls, 0)
+
+
+class _FakeState:
+    """DI-friendly stand-in for config.STATE — counts save() calls."""
+
+    def __init__(self, backend_id="b1", backend_name="dev", object_info_hash=""):
+        self.backend_id = backend_id
+        self.backend_name = backend_name
+        self.object_info_hash = object_info_hash
+        self.save_calls = 0
+
+    def save(self):
+        self.save_calls += 1
+
+
+class TestRegisterSkipLogic(unittest.IsolatedAsyncioTestCase):
+    async def test_uploads_and_saves_hash_when_changed(self):
+        from comfylink import worker
+
+        oi = {"A": {}, "B": {}}
+        relay = mock.AsyncMock()
+        comfy = mock.AsyncMock()
+        comfy.object_info.return_value = oi
+
+        state = _FakeState(object_info_hash="")  # first run / nothing stored
+        with mock.patch.object(worker, "STATUS"), \
+                mock.patch.object(worker, "STATE", state):
+            await worker._register(relay, comfy)
+
+        # Hash differs from "" => upload happens and the new hash is persisted.
+        relay.upload_object_info.assert_awaited_once_with(state.backend_id, oi)
+        self.assertEqual(state.object_info_hash, object_info_hash(oi))
+        self.assertEqual(state.save_calls, 1)
+
+    async def test_skips_upload_when_unchanged(self):
+        from comfylink import worker
+
+        oi = {"A": {}, "B": {}}
+        relay = mock.AsyncMock()
+        comfy = mock.AsyncMock()
+        comfy.object_info.return_value = oi
+
+        # Stored hash already matches the current snapshot.
+        state = _FakeState(object_info_hash=object_info_hash(oi))
+        with mock.patch.object(worker, "STATUS") as status, \
+                mock.patch.object(worker, "STATE", state):
+            await worker._register(relay, comfy)
+
+        # Upload is skipped entirely; hash untouched; no save needed.
+        relay.upload_object_info.assert_not_awaited()
+        self.assertEqual(state.save_calls, 0)
+        # Still goes online with node_count set, as before.
+        states = [c.kwargs.get("state") for c in status.set.call_args_list]
+        self.assertEqual(states[-1], "online")
+        node_counts = [c.kwargs.get("node_count") for c in status.set.call_args_list]
+        self.assertIn(len(oi), node_counts)
+
+    async def test_failure_does_not_update_hash(self):
+        from comfylink import worker
+
+        oi = {"A": {}, "B": {}}
+        relay = mock.AsyncMock()
+        comfy = mock.AsyncMock()
+        comfy.object_info.return_value = oi
+        relay.upload_object_info.side_effect = RuntimeError("boom")
+
+        state = _FakeState(object_info_hash="")  # nothing stored, must retry
+        with mock.patch.object(worker, "STATUS"), \
+                mock.patch.object(worker, "STATE", state):
+            await worker._register(relay, comfy)  # tolerated, no raise
+
+        relay.upload_object_info.assert_awaited_once()
+        # Hash stays unset so the next start re-attempts the upload.
+        self.assertEqual(state.object_info_hash, "")
+        self.assertEqual(state.save_calls, 0)
 
 
 if __name__ == "__main__":

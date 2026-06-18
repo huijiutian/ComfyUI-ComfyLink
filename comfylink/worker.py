@@ -11,6 +11,7 @@ driven by the relay instead of a user:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from uuid import uuid4
 
@@ -213,6 +214,18 @@ async def _serve_paired(session, comfy_url, stop) -> None:
         hb.cancel()
 
 
+def object_info_hash(oi: dict) -> str:
+    """Stable content hash of an object_info snapshot.
+
+    sort_keys makes it deterministic regardless of dict ordering, so an
+    unchanged ComfyUI node set always hashes identically across restarts. Pure
+    and side-effect-free => unit-testable on its own.
+    """
+    return hashlib.md5(
+        json.dumps(oi, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 async def _register(relay: RelayClient, comfy: ComfyClient) -> None:
     try:
         await relay.register(STATE.backend_id, STATE.backend_name)
@@ -222,7 +235,22 @@ async def _register(relay: RelayClient, comfy: ComfyClient) -> None:
         raise
     try:
         oi = await comfy.object_info()
-        await relay.upload_object_info(STATE.backend_id, oi)
+        new_hash = object_info_hash(oi)
+        if STATE.object_info_hash and STATE.object_info_hash == new_hash:
+            # object_info bucket is non-expiring: a remembered hash means the
+            # snapshot is still in R2, so skip the (multi-MB) re-upload.
+            log.info(
+                "object_info unchanged (hash %s), skipping upload", new_hash[:12]
+            )
+        else:
+            await relay.upload_object_info(STATE.backend_id, oi)
+            # Only remember the hash after a successful upload — on failure the
+            # except below leaves it untouched so the next start retries.
+            STATE.object_info_hash = new_hash
+            STATE.save()
+            log.info(
+                "uploaded object_info (hash %s)", new_hash[:12]
+            )
         STATUS.set(state="online", node_count=len(oi), error="")
         log.info("registered backend %s (%d node types)", STATE.backend_id, len(oi))
     except Exception as e:  # noqa: BLE001 - online even if object_info upload failed

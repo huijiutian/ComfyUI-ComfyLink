@@ -54,6 +54,11 @@ class State:
         self.device_token: str = ""
         self.device_id: str = ""
         self.backend_name: str = _default_name()
+        # Hash of the last object_info snapshot we successfully uploaded to R2.
+        # Lets _register skip re-uploading an unchanged (multi-MB) snapshot. The
+        # object_info bucket is non-expiring, so a remembered hash guarantees the
+        # object is still there. Empty == "never uploaded" => always uploads.
+        self.object_info_hash: str = ""
 
     @classmethod
     def load(cls) -> "State":
@@ -66,6 +71,8 @@ class State:
                 st.device_token = d.get("device_token", "")
                 st.device_id = d.get("device_id", "")
                 st.backend_name = d.get("backend_name") or st.backend_name
+                # Back-compat: missing in old state files loads as "" (re-upload).
+                st.object_info_hash = d.get("object_info_hash", "")
             except Exception:
                 pass
         if not st.backend_id:
@@ -92,6 +99,7 @@ class State:
                 "device_token": self.device_token,
                 "device_id": self.device_id,
                 "backend_name": self.backend_name,
+                "object_info_hash": self.object_info_hash,
             })
             # Create with 0600 atomically (O_CREAT honors the mode only on
             # creation), then chmod to also tighten a pre-existing file that may
