@@ -34,6 +34,32 @@ from .status import STATUS
 HEARTBEAT_INTERVAL = 25  # seconds
 IDLE_RECHECK = 2  # seconds between "am I paired yet?" checks while unpaired
 
+# JOB_HEARTBEAT_INTERVAL is how often a claimed-but-not-yet-finished job re-pokes
+# the relay's progress endpoint even when ComfyUI emits no new progress. It MUST
+# stay well under the relay's reaper staleThreshold (5 min): the reaper marks any
+# claimed/running job whose updated_at hasn't advanced for that long as failed, so
+# a steady ~20s heartbeat keeps a legitimately long generation alive forever.
+JOB_HEARTBEAT_INTERVAL = 20  # seconds
+
+# EXECUTION_STALL_TIMEOUT is a *no-activity* fallback for the one failure the
+# relay's reaper deliberately won't catch: the backend process is alive (its
+# heartbeat keeps flowing) but a single job's worker is wedged waiting on a
+# ComfyUI that has gone completely silent — no executing/progress/executed, not
+# even a websocket keep-alive frame. The relay's "double confirmation" reaper
+# (job stale AND backend stale) leaves such a job running forever, so the plugin
+# self-heals: if NOTHING arrives on the job's websocket for this long we declare
+# the execution stalled, report failed(error_code='execution_stalled') and free
+# the worker for the next claim.
+#
+# This measures time since the LAST activity, NOT total run time — a legitimately
+# long generation keeps emitting progress (and the ws keep-alive emits frames
+# every ~30s too), so the window resets constantly and a healthy long job NEVER
+# trips it. Only a truly dead/hung ComfyUI stays silent long enough. The default
+# is intentionally generous (10 min of total silence); bump it if you run nodes
+# that can genuinely go quiet for minutes (e.g. a slow external API call) — it
+# only guards against real hangs.
+EXECUTION_STALL_TIMEOUT = 600  # seconds of complete websocket silence
+
 
 class _Revoked(Exception):
     """Device token no longer valid (unpaired from the app)."""
@@ -44,8 +70,12 @@ class JobCanceled(Exception):
 
 
 class JobFailed(Exception):
-    def __init__(self, message: str):
+    def __init__(self, message: str, error_code: str = ""):
         self.message = message
+        # Optional machine-readable code propagated to the relay result so the
+        # app can branch on it (e.g. 'execution_stalled' for the no-activity
+        # watchdog). Empty for plain ComfyUI execution errors.
+        self.error_code = error_code
         super().__init__(message)
 
 
@@ -55,6 +85,10 @@ class Worker:
     def __init__(self, relay: RelayClient, comfy: ComfyClient):
         self.relay = relay
         self.comfy = comfy
+        # Latest progress (value, max) the running job has seen, so the heartbeat
+        # loop can re-send the CURRENT known figures (not stale 0s) when ComfyUI
+        # has gone quiet. Reset at the start of each job.
+        self._progress = (0, 0)
 
     async def handle_job(self, job: dict) -> str:
         """Run a job to a terminal state, reporting the result to the relay.
@@ -62,6 +96,13 @@ class Worker:
         Returns the final status string (for tests/logging).
         """
         job_id = job["id"]
+        self._progress = (0, 0)
+        # Background heartbeat: even when ComfyUI emits no progress, keep poking
+        # the relay's progress endpoint (~every JOB_HEARTBEAT_INTERVAL) so the
+        # job's updated_at advances and the relay reaper never mistakes a long-but-
+        # healthy generation for a dead plugin. Cancelled in finally — the task is
+        # bounded to this job's lifetime and never leaks.
+        hb = asyncio.create_task(self._job_heartbeat(job_id))
         try:
             prompt = dict(job.get("api_prompt") or {})
             inputs = job.get("inputs") or []
@@ -90,13 +131,39 @@ class Worker:
             log.info("job %s canceled", job_id)
             return "canceled"
         except JobFailed as e:
-            await self.relay.result(job_id, "failed", [], e.message)
+            await self.relay.result(job_id, "failed", [], e.message,
+                                    error_code=e.error_code)
             log.warning("job %s failed: %s", job_id, e.message)
             return "failed"
         except Exception as e:  # noqa: BLE001 - never let one job kill the loop
             await _safe_fail(self.relay, job_id, str(e))
             log.exception("job %s errored", job_id)
             return "failed"
+        finally:
+            # Stop the heartbeat before this job's result lands; await the cancel
+            # so no orphaned task survives into the next claim.
+            hb.cancel()
+            try:
+                await hb
+            except asyncio.CancelledError:
+                pass
+
+    async def _job_heartbeat(self, job_id: str) -> None:
+        """Re-report the current known progress every JOB_HEARTBEAT_INTERVAL.
+
+        This is a keep-alive, not a real progress source: it just re-sends the
+        latest (value, max) the job has seen so the relay's updated_at keeps
+        advancing while a long generation runs silently. A failed beat is logged
+        and ignored — the real progress reports and the claim loop's revoke
+        handling carry the actual signal.
+        """
+        while True:
+            await asyncio.sleep(JOB_HEARTBEAT_INTERVAL)
+            value, maximum = self._progress
+            try:
+                await self.relay.progress(job_id, "running", value, maximum)
+            except Exception as e:  # noqa: BLE001 - keep beating; result path reports real errors
+                log.debug("job %s heartbeat error: %s", job_id, e)
 
     async def _stage_inputs(self, prompt: dict, inputs: list[dict]) -> None:
         if not inputs:
@@ -115,13 +182,46 @@ class Worker:
         client_id = str(uuid4())
         async with self.comfy.ws_connect(client_id) as ws:
             prompt_id = await self.comfy.submit(prompt, client_id)
-            async for msg in ws:
+            # No-activity watchdog: receive with a short poll timeout and track
+            # how long we've gone WITHOUT any websocket message (any frame counts
+            # as activity and resets the clock). When accumulated silence crosses
+            # EXECUTION_STALL_TIMEOUT we treat ComfyUI as hung and fail the job so
+            # the worker is freed — see the constant's note for the rationale.
+            poll = min(JOB_HEARTBEAT_INTERVAL, EXECUTION_STALL_TIMEOUT)
+            silent = 0.0
+            while True:
+                try:
+                    # aiohttp's own receive timeout: raises TimeoutError on a
+                    # silent poll window WITHOUT cancelling the underlying read,
+                    # so the next receive() resumes cleanly (unlike wrapping it
+                    # in asyncio.wait_for, which cancels ws.receive() and can
+                    # corrupt aiohttp's internal _waiting state).
+                    msg = await ws.receive(timeout=poll)
+                except asyncio.TimeoutError:
+                    # Nothing arrived this poll window — accrue the silence and
+                    # bail only once the *cumulative* gap exceeds the threshold.
+                    silent += poll
+                    if silent >= EXECUTION_STALL_TIMEOUT:
+                        await self.comfy.interrupt()
+                        log.warning(
+                            "job %s: no ComfyUI activity for %ds — assuming "
+                            "execution stalled", job_id, int(silent),
+                        )
+                        raise JobFailed(
+                            "ComfyUI execution stalled (no activity)",
+                            error_code="execution_stalled",
+                        )
+                    continue
+                # Any received frame is activity — reset the silence window.
+                silent = 0.0
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     ev = progress_event(json.loads(msg.data))
                     if ev is None:
                         continue
                     pid = ev.get("prompt_id")
                     if ev["kind"] == "progress":
+                        # Remember it so the heartbeat re-sends the CURRENT figure.
+                        self._progress = (ev["value"], ev["max"])
                         r = await self.relay.progress(job_id, "running", ev["value"], ev["max"])
                         if r.get("cancel"):
                             await self.comfy.interrupt()
