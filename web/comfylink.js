@@ -2,6 +2,7 @@
 // Registers a sidebar tab (current ComfyUI frontend); falls back to a toast if
 // the sidebar API is unavailable.
 import { app } from "../../scripts/app.js";
+import { initSync, syncAfterPair } from "./sync.js";
 
 const api = {
   async status() {
@@ -133,6 +134,9 @@ function buildPanel(root) {
         codeInput.value = "";
         msg.style.color = "#4caf50";
         msg.textContent = "Paired. Connecting…";
+        // Kick the workflow catalog sync now that we're paired so the App can
+        // browse this PC's workflows right away.
+        syncAfterPair();
       } else {
         msg.textContent = r.error || "Pairing failed.";
       }
@@ -172,6 +176,13 @@ app.registerExtension({
       console.warn(
         "[ComfyLink] sidebar API unavailable; open /comfylink/status to check status."
       );
+    }
+    // Install workflow catalog sync triggers (focus / interval / save event)
+    // and run an initial pass (no-ops if not paired). See sync.js.
+    try {
+      initSync();
+    } catch (e) {
+      console.warn("[ComfyLink] failed to init workflow sync", e);
     }
   },
 });

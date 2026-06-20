@@ -150,6 +150,19 @@ class RelayClient:
         data = json.dumps(object_info).encode()
         await self.put_object(url, data, "application/json")
 
+    async def sign_put_workflow(self, backend_id: str, artifact: str,
+                                workflow_id: Optional[str] = None) -> tuple[str, str]:
+        """Request a presigned PUT URL for a workflow manifest or blob.
+
+        artifact is "manifest" or "blob"; blob requires workflow_id. Returns
+        (key, url). The relay returns 503 if R2 isn't configured.
+        """
+        body: dict = {"backend_id": backend_id, "artifact": artifact}
+        if workflow_id is not None:
+            body["workflow_id"] = workflow_id
+        d = await self._json("POST", "/v1/backends/workflows/sign-put", body)
+        return d["key"], d["url"]
+
     async def heartbeat(self, backend_id: str) -> None:
         await self._json("POST", "/v1/backends/heartbeat", {"backend_id": backend_id})
 
