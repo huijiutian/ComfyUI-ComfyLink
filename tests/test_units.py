@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from comfylink.jobs import (  # noqa: E402
     apply_inputs,
     content_type_for,
-    extract_output_images,
+    extract_outputs,
     progress_event,
 )
 
@@ -23,6 +23,12 @@ class TestContentType(unittest.TestCase):
         self.assertEqual(content_type_for("a.webp"), "image/webp")
         self.assertEqual(content_type_for("a.jpeg"), "image/jpeg")
         self.assertEqual(content_type_for("a.bin"), "application/octet-stream")
+
+    def test_video_mime(self):
+        self.assertEqual(content_type_for("clip.mp4"), "video/mp4")
+        self.assertEqual(content_type_for("clip.WEBM"), "video/webm")
+        self.assertEqual(content_type_for("anim.gif"), "image/gif")
+        self.assertEqual(content_type_for("c.mov"), "video/quicktime")
 
 
 class TestExtractOutputs(unittest.TestCase):
@@ -36,12 +42,48 @@ class TestExtractOutputs(unittest.TestCase):
                 "10": {"images": [{"filename": "b.png", "subfolder": "s", "type": "output"}]},
             }}
         }
-        out = extract_output_images(history, "p1")
+        out = extract_outputs(history, "p1")
         names = sorted(i["filename"] for i in out)
         self.assertEqual(names, ["b.png", "final.png"])
+        # Stills are tagged image.
+        self.assertTrue(all(i["media_type"] == "image" for i in out))
+
+    def test_collects_gifs_and_videos_as_video(self):
+        history = {
+            "p1": {"outputs": {
+                "9": {"gifs": [
+                    {"filename": "vhs_00001.mp4", "subfolder": "", "type": "output"},
+                    {"filename": "preview.mp4", "subfolder": "", "type": "temp"},
+                ]},
+                "12": {"videos": [
+                    {"filename": "native.webm", "subfolder": "v", "type": "output"},
+                ]},
+                "20": {"images": [
+                    {"filename": "still.png", "subfolder": "", "type": "output"},
+                ]},
+            }}
+        }
+        out = extract_outputs(history, "p1")
+        by_name = {i["filename"]: i for i in out}
+        # temp preview dropped; the three outputs kept.
+        self.assertEqual(sorted(by_name), ["native.webm", "still.png", "vhs_00001.mp4"])
+        self.assertEqual(by_name["vhs_00001.mp4"]["media_type"], "video")
+        self.assertEqual(by_name["native.webm"]["media_type"], "video")
+        self.assertEqual(by_name["still.png"]["media_type"], "image")
+
+    def test_animated_webp_in_gifs_is_video(self):
+        # VHS_VideoCombine can drop an animated .webp under "gifs" — the source
+        # key makes it a video so we never WebP-flatten it.
+        history = {
+            "p1": {"outputs": {
+                "9": {"gifs": [{"filename": "anim.webp", "subfolder": "", "type": "output"}]},
+            }}
+        }
+        out = extract_outputs(history, "p1")
+        self.assertEqual(out[0]["media_type"], "video")
 
     def test_missing_prompt(self):
-        self.assertEqual(extract_output_images({}, "nope"), [])
+        self.assertEqual(extract_outputs({}, "nope"), [])
 
 
 class TestApplyInputs(unittest.TestCase):

@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from io import BytesIO
 from typing import Any
+from xml.sax.saxutils import escape
 
 from .log import log
 
@@ -16,6 +17,15 @@ from .log import log
 # shrinks typical diffusion outputs well below their PNG size while staying
 # visually lossless enough for the subscription "convert to WebP" feature.
 WEBP_QUALITY = 90
+
+# Extensions we treat as video. ComfyUI's animated/video savers land in
+# outputs[node]["gifs"] (VHS_VideoCombine, animated GIF/WebP) or ["videos"]
+# (native SaveVideo). We classify by extension because the history rows don't
+# carry a media type, only filenames.
+_VIDEO_EXTS = (".mp4", ".webm", ".mkv", ".mov", ".avi", ".gif")
+# Animated WebP from VHS lands under "gifs" with a .webp name; it is NOT a
+# still image we should re-encode (Pillow would flatten it to a single frame),
+# so the source key — not just the extension — decides image-vs-video too.
 
 
 def content_type_for(filename: str) -> str:
@@ -27,30 +37,91 @@ def content_type_for(filename: str) -> str:
         return "image/webp"
     if lower.endswith((".jpg", ".jpeg")):
         return "image/jpeg"
+    if lower.endswith(".gif"):
+        return "image/gif"
+    if lower.endswith(".mp4"):
+        return "video/mp4"
+    if lower.endswith(".webm"):
+        return "video/webm"
+    if lower.endswith(".mkv"):
+        return "video/x-matroska"
+    if lower.endswith(".mov"):
+        return "video/quicktime"
+    if lower.endswith(".avi"):
+        return "video/x-msvideo"
     return "application/octet-stream"
 
 
-def convert_if_webp(data: bytes, filename: str, output_format: str) -> tuple[bytes, str, str]:
-    """Optionally re-encode output image bytes to WebP.
+def _xmp_with_prompt(prompt: str) -> bytes:
+    """Build a minimal XMP packet carrying only ComfyUI's ``prompt`` string.
+
+    We deliberately embed *just* the prompt (not the much larger ``workflow``
+    blob): users want the generation prompt to round-trip, and keeping the
+    packet tiny keeps the WebP small. The prompt is JSON, so it can contain
+    ``<``/``&``/``"`` — XML-escape it before placing it in an attribute.
+    """
+    esc = escape(prompt, {'"': "&quot;"})
+    packet = (
+        '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description xmlns:comfylink="http://comfylink.app/ns/1.0/" '
+        'comfylink:prompt="' + esc + '"/>'
+        "</rdf:RDF></x:xmpmeta>"
+        '<?xpacket end="w"?>'
+    )
+    return packet.encode("utf-8")
+
+
+def encode_output(
+    data: bytes, filename: str, output_format: str, media_type: str = "image"
+) -> tuple[bytes, str, str]:
+    """Optionally re-encode an output to WebP, preserving ComfyUI's prompt.
 
     Returns ``(data, filename, content_type)``. When ``output_format`` is
-    ``"webp"`` the bytes are decoded with Pillow and re-saved as WebP, the
-    filename extension is swapped to ``.webp`` and the content-type becomes
-    ``image/webp``. For any other format (default ``"png"``) the inputs pass
-    through unchanged, with the content-type derived from the filename.
+    ``"webp"`` *and* the item is a still image, the bytes are decoded with
+    Pillow and re-saved as WebP — and ComfyUI's ``prompt`` text (PNG ``tEXt`` /
+    WebP XMP) is carried into the new WebP's XMP so the prompt survives the
+    re-encode. The filename extension is swapped to ``.webp`` and the
+    content-type becomes ``image/webp``.
 
-    Conversion is wrapped in try/except: if Pillow can't open/encode the bytes
-    (odd format, truncated data, PIL missing) we fall back to the original
-    bytes/filename so a job is never crashed by the WebP step.
+    Videos (``media_type == "video"``) and any non-webp ``output_format`` pass
+    through unchanged, with the content-type derived from the filename. We never
+    run Pillow over a video — it would flatten/corrupt an animation.
+
+    The whole conversion is wrapped in try/except: if Pillow can't open/encode
+    the bytes, is too old to accept ``xmp=``, or is missing entirely, we fall
+    back to the original bytes/filename so a job is never crashed by the WebP
+    step. ``prompt`` only rides along when present in the source; its absence is
+    not an error.
+
+    Note: we deliberately do NOT re-encode PNGs that stay PNG — ComfyUI already
+    writes the prompt into the PNG ``tEXt`` and re-saving would risk dropping it.
     """
+    if media_type == "video":
+        return data, filename, content_type_for(filename)
     if (output_format or "").lower() != "webp":
         return data, filename, content_type_for(filename)
     try:
         from PIL import Image  # imported lazily — only needed when converting
 
         im = Image.open(BytesIO(data))
+        # Pull ComfyUI's prompt (PNG tEXt or source-WebP XMP land it in .info).
+        prompt = im.info.get("prompt")
+        save_kwargs: dict[str, Any] = {"format": "WEBP", "quality": WEBP_QUALITY}
+        if isinstance(prompt, (str, bytes)):
+            if isinstance(prompt, bytes):
+                prompt = prompt.decode("utf-8", "replace")
+            save_kwargs["xmp"] = _xmp_with_prompt(prompt)
         buf = BytesIO()
-        im.save(buf, format="WEBP", quality=WEBP_QUALITY)
+        try:
+            im.save(buf, **save_kwargs)
+        except TypeError:
+            # Old Pillow without xmp= support: re-encode without metadata
+            # rather than crash. Better a prompt-less WebP than a failed job.
+            buf = BytesIO()
+            im.save(buf, format="WEBP", quality=WEBP_QUALITY)
+            log.info("Pillow too old for xmp=; shipping WebP without prompt for %s", filename)
         webp = buf.getvalue()
         new_name = _swap_ext(filename, ".webp")
         return webp, new_name, "image/webp"
@@ -77,26 +148,49 @@ def within_cap(total_bytes: int, max_output_bytes: int) -> bool:
     return total_bytes <= max_output_bytes
 
 
-def extract_output_images(history: dict, prompt_id: str) -> list[dict]:
-    """Pull the final output images for a prompt from a /history response.
+def _media_type_for(filename: str, source_key: str) -> str:
+    """Classify an output item as ``"image"`` or ``"video"``.
 
-    Only images of type 'output' are returned — 'temp'/preview artifacts are
-    skipped (we never ship previews).
+    ComfyUI files videos/animations under the ``gifs``/``videos`` output keys
+    and stills under ``images`` — but VHS_VideoCombine can also drop an animated
+    WebP/GIF into ``gifs``. So an item from a video-ish key is a video, and so
+    is anything with a known video extension. Everything else is an image.
+    """
+    if source_key in ("gifs", "videos"):
+        return "video"
+    if filename.lower().endswith(_VIDEO_EXTS):
+        return "video"
+    return "image"
+
+
+def extract_outputs(history: dict, prompt_id: str) -> list[dict]:
+    """Pull the final output items (images + videos) for a prompt from /history.
+
+    Collects ComfyUI's ``images`` (stills) plus ``gifs``/``videos`` (animations
+    and video clips, e.g. VHS_VideoCombine -> ``gifs``, native SaveVideo ->
+    ``videos``). Only items of type ``output`` are returned — ``temp``/preview
+    artifacts are skipped (we never ship previews). Each item carries a
+    ``media_type`` ("image"|"video") so the rest of the pipeline knows whether
+    to WebP-convert it and what to tell the relay/app.
     """
     entry = history.get(prompt_id) or {}
     outputs = entry.get("outputs") or {}
-    images: list[dict] = []
+    out: list[dict] = []
     for node_output in outputs.values():
-        for im in node_output.get("images", []) or []:
-            if im.get("type") == "output":
-                images.append(
+        for source_key in ("images", "gifs", "videos"):
+            for it in node_output.get(source_key, []) or []:
+                if it.get("type") != "output":
+                    continue
+                filename = it.get("filename", "")
+                out.append(
                     {
-                        "filename": im.get("filename", ""),
-                        "subfolder": im.get("subfolder", ""),
-                        "type": im.get("type", "output"),
+                        "filename": filename,
+                        "subfolder": it.get("subfolder", ""),
+                        "type": it.get("type", "output"),
+                        "media_type": _media_type_for(filename, source_key),
                     }
                 )
-    return images
+    return out
 
 
 def apply_inputs(prompt: dict, inputs: list[dict], key_to_name: dict[str, str]) -> dict:

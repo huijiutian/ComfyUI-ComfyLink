@@ -22,8 +22,8 @@ from .comfy import ComfyClient
 from .config import RELAY_URL, STATE, detect_comfy_url
 from .jobs import (
     apply_inputs,
-    convert_if_webp,
-    extract_output_images,
+    encode_output,
+    extract_outputs,
     progress_event,
     within_cap,
 )
@@ -240,30 +240,39 @@ class Worker:
         """Fetch each output's bytes, optionally convert to WebP, and measure.
 
         Returns ``(items, total_bytes)`` where each item carries the (possibly
-        converted) ``data``/``filename``/``content_type`` plus the original
-        subfolder/type. WebP conversion happens BEFORE measuring so it actually
-        helps the user fit under their cap. No upload happens here.
+        converted) ``data``/``filename``/``content_type``/``media_type`` plus
+        the original subfolder/type. WebP conversion happens BEFORE measuring so
+        it actually helps the user fit under their cap; videos are never
+        converted (encode_output skips them). No upload happens here.
         """
         history = await self.comfy.history(prompt_id)
         items: list[dict] = []
         total = 0
-        for im in extract_output_images(history, prompt_id):
-            raw = await self.comfy.view(im["filename"], im["subfolder"], im["type"])
-            data, filename, ct = convert_if_webp(raw, im["filename"], output_format)
+        for it in extract_outputs(history, prompt_id):
+            raw = await self.comfy.view(it["filename"], it["subfolder"], it["type"])
+            data, filename, ct = encode_output(
+                raw, it["filename"], output_format, it["media_type"]
+            )
             total += len(data)
             items.append({"data": data, "filename": filename, "content_type": ct,
-                          "subfolder": im["subfolder"], "type": im["type"]})
+                          "subfolder": it["subfolder"], "type": it["type"],
+                          "media_type": it["media_type"]})
         return items, total
 
     async def _upload_outputs(self, job_id: str, items: list[dict]) -> list[dict]:
-        """Upload already-collected output bytes to R2; return relay payloads."""
+        """Upload already-collected output bytes to R2; return relay payloads.
+
+        Each payload carries ``media_type`` ("image"|"video") and the resolved
+        ``content_type`` so the relay/app can render images vs videos correctly.
+        """
         out: list[dict] = []
         for it in items:
             ct = it["content_type"]
             key, url = await self.relay.sign_upload(job_id, "output", it["filename"], ct)
             await self.relay.put_object(url, it["data"], ct)
             out.append({"r2_key": key, "filename": it["filename"],
-                        "subfolder": it["subfolder"], "type": it["type"]})
+                        "subfolder": it["subfolder"], "type": it["type"],
+                        "media_type": it["media_type"], "content_type": ct})
         return out
 
 
