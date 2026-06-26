@@ -1,15 +1,26 @@
-// ComfyLink — workflow catalog sync driver.
+// ComfyLink — workflow catalog sync (manual, user-driven).
 //
 // The browser extension is the ONLY place that can convert ComfyUI's saved
 // UI-graph workflows (nodes/links) into the API prompt format the App needs
-// (graphToPrompt). So the browser drives sync: enumerate saved workflows,
-// convert the new/changed ones offscreen, assemble a manifest, and POST both
-// manifest + blobs to the Python plugin (POST /comfylink/sync). Python holds
-// the device token and pushes everything to R2 — the browser NEVER sees the
-// token.
+// (graphToPrompt). So the browser drives sync: the user opens "Manage
+// workflows", picks the ones to upload, and we convert the chosen ones on the
+// spot, assemble a manifest, and POST both manifest + blobs to the Python
+// plugin (POST /comfylink/sync). Python holds the device token and pushes
+// everything to R2 — the browser NEVER sees the token.
 //
-// Contract: app/docs/workflow-sync.md (manifest schema lines 17-34, web
-// extension behaviour lines 59-66).
+// This is MANUAL by design. The previous version auto-synced ALL workflows in
+// the background (focus / 60s interval / guessed save event / post-pair), which
+// was unreliable (depended on the page being open + focused, the save event
+// name was a guess, offscreen conversion is finicky) → users reported "my
+// workflow updates never show up". Now upload is an explicit click: reliable,
+// converted on the spot, failures visible immediately.
+//
+// IMPORTANT: the manifest we POST contains ONLY the workflows the user selected
+// (not every workflow on disk). That is exactly what the App browses, so the
+// App shows the user's chosen set. Already-uploaded items are default-checked in
+// the UI so they stay in the manifest unless the user deliberately drops them.
+//
+// Contract: app/docs/workflow-sync.md (manifest schema lines 17-34).
 //
 // VERIFIED ComfyUI frontend API shapes (confirmed from official
 // Comfy-Org/ComfyUI_frontend source on 2026-06-19):
@@ -19,8 +30,7 @@
 //   - app.api.getUserData(file) -> Promise<Response>, GET
 //     /userdata/${encodeURIComponent(file)}. `file` is relative to the user
 //     data root, so for workflows the path must be joined as
-//     "workflows/" + path.  [NEEDS-VERIFICATION on a real ComfyUI: exact join
-//     behaviour for the getUserData path — see report.]
+//     "workflows/" + path.
 //   - app.graphToPrompt(graph = this.rootGraph) -> {workflow, output} where
 //     `output` is the API prompt { "<nodeId>": {class_type, inputs, _meta} }.
 //     It accepts a graph argument, enabling offscreen conversion.
@@ -32,21 +42,16 @@
 import { app } from "../../scripts/app.js";
 import { api as apiFallback } from "../../scripts/api.js";
 
-// Single localStorage key for the last successfully-synced manifest. backendId
+// Single localStorage key for the last successfully-uploaded manifest. backendId
 // isn't known in the browser; the browser is the single writer for v1, so a
-// fixed key is acceptable (contract line 84).
+// fixed key is acceptable.
 const LAST_MANIFEST_KEY = "comfylink.lastManifest";
-
-// Coalesce window for scheduleSync() (ms).
-const DEBOUNCE_MS = 1500;
-// Lightweight background rescan interval (ms).
-const RESCAN_MS = 60000;
 
 // ---- small helpers -------------------------------------------------------
 
 function getApi() {
-  // VERIFIED: api client is reachable as app.api; apiFallback is the
-  // standalone scripts/api.js singleton.
+  // api client is reachable as app.api; apiFallback is the standalone
+  // scripts/api.js singleton.
   return app?.api ?? apiFallback;
 }
 
@@ -96,15 +101,15 @@ function saveLastManifest(manifest) {
   }
 }
 
-// Build id -> previous manifest entry, for diffing + carry-over of unchanged.
-function indexById(manifest) {
-  const map = new Map();
+// Set of workflow ids present in the last uploaded manifest (any status).
+function uploadedIdSet(manifest) {
+  const set = new Set();
   if (manifest && Array.isArray(manifest.workflows)) {
     for (const w of manifest.workflows) {
-      if (w && w.id) map.set(w.id, w);
+      if (w && w.id) set.add(w.id);
     }
   }
-  return map;
+  return set;
 }
 
 // ---- conversion ----------------------------------------------------------
@@ -112,15 +117,13 @@ function indexById(manifest) {
 // Convert one UI graph JSON to the API prompt.
 // Primary path = offscreen LGraph: build a throwaway LGraph, configure it with
 // the saved UI graph, and graphToPrompt(thatGraph). This does NOT disturb the
-// user's live canvas. [NEEDS-VERIFICATION on a real ComfyUI: that offscreen
-// graphToPrompt produces correct, non-empty output across frontend builds.]
+// user's live canvas.
 //
 // Fallback path = load/convert/restore on the LIVE graph: snapshot the current
 // graph, app.loadGraphData(ui), graphToPrompt(), then RESTORE the snapshot in
 // a finally so the user's canvas is always put back. Used ONLY if the offscreen
-// path throws or yields empty output. [NEEDS-VERIFICATION: whether the fallback
-// is ever required, and that loadGraphData round-trips cleanly.]
-async function convertUiToApi(ui) {
+// path throws or yields empty output.
+export async function convertUiToApi(ui) {
   // --- primary: offscreen ---
   try {
     const LG = (typeof LiteGraph !== "undefined" && LiteGraph) || window.LiteGraph;
@@ -166,18 +169,18 @@ async function convertUiToApi(ui) {
   }
 }
 
-// ---- core sync -----------------------------------------------------------
+// ---- capability / pairing / transport ------------------------------------
 
 // Returns true if the environment can sync; logs a warn + returns false if a
-// required API is missing (never throws out of the extension).
+// required API is missing.
 function capabilitiesOk() {
   const a = getApi();
   if (!a || typeof a.listUserDataFullInfo !== "function" || typeof a.getUserData !== "function") {
-    console.warn("[ComfyLink] userdata API unavailable; skipping workflow sync.");
+    console.warn("[ComfyLink] userdata API unavailable; cannot sync workflows.");
     return false;
   }
   if (typeof app.graphToPrompt !== "function") {
-    console.warn("[ComfyLink] app.graphToPrompt unavailable; skipping workflow sync.");
+    console.warn("[ComfyLink] app.graphToPrompt unavailable; cannot sync workflows.");
     return false;
   }
   return true;
@@ -203,191 +206,135 @@ async function postSync(manifest, blobs) {
   return r.json();
 }
 
-// One full sync pass. Returns silently on any guard miss; never throws.
-async function runSync() {
-  try {
-    if (!(await isPaired())) return; // not paired -> skip (contract line 60)
-    if (!capabilitiesOk()) return;
-
-    const a = getApi();
-
-    // 1. Enumerate ALL saved workflows (no filtering). path is relative to
-    //    the "workflows" dir.
-    let entries;
-    try {
-      entries = await a.listUserDataFullInfo("workflows");
-    } catch (e) {
-      console.warn("[ComfyLink] listUserDataFullInfo failed", e);
-      return;
-    }
-    if (!Array.isArray(entries)) return;
-
-    // 2. Diff vs last sync.
-    const prev = loadLastManifest();
-    const prevById = indexById(prev);
-
-    const workflows = []; // manifest entries (ALL current workflows)
-    const blobs = {}; // only NEW/CHANGED ready items get a blob
-
-    for (const entry of entries) {
-      const path = entry && entry.path;
-      if (typeof path !== "string" || !path) continue;
-
-      const id = await workflowId(path);
-      const fingerprint = fingerprintOf(entry);
-      const name = nameOf(path);
-      const previous = prevById.get(id);
-
-      // Unchanged: same fingerprint as last sync -> carry over the previous
-      // manifest entry (status/name/node_count/error) and do NOT re-upload its
-      // blob. Note: if it was previously status:"error", it stays error.
-      if (previous && previous.fingerprint === fingerprint) {
-        workflows.push({
-          id,
-          path,
-          name: previous.name ?? name,
-          fingerprint,
-          status: previous.status === "error" ? "error" : "ready",
-          ...(previous.error ? { error: previous.error } : {}),
-          ...(previous.node_count != null ? { node_count: previous.node_count } : {}),
-        });
-        continue;
-      }
-
-      // New or changed: fetch + convert.
-      let ui;
-      try {
-        // VERIFIED: getUserData path is relative to userdata root; join with
-        // "workflows/". [NEEDS-VERIFICATION on real ComfyUI — see header.]
-        const resp = await a.getUserData("workflows/" + path);
-        if (!resp || !resp.ok) {
-          workflows.push({ id, path, name, fingerprint, status: "error", error: "failed to read file" });
-          continue;
-        }
-        ui = await resp.json();
-      } catch (e) {
-        workflows.push({ id, path, name, fingerprint, status: "error", error: "failed to read file" });
-        continue;
-      }
-
-      try {
-        const output = await convertUiToApi(ui);
-        blobs[id] = output;
-        workflows.push({
-          id,
-          path,
-          name,
-          fingerprint,
-          status: "ready",
-          node_count: Object.keys(output).length,
-        });
-      } catch (e) {
-        // both primary + fallback failed -> error, not in blobs.
-        workflows.push({
-          id,
-          path,
-          name,
-          fingerprint,
-          status: "error",
-          error: String((e && e.message) || e),
-        });
-      }
-    }
-
-    // 3. Assemble manifest (schema: contract lines 17-34). Deleted files
-    //    simply don't appear in `workflows`.
-    const manifest = {
-      version: 1,
-      updated_at: new Date().toISOString(),
-      workflows,
-    };
-
-    // 4. POST to Python. Only overwrite the last manifest on success, so a
-    //    failed sync retries new/changed items next time.
-    const res = await postSync(manifest, blobs);
-    if (res && res.ok) {
-      saveLastManifest(manifest);
-    } else {
-      console.warn("[ComfyLink] sync upload failed", res && res.error);
-    }
-  } catch (e) {
-    // Never let sync throw out of the extension.
-    console.warn("[ComfyLink] workflow sync error", e);
-  }
-}
-
-// ---- scheduling (debounce + single-flight) -------------------------------
-
-let timer = null;
-let running = false;
-let queued = false;
-
-// Coalesce calls within DEBOUNCE_MS and ensure only one sync runs at a time.
-// If a trigger fires while a sync is running, queue exactly one re-run.
-export function scheduleSync() {
-  if (timer) clearTimeout(timer);
-  timer = setTimeout(async () => {
-    timer = null;
-    if (running) {
-      queued = true; // run once more after the current pass
-      return;
-    }
-    running = true;
-    try {
-      await runSync();
-    } finally {
-      running = false;
-      if (queued) {
-        queued = false;
-        scheduleSync();
-      }
-    }
-  }, DEBOUNCE_MS);
-}
-
-// ---- triggers ------------------------------------------------------------
-
-let installed = false;
-
-// Wire up all sync triggers once. Safe to call multiple times.
-//   - window focus           -> debounced rescan
-//   - light interval (60s)   -> debounced rescan
-//   - ComfyUI save event     -> debounced rescan [event name NEEDS-VERIFICATION]
-// The focus + interval + post-pair triggers guarantee freshness regardless of
-// whether the save event name is correct.
-export function initSync() {
-  if (installed) {
-    // already installed; still kick a sync (e.g. panel re-opened).
-    scheduleSync();
-    return;
-  }
-  installed = true;
-
-  // Background freshness.
-  window.addEventListener("focus", scheduleSync);
-  setInterval(scheduleSync, RESCAN_MS);
-
-  // ComfyUI fires events on the api EventTarget. The exact "saved a workflow"
-  // event name is uncertain across frontend versions, so we best-effort
-  // subscribe to a few likely names. [NEEDS-VERIFICATION on real ComfyUI: the
-  // actual save-workflow event name.] The focus/interval/post-pair triggers
-  // cover us if none of these fire.
+// Enumerate the saved workflows on disk. `path` is relative to the "workflows"
+// dir. Returns [] (never throws) if the API is missing or the call fails.
+async function enumerateWorkflows() {
+  if (!capabilitiesOk()) return [];
   const a = getApi();
-  if (a && typeof a.addEventListener === "function") {
-    for (const ev of ["graphChanged", "workflow_saved", "saved", "save"]) {
-      try {
-        a.addEventListener(ev, scheduleSync);
-      } catch (e) {
-        /* ignore unknown event names */
-      }
+  let entries;
+  try {
+    entries = await a.listUserDataFullInfo("workflows");
+  } catch (e) {
+    console.warn("[ComfyLink] listUserDataFullInfo failed", e);
+    return [];
+  }
+  return Array.isArray(entries) ? entries : [];
+}
+
+// ---- public API (consumed by the panel UI) -------------------------------
+
+// List the saved workflows for the management UI.
+//   -> [{ path, name, fingerprint, uploaded }]
+// `uploaded` = this workflow (by id = hash(path)) was in the last uploaded
+// manifest, so the UI default-checks it (keeping it in the manifest on the next
+// upload). Sorted by path for a stable display. Throws if the ComfyUI APIs are
+// unavailable so the UI can surface a clear message.
+export async function listWorkflows() {
+  if (!capabilitiesOk()) {
+    throw new Error("ComfyUI workflow APIs are unavailable");
+  }
+  const entries = await enumerateWorkflows();
+  const uploaded = uploadedIdSet(loadLastManifest());
+
+  const out = [];
+  for (const entry of entries) {
+    const path = entry && entry.path;
+    if (typeof path !== "string" || !path) continue;
+    const id = await workflowId(path);
+    out.push({
+      path,
+      name: nameOf(path),
+      fingerprint: fingerprintOf(entry),
+      uploaded: uploaded.has(id),
+    });
+  }
+  out.sort((x, y) => x.path.localeCompare(y.path));
+  return out;
+}
+
+// Upload exactly the selected workflows.
+//   paths: string[] of workflow-relative paths (from listWorkflows()).
+//   -> { uploaded, errors: [{ path, error }] }
+// For each selected path we read its saved UI graph, convert it on the spot,
+// and collect a blob; conversion/read failures are recorded as status:"error"
+// (no blob) and surfaced in `errors`. The manifest contains ONLY the selected
+// items, so the App will browse exactly this set. On a successful POST the
+// localStorage manifest is updated (drives the "uploaded" flag next time).
+// Throws if not paired, capabilities are missing, or the POST itself fails.
+export async function uploadSelected(paths) {
+  if (!capabilitiesOk()) {
+    throw new Error("ComfyUI workflow APIs are unavailable");
+  }
+  if (!(await isPaired())) {
+    throw new Error("This PC is not paired");
+  }
+  const a = getApi();
+
+  // Current fingerprints for every workflow on disk (so each manifest entry
+  // carries the up-to-date <size>:<modified>).
+  const byPath = new Map();
+  for (const entry of await enumerateWorkflows()) {
+    if (entry && typeof entry.path === "string") byPath.set(entry.path, entry);
+  }
+
+  const workflows = []; // manifest entries (ONLY the selected workflows)
+  const blobs = {}; // id -> API prompt, only for the ones that converted
+  const errors = []; // [{ path, error }] for read/convert failures
+
+  for (const path of Array.isArray(paths) ? paths : []) {
+    if (typeof path !== "string" || !path) continue;
+
+    const id = await workflowId(path);
+    const name = nameOf(path);
+    const entry = byPath.get(path);
+    const fingerprint = entry ? fingerprintOf(entry) : "";
+
+    // 1. Read the saved UI graph.
+    let ui;
+    try {
+      const resp = await a.getUserData("workflows/" + path);
+      if (!resp || !resp.ok) throw new Error("failed to read file");
+      ui = await resp.json();
+    } catch (e) {
+      const error = "failed to read file";
+      workflows.push({ id, path, name, fingerprint, status: "error", error });
+      errors.push({ path, error });
+      continue;
+    }
+
+    // 2. Convert UI graph -> API prompt (offscreen, with live-graph fallback).
+    try {
+      const output = await convertUiToApi(ui);
+      blobs[id] = output;
+      workflows.push({
+        id,
+        path,
+        name,
+        fingerprint,
+        status: "ready",
+        node_count: Object.keys(output).length,
+      });
+    } catch (e) {
+      const error = String((e && e.message) || e);
+      workflows.push({ id, path, name, fingerprint, status: "error", error });
+      errors.push({ path, error });
     }
   }
 
-  // Initial pass (will no-op if not paired / capabilities missing).
-  scheduleSync();
-}
+  // 3. Assemble the manifest (selected items only) and POST to Python.
+  const manifest = {
+    version: 1,
+    updated_at: new Date().toISOString(),
+    workflows,
+  };
+  const res = await postSync(manifest, blobs);
+  if (!res || !res.ok) {
+    throw new Error((res && res.error) || "upload failed");
+  }
 
-// Call right after a successful pair so the first catalog lands immediately.
-export function syncAfterPair() {
-  scheduleSync();
+  // 4. Persist on success only, so a failed POST doesn't poison the "uploaded"
+  //    flags. Reflects exactly what the App now browses.
+  saveLastManifest(manifest);
+
+  return { uploaded: Object.keys(blobs).length, errors };
 }

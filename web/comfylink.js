@@ -2,7 +2,7 @@
 // Registers a sidebar tab (current ComfyUI frontend); falls back to a toast if
 // the sidebar API is unavailable.
 import { app } from "../../scripts/app.js";
-import { initSync, syncAfterPair } from "./sync.js";
+import { listWorkflows, uploadSelected } from "./sync.js";
 
 const api = {
   async status() {
@@ -30,6 +30,12 @@ const STATE_LABEL = {
   online: ["Online", "#4caf50"],
   error: ["Error", "#f44336"],
 };
+
+function nameFromPath(path) {
+  const i = path.lastIndexOf("/");
+  const base = i >= 0 ? path.slice(i + 1) : path;
+  return base.toLowerCase().endsWith(".json") ? base.slice(0, -5) : base;
+}
 
 function h(tag, props = {}, children = []) {
   const e = document.createElement(tag);
@@ -84,6 +90,37 @@ function buildPanel(root) {
     style: "width:100%;padding:8px;cursor:pointer;",
   });
 
+  // --- workflow management (shown when paired) ----------------------------
+  // Manual upload: pick which saved workflows to push to the app, convert them
+  // on the spot, and POST manifest + blobs. No background auto-sync.
+  const manageBtn = h("button", {
+    textContent: "Manage workflows",
+    style: "width:100%;padding:8px;margin-top:8px;cursor:pointer;",
+  });
+
+  // Collapsible management panel.
+  const wfList = h("div", {
+    style:
+      "max-height:240px;overflow-y:auto;border:1px solid var(--border-color,#444);" +
+      "border-radius:4px;padding:6px;margin:8px 0;",
+  });
+  const wfStatus = h("div", {
+    style: "min-height:16px;margin-bottom:8px;color:var(--descrip-text,#aaa);font-size:12px;",
+  });
+  const uploadBtn = h("button", {
+    textContent: "Upload / update selected",
+    style: "width:100%;padding:8px;cursor:pointer;",
+  });
+  const reloadBtn = h("button", {
+    textContent: "Refresh list",
+    style: "width:100%;padding:6px;margin-bottom:8px;cursor:pointer;",
+  });
+  const managePanel = h(
+    "div",
+    { style: "display:none;margin-top:8px;" },
+    [reloadBtn, wfList, wfStatus, uploadBtn]
+  );
+
   const msg = h("div", { style: "margin-top:10px;min-height:18px;color:#f44336;" });
 
   // small, unobtrusive version line; filled from the status response.
@@ -92,7 +129,16 @@ function buildPanel(root) {
     textContent: "ComfyLink",
   });
 
-  root.append(statusRow, detail, pairForm, unpairBtn, msg, versionLine);
+  root.append(
+    statusRow,
+    detail,
+    pairForm,
+    unpairBtn,
+    manageBtn,
+    managePanel,
+    msg,
+    versionLine
+  );
 
   async function refresh() {
     let s;
@@ -116,6 +162,8 @@ function buildPanel(root) {
     const paired = !!s.paired;
     pairForm.style.display = paired ? "none" : "block";
     unpairBtn.style.display = paired ? "block" : "none";
+    manageBtn.style.display = paired ? "block" : "none";
+    if (!paired) managePanel.style.display = "none"; // collapse when unpaired
     if (!nameInput.value && s.backend_name) nameInput.value = s.backend_name;
   }
 
@@ -133,10 +181,7 @@ function buildPanel(root) {
       if (r.ok) {
         codeInput.value = "";
         msg.style.color = "#4caf50";
-        msg.textContent = "Paired. Connecting…";
-        // Kick the workflow catalog sync now that we're paired so the App can
-        // browse this PC's workflows right away.
-        syncAfterPair();
+        msg.textContent = "Paired. Open “Manage workflows” to upload.";
       } else {
         msg.textContent = r.error || "Pairing failed.";
       }
@@ -151,6 +196,109 @@ function buildPanel(root) {
   unpairBtn.onclick = async () => {
     await api.unpair();
     refresh();
+  };
+
+  // --- workflow management wiring -----------------------------------------
+  // Render one checkbox row per saved workflow. Already-uploaded ones are
+  // checked by default (so they stay in the manifest) and tagged "uploaded".
+  function renderWorkflows(items) {
+    wfList.innerHTML = "";
+    if (!items.length) {
+      wfList.append(
+        h("div", {
+          style: "color:var(--descrip-text,#aaa);font-size:12px;",
+          textContent: "No saved workflows found.",
+        })
+      );
+      return;
+    }
+    for (const wf of items) {
+      const cb = h("input", { type: "checkbox", checked: wf.uploaded });
+      cb.dataset.path = wf.path;
+      const tag = wf.uploaded
+        ? h("span", {
+            style: "margin-left:6px;color:#4caf50;font-size:11px;",
+            textContent: "uploaded",
+          })
+        : null;
+      const label = h(
+        "label",
+        {
+          style:
+            "display:flex;align-items:center;gap:6px;padding:3px 0;cursor:pointer;font-size:12px;",
+          title: wf.path,
+        },
+        [cb, h("span", { textContent: wf.name }), tag]
+      );
+      wfList.append(label);
+    }
+  }
+
+  async function loadWorkflows() {
+    wfStatus.style.color = "var(--descrip-text,#aaa)";
+    wfStatus.textContent = "Loading…";
+    reloadBtn.disabled = true;
+    uploadBtn.disabled = true;
+    try {
+      const items = await listWorkflows();
+      renderWorkflows(items);
+      wfStatus.textContent = `${items.length} workflow(s) on this PC.`;
+    } catch (e) {
+      wfList.innerHTML = "";
+      wfStatus.style.color = "#f44336";
+      wfStatus.textContent = String((e && e.message) || e);
+    } finally {
+      reloadBtn.disabled = false;
+      uploadBtn.disabled = false;
+    }
+  }
+
+  manageBtn.onclick = () => {
+    const open = managePanel.style.display !== "none";
+    if (open) {
+      managePanel.style.display = "none";
+      return;
+    }
+    managePanel.style.display = "block";
+    loadWorkflows();
+  };
+
+  reloadBtn.onclick = () => loadWorkflows();
+
+  uploadBtn.onclick = async () => {
+    const paths = Array.from(
+      wfList.querySelectorAll("input[type=checkbox]")
+    )
+      .filter((c) => c.checked)
+      .map((c) => c.dataset.path);
+    if (!paths.length) {
+      wfStatus.style.color = "#ff9800";
+      wfStatus.textContent = "Select at least one workflow.";
+      return;
+    }
+    uploadBtn.disabled = true;
+    reloadBtn.disabled = true;
+    wfStatus.style.color = "var(--descrip-text,#aaa)";
+    wfStatus.textContent = `Uploading ${paths.length}…`;
+    try {
+      const { uploaded, errors } = await uploadSelected(paths);
+      if (errors.length) {
+        wfStatus.style.color = "#ff9800";
+        const failed = errors.map((e) => nameFromPath(e.path)).join(", ");
+        wfStatus.textContent = `Uploaded ${uploaded}; ${errors.length} failed: ${failed}`;
+      } else {
+        wfStatus.style.color = "#4caf50";
+        wfStatus.textContent = `Uploaded ${uploaded} workflow(s).`;
+      }
+      // Reflect new "uploaded" tags / checkboxes.
+      await loadWorkflows();
+    } catch (e) {
+      wfStatus.style.color = "#f44336";
+      wfStatus.textContent = `Upload failed: ${(e && e.message) || e}`;
+    } finally {
+      uploadBtn.disabled = false;
+      reloadBtn.disabled = false;
+    }
   };
 
   refresh();
@@ -177,12 +325,7 @@ app.registerExtension({
         "[ComfyLink] sidebar API unavailable; open /comfylink/status to check status."
       );
     }
-    // Install workflow catalog sync triggers (focus / interval / save event)
-    // and run an initial pass (no-ops if not paired). See sync.js.
-    try {
-      initSync();
-    } catch (e) {
-      console.warn("[ComfyLink] failed to init workflow sync", e);
-    }
+    // Workflow upload is manual now: the panel's "Manage workflows" button lets
+    // the user pick which workflows to convert + push. No background auto-sync.
   },
 });
