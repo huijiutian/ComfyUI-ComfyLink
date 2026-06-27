@@ -37,6 +37,15 @@ function nameFromPath(path) {
   return base.toLowerCase().endsWith(".json") ? base.slice(0, -5) : base;
 }
 
+// Compact local "YYYY-MM-DD HH:MM" for an ISO upload timestamp ("" if invalid).
+function fmtUploadedAt(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 function h(tag, props = {}, children = []) {
   const e = document.createElement(tag);
   Object.assign(e, props);
@@ -218,12 +227,21 @@ function buildPanel(root) {
     for (const wf of items) {
       const cb = h("input", { type: "checkbox", checked: wf.uploaded });
       cb.dataset.path = wf.path;
-      const tag = wf.uploaded
-        ? h("span", {
-            style: "margin-left:6px;color:#4caf50;font-size:11px;",
-            textContent: "uploaded",
-          })
-        : null;
+      // Tag: green "uploaded <date>" normally; amber "changed · uploaded <date>"
+      // when the file changed on disk since (re-upload to refresh it).
+      let tag = null;
+      if (wf.uploaded) {
+        const when = fmtUploadedAt(wf.uploadedAt);
+        tag = wf.changed
+          ? h("span", {
+              style: "margin-left:6px;color:#ff9800;font-size:11px;",
+              textContent: when ? `changed · uploaded ${when}` : "changed since upload",
+            })
+          : h("span", {
+              style: "margin-left:6px;color:#4caf50;font-size:11px;",
+              textContent: when ? `uploaded ${when}` : "uploaded",
+            });
+      }
       const label = h(
         "label",
         {

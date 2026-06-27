@@ -51,6 +51,11 @@ function manifestKey(account) {
   return account ? `${LAST_MANIFEST_PREFIX}.${account}` : LAST_MANIFEST_PREFIX;
 }
 
+// Hard cap on how many workflows can be uploaded (anti-abuse). The plugin is the
+// gate: the App mirrors the manifest 1:1, so blocking here keeps the synced set
+// within the limit. Keep in sync with the App's AppLimits.workflowFloor.
+const MAX_WORKFLOWS = 100;
+
 // ---- small helpers -------------------------------------------------------
 
 function getApi() {
@@ -101,15 +106,23 @@ function saveLastManifest(account, manifest) {
   }
 }
 
-// Set of workflow ids present in the last uploaded manifest (any status).
-function uploadedIdSet(manifest) {
-  const set = new Set();
+// Map of uploaded workflow id -> { at, fingerprint } from the last manifest.
+// Only successfully-uploaded (status "ready") entries count — an "error" entry
+// was never really pushed. `at` = when it was uploaded; `fingerprint` lets the
+// UI detect a workflow that changed on disk since its last upload.
+function uploadedIndex(manifest) {
+  const map = new Map();
   if (manifest && Array.isArray(manifest.workflows)) {
     for (const w of manifest.workflows) {
-      if (w && w.id) set.add(w.id);
+      if (w && w.id && w.status === "ready") {
+        map.set(w.id, {
+          at: w.uploaded_at || manifest.updated_at || "",
+          fingerprint: w.fingerprint || "",
+        });
+      }
     }
   }
-  return set;
+  return map;
 }
 
 // ---- conversion ----------------------------------------------------------
@@ -227,29 +240,34 @@ async function enumerateWorkflows() {
 // ---- public API (consumed by the panel UI) -------------------------------
 
 // List the saved workflows for the management UI.
-//   -> [{ path, name, fingerprint, uploaded }]
-// `uploaded` = this workflow (by id = hash(path)) was in the last uploaded
-// manifest, so the UI default-checks it (keeping it in the manifest on the next
-// upload). Sorted by path for a stable display. Throws if the ComfyUI APIs are
-// unavailable so the UI can surface a clear message.
+//   -> [{ path, name, fingerprint, uploaded, uploadedAt, changed }]
+// `uploaded` = previously uploaded (by id = hash(path)); `uploadedAt` = ISO time
+// of that upload; `changed` = uploaded but the file changed on disk since (its
+// fingerprint differs) → the user should re-upload to refresh it. The UI default-
+// checks uploaded ones. Sorted by path for stable display. Throws if the ComfyUI
+// APIs are unavailable so the UI can surface a clear message.
 export async function listWorkflows() {
   if (!capabilitiesOk()) {
     throw new Error("ComfyUI workflow APIs are unavailable");
   }
   const { account } = await pairedAccount();
   const entries = await enumerateWorkflows();
-  const uploaded = uploadedIdSet(loadLastManifest(account));
+  const uploaded = uploadedIndex(loadLastManifest(account));
 
   const out = [];
   for (const entry of entries) {
     const path = entry && entry.path;
     if (typeof path !== "string" || !path) continue;
     const id = await workflowId(path);
+    const fp = fingerprintOf(entry);
+    const up = uploaded.get(id);
     out.push({
       path,
       name: nameOf(path),
-      fingerprint: fingerprintOf(entry),
-      uploaded: uploaded.has(id),
+      fingerprint: fp,
+      uploaded: !!up,
+      uploadedAt: up ? up.at : "",
+      changed: !!up && up.fingerprint !== "" && up.fingerprint !== fp,
     });
   }
   out.sort((x, y) => x.path.localeCompare(y.path));
@@ -273,6 +291,16 @@ export async function uploadSelected(paths) {
   if (!paired) {
     throw new Error("This PC is not paired");
   }
+  const selected = (Array.isArray(paths) ? paths : []).filter(
+    (p) => typeof p === "string" && p
+  );
+  // Anti-abuse cap: block (don't upload) when over the limit. The App mirrors
+  // the manifest 1:1, so this is where the 100-workflow ceiling is enforced.
+  if (selected.length > MAX_WORKFLOWS) {
+    throw new Error(
+      `Over the limit: ${selected.length} selected, max ${MAX_WORKFLOWS}. Uncheck some and upload again.`
+    );
+  }
   const a = getApi();
 
   // Current fingerprints for every workflow on disk (so each manifest entry
@@ -285,10 +313,9 @@ export async function uploadSelected(paths) {
   const workflows = []; // manifest entries (ONLY the selected workflows)
   const blobs = {}; // id -> API prompt, only for the ones that converted
   const errors = []; // [{ path, error }] for read/convert failures
+  const now = new Date().toISOString(); // upload time, stamped on ready entries
 
-  for (const path of Array.isArray(paths) ? paths : []) {
-    if (typeof path !== "string" || !path) continue;
-
+  for (const path of selected) {
     const id = await workflowId(path);
     const name = nameOf(path);
     const entry = byPath.get(path);
@@ -318,6 +345,7 @@ export async function uploadSelected(paths) {
         fingerprint,
         status: "ready",
         node_count: Object.keys(output).length,
+        uploaded_at: now,
       });
     } catch (e) {
       const error = String((e && e.message) || e);
