@@ -291,6 +291,16 @@ async def serve(stop: asyncio.Event | None = None) -> None:
     """
     comfy_url = detect_comfy_url()
     log.info("ComfyLink worker started (relay %s, comfy %s)", RELAY_URL, comfy_url)
+    # Per-process "sweep the orphans once" latch. ComfyUI's queue is in-memory, so
+    # a freshly started process is running zero jobs — yet the relay may still have
+    # claimed/running jobs from a previous run that was killed mid-job. We tell the
+    # relay to fail those exactly once, right after the FIRST successful register
+    # (see _abandon_orphans). The latch is a mutable dict so reconnects share it:
+    # a later _serve_paired re-register must NOT sweep again or it would kill a job
+    # that is genuinely running by then. (As to why the plugin owns this and not
+    # the relay's reaper: we re-register + heartbeat immediately on restart, so the
+    # reaper's "job stale AND backend offline" double-check never holds.)
+    swept = {"done": False}
     async with aiohttp.ClientSession() as session:
         while not _stopped(stop):
             if not STATE.paired:
@@ -298,7 +308,7 @@ async def serve(stop: asyncio.Event | None = None) -> None:
                 await asyncio.sleep(IDLE_RECHECK)
                 continue
             try:
-                await _serve_paired(session, comfy_url, stop)
+                await _serve_paired(session, comfy_url, stop, swept)
             except _Revoked:
                 STATE.clear_pairing()
                 STATE.save()
@@ -310,17 +320,44 @@ async def serve(stop: asyncio.Event | None = None) -> None:
                 await asyncio.sleep(5)
 
 
-async def _serve_paired(session, comfy_url, stop) -> None:
+async def _serve_paired(session, comfy_url, stop, swept=None) -> None:
     relay = RelayClient(session, RELAY_URL, TokenAuth(STATE))
     comfy = ComfyClient(session, comfy_url)
     worker = Worker(relay, comfy)
     STATUS.set(state="connecting", error="")
     await _register(relay, comfy)
+    # One-shot orphan sweep, AFTER a successful register and BEFORE we start
+    # claiming. Guarded by the per-process latch so a reconnect (network blip →
+    # re-enter _serve_paired) never sweeps a second time and kills a live job.
+    if swept is not None and not swept.get("done"):
+        await _abandon_orphans(relay, swept)
     hb = asyncio.create_task(_heartbeat_loop(relay, stop))
     try:
         await _claim_loop(relay, worker, stop)
     finally:
         hb.cancel()
+
+
+async def _abandon_orphans(relay: RelayClient, swept: dict) -> None:
+    """Fail any zombie jobs left claimed/running from a previous process run.
+
+    Called exactly once per process: a just-started worker is running zero jobs
+    (ComfyUI's queue is in-memory and empty on launch), so anything the relay
+    still has as claimed/running is a leftover from a run that was killed
+    mid-job. We ask the relay to mark those failed and latch ``swept['done']``
+    so we never sweep again — a later reconnect must not clear a job that is
+    genuinely running by then. Failures (network blip, relay hiccup) leave the
+    latch unset so the NEXT reconnect retries; we swallow the exception so a
+    failed sweep never tears down the serve loop.
+    """
+    try:
+        n = await relay.abandon_jobs(STATE.backend_id)
+    except Exception as e:  # noqa: BLE001 - best-effort; retry on next reconnect
+        log.warning("orphan sweep failed (will retry on reconnect): %s", e)
+        return
+    swept["done"] = True
+    if n > 0:
+        log.info("cleared %d orphaned job(s) from a previous run", n)
 
 
 def object_info_hash(oi: dict) -> str:

@@ -166,6 +166,22 @@ class RelayClient:
     async def heartbeat(self, backend_id: str) -> None:
         await self._json("POST", "/v1/backends/heartbeat", {"backend_id": backend_id})
 
+    async def abandon_jobs(self, backend_id: str) -> int:
+        """Fail every still-claimed/running job left on this backend.
+
+        Called once right after the worker's first successful register on a fresh
+        process: ComfyUI's queue is in-memory, so a just-started process is by
+        definition running zero jobs. Any job the relay still has as
+        claimed/running is therefore a zombie from a previous run that was killed
+        mid-job (the relay's reaper can't catch it — we immediately re-register
+        and heartbeat, so its 'job stale AND backend offline' double-check never
+        holds). The relay marks them failed and returns how many it cleared.
+        """
+        d = await self._json(
+            "POST", f"/v1/backends/{backend_id}/jobs/abandon", {}
+        )
+        return int(d.get("abandoned", 0))
+
     async def claim(self, backend_id: str) -> Optional[dict]:
         """Long-poll for a job. Returns the job, or None on a 204 timeout."""
         async with self._session.get(
