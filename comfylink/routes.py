@@ -19,7 +19,7 @@ from .config import RELAY_URL, STATE
 from .log import log
 from .relay import RelayClient, redeem_pair_code
 from .status import STATUS
-from .version import __version__
+from .version import __commit__, __version__
 
 
 async def _do_sync(relay, manifest: dict, blobs: dict, backend_id: str) -> int:
@@ -49,6 +49,7 @@ def register() -> None:
         snap["account"] = STATE.account  # paired account email (may be "")
         snap["relay_url"] = RELAY_URL
         snap["version"] = __version__
+        snap["commit"] = __commit__  # git short commit (panel display; "dev" if unknown)
         # no-store: the panel polls this; browsers must not serve a stale value.
         return web.json_response(snap, headers=_NO_CACHE)
 

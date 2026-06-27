@@ -169,7 +169,12 @@ function buildPanel(root) {
     if (s.error) lines.push(`Note: ${s.error}`);
     detail.textContent = lines.join("\n");
 
-    if (s.version) versionLine.textContent = `ComfyLink v${s.version}`;
+    if (s.version) {
+      // Show "ComfyLink v0.1.0 · <commit>" so the user can tell if they pulled
+      // the latest; hide the commit when unknown ("dev").
+      const c = s.commit && s.commit !== "dev" ? ` · ${s.commit}` : "";
+      versionLine.textContent = `ComfyLink v${s.version}${c}`;
+    }
 
     const paired = !!s.paired;
     pairForm.style.display = paired ? "none" : "block";
