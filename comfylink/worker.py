@@ -338,12 +338,29 @@ def object_info_hash(oi: dict) -> str:
 async def _register(relay: RelayClient, comfy: ComfyClient) -> None:
     try:
         resp = await relay.register(STATE.backend_id, STATE.backend_name)
-        # Account email for the panel ("paired to <email>"); best-effort, may be "".
-        STATE.account = (resp or {}).get("account", "") if isinstance(resp, dict) else ""
     except RelayError as e:
-        if e.status in (401, 403):
+        # 自愈:这台 ComfyUI 的 backend_id 已归**另一个账号**(换账号配对)。以**新配对
+        # 为准**——换一个新 backend_id 重新注册(旧 backend 留旧账号,离线孤儿)。一个
+        # ComfyUI 同时只服务一个配对。区别于真正的"被解除配对"(401 / 其它 403)。
+        if e.status == 403 and "owned by another account" in str(e):
+            STATE.reset_backend()
+            STATE.save()
+            log.info(
+                "backend was owned by another account; re-registering as new "
+                "backend %s (one ComfyUI = one pairing)", STATE.backend_id
+            )
+            try:
+                resp = await relay.register(STATE.backend_id, STATE.backend_name)
+            except RelayError as e2:
+                if e2.status in (401, 403):
+                    raise _Revoked() from e2
+                raise
+        elif e.status in (401, 403):
             raise _Revoked() from e
-        raise
+        else:
+            raise
+    # Account email for the panel ("paired to <email>"); best-effort, may be "".
+    STATE.account = (resp or {}).get("account", "") if isinstance(resp, dict) else ""
     try:
         oi = await comfy.object_info()
         new_hash = object_info_hash(oi)

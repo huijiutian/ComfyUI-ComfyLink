@@ -123,5 +123,13 @@ class State:
         self.device_id = ""
         self.account = ""
 
+    def reset_backend(self) -> None:
+        """换一个全新 backend_id(自愈用)。当这台 ComfyUI 的 backend_id 已归**另一个
+        账号**(换账号配对)时,以**新配对为准**:换新 id 重新注册,旧 backend 留给旧
+        账号(离线孤儿,可在旧账号 App 里删)。一个 ComfyUI 同时只服务一个配对。
+        清 object_info_hash 以便对新 backend 重传一次节点快照。"""
+        self.backend_id = str(uuid.uuid4())
+        self.object_info_hash = ""
+
 
 STATE = State.load()
