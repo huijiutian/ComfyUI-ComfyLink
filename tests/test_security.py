@@ -153,15 +153,14 @@ class TestStatePermissions(unittest.TestCase):
             import comfylink.config as cfg
             importlib.reload(cfg)
             st = cfg.State.load()
-            st.device_token = "clr_secret"
-            st.save()
+            st.add_pairing("clr_secret", "d1")  # appends + saves the token file
             self.assertTrue(os.path.isfile(path))
             if os.name == "posix":
                 mode = stat.S_IMODE(os.stat(path).st_mode)
                 self.assertEqual(mode, 0o600, oct(mode))
             # Round-trips regardless of platform.
             again = cfg.State.load()
-            self.assertEqual(again.device_token, "clr_secret")
+            self.assertEqual(again.pairings[0].device_token, "clr_secret")
         finally:
             del os.environ["COMFYLINK_STATE"]
 
@@ -181,8 +180,7 @@ class TestStatePermissions(unittest.TestCase):
             import comfylink.config as cfg
             importlib.reload(cfg)
             st = cfg.State.load()
-            st.device_token = "clr_secret"
-            st.save()
+            st.add_pairing("clr_secret", "d1")  # appends + saves the token file
             mode = stat.S_IMODE(os.stat(path).st_mode)
             self.assertEqual(mode, 0o600, oct(mode))
         finally:

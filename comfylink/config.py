@@ -2,7 +2,13 @@
 
 The relay address is baked in (no user config file). Pairing is done from the
 ComfyUI panel, not by editing JSON. The only on-disk file is an auto-managed
-state file (device token + ids) that the user never edits.
+state file (device tokens + ids) that the user never edits.
+
+One ComfyUI can be paired to MULTIPLE accounts at once. Each pairing carries its
+own backend_id + device token (the relay's backends table is one backend_id ↔
+one account, but a single machine simply registers several backend_ids — one per
+account). All pairings share one machine name; jobs run serially on the single
+local GPU.
 """
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ import json
 import os
 import socket
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 # Baked-in relay address. Override with COMFYLINK_RELAY_URL for local dev.
@@ -46,64 +53,137 @@ def _state_path() -> Path:
     return Path(__file__).resolve().parent.parent / "comfylink_state.json"
 
 
+@dataclass
+class Pairing:
+    """One account's pairing to this ComfyUI.
+
+    Each pairing gets its own backend_id so the relay's one-backend-per-account
+    model holds while a single machine serves several accounts concurrently.
+    """
+
+    backend_id: str
+    device_token: str
+    device_id: str = ""
+    # Paired account email (for the panel; "paired to <email>"). In-memory only —
+    # refreshed from the relay register response each start. NEVER persisted (no
+    # account PII at rest in the state file).
+    account: str = ""
+    # Hash of the last object_info snapshot successfully uploaded to R2 for THIS
+    # backend_id. Lets _register skip re-uploading an unchanged (multi-MB)
+    # snapshot. The object_info bucket is non-expiring, so a remembered hash
+    # guarantees the object is still there. Empty == "never uploaded" => uploads.
+    object_info_hash: str = ""
+
+
 class State:
-    """Auto-managed local state (not user-edited). Module singleton: [STATE]."""
+    """Auto-managed local state (not user-edited). Module singleton: [STATE].
+
+    Holds a list of pairings (one per paired account) plus a single machine name
+    shared by all of them.
+    """
 
     def __init__(self) -> None:
-        self.backend_id: str = ""
-        self.device_token: str = ""
-        self.device_id: str = ""
         self.backend_name: str = _default_name()
-        # Paired account email (for the panel; "paired to <email>"). In-memory only
-        # — refreshed from the relay register response each start, cleared on unpair.
-        # Never persisted (no account PII at rest in the state file).
-        self.account: str = ""
-        # Hash of the last object_info snapshot we successfully uploaded to R2.
-        # Lets _register skip re-uploading an unchanged (multi-MB) snapshot. The
-        # object_info bucket is non-expiring, so a remembered hash guarantees the
-        # object is still there. Empty == "never uploaded" => always uploads.
-        self.object_info_hash: str = ""
+        self.pairings: list[Pairing] = []
 
     @classmethod
     def load(cls) -> "State":
         st = cls()
         p = _state_path()
-        if p.is_file():
-            try:
-                d = json.loads(p.read_text("utf-8"))
-                st.backend_id = d.get("backend_id", "")
-                st.device_token = d.get("device_token", "")
-                st.device_id = d.get("device_id", "")
-                st.backend_name = d.get("backend_name") or st.backend_name
-                # Back-compat: missing in old state files loads as "" (re-upload).
-                st.object_info_hash = d.get("object_info_hash", "")
-            except Exception:
-                pass
-        if not st.backend_id:
-            st.backend_id = str(uuid.uuid4())
-            st.save()
+        if not p.is_file():
+            return st
+        try:
+            d = json.loads(p.read_text("utf-8"))
+        except Exception:
+            return st
+        if not isinstance(d, dict):
+            return st
+        st.backend_name = d.get("backend_name") or st.backend_name
+        raw = d.get("pairings")
+        if isinstance(raw, list):
+            # New multi-pairing format.
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                token = item.get("device_token") or ""
+                if not token:
+                    continue
+                st.pairings.append(Pairing(
+                    backend_id=item.get("backend_id") or str(uuid.uuid4()),
+                    device_token=token,
+                    device_id=item.get("device_id", ""),
+                    object_info_hash=item.get("object_info_hash", ""),
+                ))
+        else:
+            # Back-compat: old single-pairing top-level format. Convert to a
+            # 1-element pairings list IFF a device token was actually present
+            # (an unpaired old machine just loads as zero pairings).
+            token = d.get("device_token") or ""
+            if token:
+                st.pairings.append(Pairing(
+                    backend_id=d.get("backend_id") or str(uuid.uuid4()),
+                    device_token=token,
+                    device_id=d.get("device_id", ""),
+                    object_info_hash=d.get("object_info_hash", ""),
+                ))
         return st
 
     @property
     def paired(self) -> bool:
-        return bool(self.device_token)
+        return len(self.pairings) > 0
+
+    def get_pairing(self, backend_id: str) -> Pairing | None:
+        for pr in self.pairings:
+            if pr.backend_id == backend_id:
+                return pr
+        return None
+
+    def add_pairing(self, device_token: str, device_id: str) -> Pairing:
+        """Append a new pairing (fresh backend_id), persist, and return it."""
+        pr = Pairing(
+            backend_id=str(uuid.uuid4()),
+            device_token=device_token,
+            device_id=device_id,
+        )
+        self.pairings.append(pr)
+        self.save()
+        return pr
+
+    def remove_pairing(self, backend_id: str) -> Pairing | None:
+        """Drop the pairing with this backend_id, persist, return it (or None)."""
+        pr = self.get_pairing(backend_id)
+        if pr is not None:
+            self.pairings = [p for p in self.pairings if p.backend_id != backend_id]
+            self.save()
+        return pr
+
+    def clear_pairing(self) -> None:
+        """Remove ALL pairings (full local unpair) and persist."""
+        self.pairings = []
+        self.save()
 
     def save(self) -> None:
-        # The state file holds the device bearer token (clr_..., full capability
+        # The state file holds the device bearer tokens (clr_..., full capability
         # to drive this backend, never expires). On a shared/multi-user host a
-        # default-umask 0644 file would let any local user read that token, so we
-        # create it 0600 (owner read/write only) from the start — never even
+        # default-umask 0644 file would let any local user read those tokens, so
+        # we create it 0600 (owner read/write only) from the start — never even
         # briefly world-readable. On Windows os.chmod with these mode bits is a
         # best-effort no-op and does not throw.
         try:
             p = _state_path()
             p.parent.mkdir(parents=True, exist_ok=True)
             data = json.dumps({
-                "backend_id": self.backend_id,
-                "device_token": self.device_token,
-                "device_id": self.device_id,
                 "backend_name": self.backend_name,
-                "object_info_hash": self.object_info_hash,
+                # account is intentionally NOT persisted (no PII at rest).
+                "pairings": [
+                    {
+                        "backend_id": pr.backend_id,
+                        "device_token": pr.device_token,
+                        "device_id": pr.device_id,
+                        "object_info_hash": pr.object_info_hash,
+                    }
+                    for pr in self.pairings
+                ],
             })
             # Create with 0600 atomically (O_CREAT honors the mode only on
             # creation), then chmod to also tighten a pre-existing file that may
@@ -117,19 +197,6 @@ class State:
                 pass
         except Exception:
             pass
-
-    def clear_pairing(self) -> None:
-        self.device_token = ""
-        self.device_id = ""
-        self.account = ""
-
-    def reset_backend(self) -> None:
-        """换一个全新 backend_id(自愈用)。当这台 ComfyUI 的 backend_id 已归**另一个
-        账号**(换账号配对)时,以**新配对为准**:换新 id 重新注册,旧 backend 留给旧
-        账号(离线孤儿,可在旧账号 App 里删)。一个 ComfyUI 同时只服务一个配对。
-        清 object_info_hash 以便对新 backend 重传一次节点快照。"""
-        self.backend_id = str(uuid.uuid4())
-        self.object_info_hash = ""
 
 
 STATE = State.load()

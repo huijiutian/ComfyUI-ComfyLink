@@ -135,14 +135,16 @@ class TestState(unittest.TestCase):
             import comfylink.config as cfg
             importlib.reload(cfg)
             st = cfg.State.load()
-            self.assertTrue(st.backend_id)  # auto-generated
-            self.assertFalse(st.paired)
-            st.device_token = "clr_abc"
-            st.device_id = "d1"
-            st.save()
+            self.assertFalse(st.paired)  # no pairings yet
+            self.assertEqual(st.pairings, [])
+            pr = st.add_pairing("clr_abc", "d1")  # appends + saves + new backend_id
+            self.assertTrue(pr.backend_id)
             again = cfg.State.load()
-            self.assertEqual(again.device_token, "clr_abc")
             self.assertTrue(again.paired)
+            self.assertEqual(len(again.pairings), 1)
+            self.assertEqual(again.pairings[0].device_token, "clr_abc")
+            self.assertEqual(again.pairings[0].device_id, "d1")
+            self.assertEqual(again.pairings[0].backend_id, pr.backend_id)
             again.clear_pairing()
             self.assertFalse(again.paired)
         finally:

@@ -85,9 +85,26 @@ class TestUploadObjectInfo(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((key, url), ("k", "https://r2.example.com/u"))
 
 
+class _FakeState:
+    """DI-friendly stand-in for config.STATE — only backend_name + save() count.
+
+    object_info_hash now lives on the per-account Pairing (see config.Pairing),
+    so _register reads/writes the pairing; STATE only contributes the machine
+    name and a save() that this fake counts.
+    """
+
+    def __init__(self, backend_name="dev"):
+        self.backend_name = backend_name
+        self.save_calls = 0
+
+    def save(self):
+        self.save_calls += 1
+
+
 class TestRegisterToleratesUploadFailure(unittest.IsolatedAsyncioTestCase):
     async def test_online_even_when_upload_fails(self):
         from comfylink import worker
+        from comfylink.config import Pairing
 
         relay = mock.AsyncMock()
         comfy = mock.AsyncMock()
@@ -95,12 +112,12 @@ class TestRegisterToleratesUploadFailure(unittest.IsolatedAsyncioTestCase):
         # Upload blows up (e.g. relay 503 because R2 unconfigured).
         relay.upload_object_info.side_effect = RuntimeError("503 R2 not configured")
 
-        # Fresh state object so we don't touch the real on-disk state.
-        fake_state = _FakeState(backend_id="b1", object_info_hash="")
+        state = _FakeState()
+        pairing = Pairing(backend_id="b1", device_token="t", object_info_hash="")
         with mock.patch.object(worker, "STATUS") as status, \
-                mock.patch.object(worker, "STATE", fake_state):
+                mock.patch.object(worker, "STATE", state):
             # Should NOT raise — failure is tolerated.
-            await worker._register(relay, comfy)
+            await worker._register(relay, comfy, pairing)
 
         relay.register.assert_awaited_once()
         relay.upload_object_info.assert_awaited_once()
@@ -108,44 +125,34 @@ class TestRegisterToleratesUploadFailure(unittest.IsolatedAsyncioTestCase):
         states = [c.kwargs.get("state") for c in status.set.call_args_list]
         self.assertEqual(states[-1], "online")
         # Failure path must NOT persist the hash — next start retries.
-        self.assertEqual(fake_state.object_info_hash, "")
-        self.assertEqual(fake_state.save_calls, 0)
-
-
-class _FakeState:
-    """DI-friendly stand-in for config.STATE — counts save() calls."""
-
-    def __init__(self, backend_id="b1", backend_name="dev", object_info_hash=""):
-        self.backend_id = backend_id
-        self.backend_name = backend_name
-        self.object_info_hash = object_info_hash
-        self.save_calls = 0
-
-    def save(self):
-        self.save_calls += 1
+        self.assertEqual(pairing.object_info_hash, "")
+        self.assertEqual(state.save_calls, 0)
 
 
 class TestRegisterSkipLogic(unittest.IsolatedAsyncioTestCase):
     async def test_uploads_and_saves_hash_when_changed(self):
         from comfylink import worker
+        from comfylink.config import Pairing
 
         oi = {"A": {}, "B": {}}
         relay = mock.AsyncMock()
         comfy = mock.AsyncMock()
         comfy.object_info.return_value = oi
 
-        state = _FakeState(object_info_hash="")  # first run / nothing stored
+        state = _FakeState()
+        pairing = Pairing(backend_id="b1", device_token="t", object_info_hash="")
         with mock.patch.object(worker, "STATUS"), \
                 mock.patch.object(worker, "STATE", state):
-            await worker._register(relay, comfy)
+            await worker._register(relay, comfy, pairing)
 
         # Hash differs from "" => upload happens and the new hash is persisted.
-        relay.upload_object_info.assert_awaited_once_with(state.backend_id, oi)
-        self.assertEqual(state.object_info_hash, object_info_hash(oi))
+        relay.upload_object_info.assert_awaited_once_with(pairing.backend_id, oi)
+        self.assertEqual(pairing.object_info_hash, object_info_hash(oi))
         self.assertEqual(state.save_calls, 1)
 
     async def test_skips_upload_when_unchanged(self):
         from comfylink import worker
+        from comfylink.config import Pairing
 
         oi = {"A": {}, "B": {}}
         relay = mock.AsyncMock()
@@ -153,10 +160,12 @@ class TestRegisterSkipLogic(unittest.IsolatedAsyncioTestCase):
         comfy.object_info.return_value = oi
 
         # Stored hash already matches the current snapshot.
-        state = _FakeState(object_info_hash=object_info_hash(oi))
+        state = _FakeState()
+        pairing = Pairing(backend_id="b1", device_token="t",
+                          object_info_hash=object_info_hash(oi))
         with mock.patch.object(worker, "STATUS") as status, \
                 mock.patch.object(worker, "STATE", state):
-            await worker._register(relay, comfy)
+            await worker._register(relay, comfy, pairing)
 
         # Upload is skipped entirely; hash untouched; no save needed.
         relay.upload_object_info.assert_not_awaited()
@@ -169,6 +178,7 @@ class TestRegisterSkipLogic(unittest.IsolatedAsyncioTestCase):
 
     async def test_failure_does_not_update_hash(self):
         from comfylink import worker
+        from comfylink.config import Pairing
 
         oi = {"A": {}, "B": {}}
         relay = mock.AsyncMock()
@@ -176,14 +186,15 @@ class TestRegisterSkipLogic(unittest.IsolatedAsyncioTestCase):
         comfy.object_info.return_value = oi
         relay.upload_object_info.side_effect = RuntimeError("boom")
 
-        state = _FakeState(object_info_hash="")  # nothing stored, must retry
+        state = _FakeState()
+        pairing = Pairing(backend_id="b1", device_token="t", object_info_hash="")
         with mock.patch.object(worker, "STATUS"), \
                 mock.patch.object(worker, "STATE", state):
-            await worker._register(relay, comfy)  # tolerated, no raise
+            await worker._register(relay, comfy, pairing)  # tolerated, no raise
 
         relay.upload_object_info.assert_awaited_once()
         # Hash stays unset so the next start re-attempts the upload.
-        self.assertEqual(state.object_info_hash, "")
+        self.assertEqual(pairing.object_info_hash, "")
         self.assertEqual(state.save_calls, 0)
 
 

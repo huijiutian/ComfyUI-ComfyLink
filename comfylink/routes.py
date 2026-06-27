@@ -43,10 +43,15 @@ def register() -> None:
 
     @routes.get("/comfylink/status")
     async def _status(_request):
-        snap = STATUS.snapshot()
+        snap = STATUS.snapshot()  # machine-level: state/active/node_count/error
         snap["paired"] = STATE.paired
         snap["backend_name"] = STATE.backend_name
-        snap["account"] = STATE.account  # paired account email (may be "")
+        # One row per paired account; account email may be "" until that pairing
+        # registers (then the worker fills it in from the relay response).
+        snap["pairings"] = [
+            {"backend_id": pr.backend_id, "account": pr.account}
+            for pr in STATE.pairings
+        ]
         snap["relay_url"] = RELAY_URL
         snap["version"] = __version__
         snap["commit"] = __commit__  # git short commit (panel display; "dev" if unknown)
@@ -68,33 +73,44 @@ def register() -> None:
                 token, dev_id = await redeem_pair_code(s, RELAY_URL, code, name)
         except Exception as e:  # noqa: BLE001
             return web.json_response({"ok": False, "error": str(e)}, status=400)
-        STATE.device_token = token
-        STATE.device_id = dev_id
+        # Append a NEW pairing (one ComfyUI → many accounts); never replace the
+        # existing ones. The machine name is shared, so update it for all.
         STATE.backend_name = name
-        STATE.save()
+        STATE.add_pairing(token, dev_id)  # generates a fresh backend_id + saves
         STATUS.set(state="connecting", error="")
         log.info("paired via panel (device %s)", dev_id)
         return web.json_response({"ok": True})
 
     @routes.post("/comfylink/unpair")
-    async def _unpair(_request):
-        token, dev_id = STATE.device_token, STATE.device_id
-        STATE.clear_pairing()
-        STATE.save()
-        STATUS.set(state="unpaired", error="")
-        # Best-effort server-side revoke (local unpair already done).
-        if token and dev_id:
-            try:
-                async with aiohttp.ClientSession() as s:
-                    await s.delete(
-                        RELAY_URL.rstrip("/") + f"/v1/devices/{dev_id}",
-                        headers={"Authorization": f"Bearer {token}"},
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    )
-            except Exception:  # noqa: BLE001
-                pass
-        log.info("unpaired via panel")
-        return web.json_response({"ok": True})
+    async def _unpair(request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        backend_id = str(data.get("backend_id") or "").strip()
+        if backend_id:
+            pr = STATE.remove_pairing(backend_id)
+            removed = [pr] if pr is not None else []
+        else:
+            # No backend_id → unpair ALL accounts on this machine.
+            removed = list(STATE.pairings)
+            STATE.clear_pairing()
+        # Best-effort server-side revoke per removed device (local unpair done).
+        for pr in removed:
+            if pr.device_token and pr.device_id:
+                try:
+                    async with aiohttp.ClientSession() as s:
+                        await s.delete(
+                            RELAY_URL.rstrip("/") + f"/v1/devices/{pr.device_id}",
+                            headers={"Authorization": f"Bearer {pr.device_token}"},
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+        if not STATE.pairings:
+            STATUS.set(state="unpaired", error="")
+        log.info("unpaired %d pairing(s) via panel", len(removed))
+        return web.json_response({"ok": True, "removed": len(removed)})
 
     @routes.post("/comfylink/sync")
     async def _sync(request):
@@ -110,15 +126,35 @@ def register() -> None:
             return web.json_response({"ok": False, "error": "manifest required"}, status=400)
         if not isinstance(blobs, dict):
             blobs = {}
-        try:
-            async with aiohttp.ClientSession() as session:
-                relay = RelayClient(session, RELAY_URL, TokenAuth(STATE))
-                # device token stays server-side; only ok/uploaded/error go back.
-                uploaded = await _do_sync(relay, manifest, blobs, STATE.backend_id)
-        except Exception as e:  # noqa: BLE001
-            log.warning("workflow sync failed: %s", e)
-            return web.json_response({"ok": False, "error": str(e)}, status=502)
-        log.info("workflow sync uploaded %d blob(s) + manifest", uploaded)
-        return web.json_response({"ok": True, "uploaded": uploaded})
+        # Push the SAME catalog to every paired account so each account's app sees
+        # this machine's workflows (incl. any review/audit account). Per-pairing
+        # results are collected; one account's failure doesn't abort the others.
+        pairings = list(STATE.pairings)
+        results: list[dict] = []
+        errors: list[str] = []
+        async with aiohttp.ClientSession() as session:
+            for pr in pairings:
+                relay = RelayClient(session, RELAY_URL, TokenAuth(pr))
+                try:
+                    # device token stays server-side; only ok/uploaded/error go back.
+                    await _do_sync(relay, manifest, blobs, pr.backend_id)
+                    results.append({"account": pr.account, "ok": True})
+                except Exception as e:  # noqa: BLE001
+                    log.warning("workflow sync failed for backend %s: %s",
+                                pr.backend_id, e)
+                    errors.append(str(e))
+                    results.append({"account": pr.account, "ok": False, "error": str(e)})
+        if errors and len(errors) == len(pairings):
+            # Every account failed → surface an error so the panel shows it.
+            return web.json_response(
+                {"ok": False, "error": errors[0], "results": results}, status=502
+            )
+        log.info("workflow sync: %d blob(s) + manifest pushed to %d account(s)",
+                 len(blobs), len(pairings))
+        # `uploaded` mirrors the per-account blob count (the panel counts blobs
+        # itself); `results` carries the per-account breakdown.
+        return web.json_response(
+            {"ok": True, "uploaded": len(blobs), "results": results}
+        )
 
     log.info("ComfyLink panel routes registered")

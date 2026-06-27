@@ -284,80 +284,163 @@ async def _safe_fail(relay: RelayClient, job_id: str, message: str) -> None:
 
 
 async def serve(stop: asyncio.Event | None = None) -> None:
-    """Run the worker forever. Idles until paired (via the panel); connects and
-    serves jobs while paired; returns to idle if the device is unpaired.
+    """Supervise one service task per pairing; idle (unpaired) when there are none.
 
-    Relay address is baked in; pairing is done from the ComfyUI panel.
+    A single machine can be paired to several accounts at once — each pairing has
+    its own backend_id and runs its own register/heartbeat/claim loop. All jobs
+    share ONE global lock (one GPU → one generation at a time); whoever claims a
+    job first gets the lock first (asyncio.Lock is FIFO-fair).
+
+    Every IDLE_RECHECK seconds the supervisor reconciles: pairings in STATE with
+    no running task get one; tasks whose pairing was removed (unpaired) get
+    cancelled. Relay address is baked in; pairing is done from the ComfyUI panel.
     """
     comfy_url = detect_comfy_url()
     log.info("ComfyLink worker started (relay %s, comfy %s)", RELAY_URL, comfy_url)
-    # Per-process "sweep the orphans once" latch. ComfyUI's queue is in-memory, so
-    # a freshly started process is running zero jobs — yet the relay may still have
-    # claimed/running jobs from a previous run that was killed mid-job. We tell the
-    # relay to fail those exactly once, right after the FIRST successful register
-    # (see _abandon_orphans). The latch is a mutable dict so reconnects share it:
-    # a later _serve_paired re-register must NOT sweep again or it would kill a job
-    # that is genuinely running by then. (As to why the plugin owns this and not
-    # the relay's reaper: we re-register + heartbeat immediately on restart, so the
-    # reaper's "job stale AND backend offline" double-check never holds.)
-    swept = {"done": False}
+    # One generation at a time on the single local GPU, shared fairly across all
+    # paired accounts.
+    job_lock = asyncio.Lock()
+    # Per-process "swept orphans once" set, keyed by backend_id (see
+    # _abandon_orphans). Shared across reconnects so each backend is swept exactly
+    # once per process — never again on a later reconnect (which would kill a job
+    # that is genuinely running by then). The plugin owns this rather than the
+    # relay's reaper because we re-register + heartbeat immediately on restart, so
+    # the reaper's "job stale AND backend offline" double-check never holds.
+    swept: set[str] = set()
+    tasks: dict[str, asyncio.Task] = {}
     async with aiohttp.ClientSession() as session:
-        while not _stopped(stop):
-            if not STATE.paired:
-                STATUS.set(state="unpaired")
+        try:
+            while not _stopped(stop):
+                _reconcile(tasks, job_lock, session, comfy_url, stop, swept)
+                if not tasks:
+                    # No pairings → the machine is idle/unpaired.
+                    STATUS.set(state="unpaired", active=False, error="")
                 await asyncio.sleep(IDLE_RECHECK)
-                continue
-            try:
-                await _serve_paired(session, comfy_url, stop, swept)
-            except _Revoked:
-                STATE.clear_pairing()
-                STATE.save()
-                STATUS.set(state="unpaired", error="unpaired from the app")
-                log.info("device unpaired — back to idle")
-            except Exception as e:  # noqa: BLE001 - keep the loop alive
-                STATUS.set(state="error", error=str(e))
-                log.warning("connection error: %s; retrying in 5s", e)
-                await asyncio.sleep(5)
+        finally:
+            for t in tasks.values():
+                t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks.values(), return_exceptions=True)
 
 
-async def _serve_paired(session, comfy_url, stop, swept=None) -> None:
-    relay = RelayClient(session, RELAY_URL, TokenAuth(STATE))
+def _reconcile(tasks: dict, job_lock: asyncio.Lock, session, comfy_url,
+               stop: asyncio.Event | None, swept: set) -> None:
+    """Bring the running task set in line with STATE.pairings.
+
+    Reaps finished tasks, cancels tasks whose pairing was removed, and starts a
+    task for any pairing that lacks one. A pairing that revoked itself has already
+    removed itself from STATE (so it is not restarted); a task that crashed
+    unexpectedly while its pairing still exists IS restarted (resilience).
+    """
+    wanted = {pr.backend_id: pr for pr in STATE.pairings}
+    # Reap finished tasks (surfacing unexpected crashes); they may be restarted
+    # below if their pairing still exists.
+    for bid in list(tasks):
+        t = tasks[bid]
+        if t.done():
+            if not t.cancelled():
+                exc = t.exception()
+                if exc is not None:
+                    log.warning("pairing %s task exited unexpectedly: %s", bid, exc)
+            del tasks[bid]
+    # Cancel tasks whose pairing is gone (unpaired).
+    for bid in list(tasks):
+        if bid not in wanted:
+            tasks[bid].cancel()
+            del tasks[bid]
+    # Start a task for every pairing that lacks one.
+    for bid, pr in wanted.items():
+        if bid not in tasks:
+            tasks[bid] = asyncio.create_task(
+                _serve_pairing(pr, job_lock, session, comfy_url, stop, swept)
+            )
+
+
+async def _serve_pairing(pairing, job_lock: asyncio.Lock, session, comfy_url,
+                         stop: asyncio.Event | None, swept: set) -> None:
+    """Serve one pairing (one backend_id) until it is unpaired or stop is set.
+
+    Registers, sweeps this backend's orphans once, then claims+runs jobs under
+    the shared job_lock. A 401/403 from the relay means the account unpaired this
+    device → remove the pairing and return (the supervisor won't restart it).
+    Transient errors are logged and retried; one pairing's failure never tears
+    down the others.
+    """
+    relay = RelayClient(session, RELAY_URL, TokenAuth(pairing))
     comfy = ComfyClient(session, comfy_url)
     worker = Worker(relay, comfy)
-    STATUS.set(state="connecting", error="")
-    await _register(relay, comfy)
-    # One-shot orphan sweep, AFTER a successful register and BEFORE we start
-    # claiming. Guarded by the per-process latch so a reconnect (network blip →
-    # re-enter _serve_paired) never sweeps a second time and kills a live job.
-    if swept is not None and not swept.get("done"):
-        await _abandon_orphans(relay, swept)
-    hb = asyncio.create_task(_heartbeat_loop(relay, stop))
-    try:
-        await _claim_loop(relay, worker, stop)
-    finally:
-        hb.cancel()
+    bid = pairing.backend_id
+    while not _stopped(stop) and STATE.get_pairing(bid) is not None:
+        hb = None
+        try:
+            STATUS.set(state="connecting", error="")
+            await _register(relay, comfy, pairing)
+            # One-shot orphan sweep per backend, AFTER a successful register and
+            # BEFORE claiming. The shared `swept` set guards against re-sweeping
+            # on a later reconnect (which would kill a job that is live by then).
+            if bid not in swept:
+                await _abandon_orphans(relay, pairing, swept)
+            hb = asyncio.create_task(_heartbeat_loop(relay, pairing, stop))
+            await _claim_loop(relay, worker, pairing, job_lock, stop)
+        except asyncio.CancelledError:
+            raise
+        except _Revoked:
+            STATE.remove_pairing(bid)
+            log.info("device unpaired — removing pairing %s (%s)",
+                     bid, pairing.account or "?")
+            return
+        except Exception as e:  # noqa: BLE001 - isolate this pairing's failures
+            STATUS.set(error=str(e))
+            log.warning("pairing %s connection error: %s; retrying in 5s", bid, e)
+            await asyncio.sleep(5)
+        finally:
+            if hb is not None:
+                hb.cancel()
+                try:
+                    await hb
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001
+                    pass
 
 
-async def _abandon_orphans(relay: RelayClient, swept: dict) -> None:
-    """Fail any zombie jobs left claimed/running from a previous process run.
+async def _run_locked(job_lock: asyncio.Lock, worker: "Worker", job: dict) -> str:
+    """Run one job while holding the global generation lock.
 
-    Called exactly once per process: a just-started worker is running zero jobs
-    (ComfyUI's queue is in-memory and empty on launch), so anything the relay
-    still has as claimed/running is a leftover from a run that was killed
-    mid-job. We ask the relay to mark those failed and latch ``swept['done']``
-    so we never sweep again — a later reconnect must not clear a job that is
-    genuinely running by then. Failures (network blip, relay hiccup) leave the
-    latch unset so the NEXT reconnect retries; we swallow the exception so a
-    failed sweep never tears down the serve loop.
+    The single local GPU runs one generation at a time; multiple accounts queue
+    fairly on this lock (asyncio.Lock is FIFO). ``active`` is machine-level — set
+    only while a job actually runs (lock held), so the panel shows "generating"
+    whenever any account's job is on the GPU.
+    """
+    async with job_lock:
+        STATUS.set(active=True)
+        try:
+            return await worker.handle_job(job)
+        finally:
+            STATUS.set(active=False)
+
+
+async def _abandon_orphans(relay: RelayClient, pairing, swept: set) -> None:
+    """Fail any zombie jobs left claimed/running on this pairing's backend.
+
+    Called once per backend per process: a just-started worker is running zero
+    jobs (ComfyUI's queue is in-memory and empty on launch), so anything the
+    relay still has as claimed/running on this backend is a leftover from a run
+    that was killed mid-job. We ask the relay to mark those failed and record the
+    backend in ``swept`` so we never sweep it again — a later reconnect must not
+    clear a job that is genuinely running by then. Failures (network blip, relay
+    hiccup) leave the backend unswept so the NEXT reconnect retries; we swallow
+    the exception so a failed sweep never tears down the serve loop.
     """
     try:
-        n = await relay.abandon_jobs(STATE.backend_id)
+        n = await relay.abandon_jobs(pairing.backend_id)
     except Exception as e:  # noqa: BLE001 - best-effort; retry on next reconnect
         log.warning("orphan sweep failed (will retry on reconnect): %s", e)
         return
-    swept["done"] = True
+    swept.add(pairing.backend_id)
     if n > 0:
-        log.info("cleared %d orphaned job(s) from a previous run", n)
+        log.info("cleared %d orphaned job(s) from a previous run (backend %s)",
+                 n, pairing.backend_id)
 
 
 def object_info_hash(oi: dict) -> str:
@@ -372,72 +455,61 @@ def object_info_hash(oi: dict) -> str:
     ).hexdigest()
 
 
-async def _register(relay: RelayClient, comfy: ComfyClient) -> None:
+async def _register(relay: RelayClient, comfy: ComfyClient, pairing) -> None:
     try:
-        resp = await relay.register(STATE.backend_id, STATE.backend_name)
+        resp = await relay.register(pairing.backend_id, STATE.backend_name)
     except RelayError as e:
-        # 自愈:这台 ComfyUI 的 backend_id 已归**另一个账号**(换账号配对)。以**新配对
-        # 为准**——换一个新 backend_id 重新注册(旧 backend 留旧账号,离线孤儿)。一个
-        # ComfyUI 同时只服务一个配对。区别于真正的"被解除配对"(401 / 其它 403)。
-        if e.status == 403 and "owned by another account" in str(e):
-            STATE.reset_backend()
-            STATE.save()
-            log.info(
-                "backend was owned by another account; re-registering as new "
-                "backend %s (one ComfyUI = one pairing)", STATE.backend_id
-            )
-            try:
-                resp = await relay.register(STATE.backend_id, STATE.backend_name)
-            except RelayError as e2:
-                if e2.status in (401, 403):
-                    raise _Revoked() from e2
-                raise
-        elif e.status in (401, 403):
+        # 401/403 = this device was unpaired from the app (or its token is no
+        # longer valid) → treat as revoked so the supervisor drops the pairing.
+        # Each pairing owns a unique backend_id, so the old "owned by another
+        # account" self-heal is gone — a fresh pairing never collides.
+        if e.status in (401, 403):
             raise _Revoked() from e
-        else:
-            raise
+        raise
     # Account email for the panel ("paired to <email>"); best-effort, may be "".
-    STATE.account = (resp or {}).get("account", "") if isinstance(resp, dict) else ""
+    pairing.account = (resp or {}).get("account", "") if isinstance(resp, dict) else ""
     try:
         oi = await comfy.object_info()
         new_hash = object_info_hash(oi)
-        if STATE.object_info_hash and STATE.object_info_hash == new_hash:
+        if pairing.object_info_hash and pairing.object_info_hash == new_hash:
             # object_info bucket is non-expiring: a remembered hash means the
             # snapshot is still in R2, so skip the (multi-MB) re-upload.
             log.info(
                 "object_info unchanged (hash %s), skipping upload", new_hash[:12]
             )
         else:
-            await relay.upload_object_info(STATE.backend_id, oi)
+            await relay.upload_object_info(pairing.backend_id, oi)
             # Only remember the hash after a successful upload — on failure the
             # except below leaves it untouched so the next start retries.
-            STATE.object_info_hash = new_hash
+            pairing.object_info_hash = new_hash
             STATE.save()
             log.info(
                 "uploaded object_info (hash %s)", new_hash[:12]
             )
         STATUS.set(state="online", node_count=len(oi), error="")
-        log.info("registered backend %s (%d node types)", STATE.backend_id, len(oi))
+        log.info("registered backend %s (%d node types)", pairing.backend_id, len(oi))
     except Exception as e:  # noqa: BLE001 - online even if object_info upload failed
         STATUS.set(state="online", error=f"object_info: {e}")
         log.warning("object_info not reported (ComfyUI reachable?): %s", e)
 
 
-async def _heartbeat_loop(relay: RelayClient, stop: asyncio.Event | None) -> None:
-    while not _stopped(stop) and STATE.paired:
+async def _heartbeat_loop(relay: RelayClient, pairing,
+                          stop: asyncio.Event | None) -> None:
+    while not _stopped(stop) and STATE.get_pairing(pairing.backend_id) is not None:
         try:
-            await relay.heartbeat(STATE.backend_id)
+            await relay.heartbeat(pairing.backend_id)
         except Exception as e:  # noqa: BLE001 - claim loop handles revoke
             log.debug("heartbeat error: %s", e)
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 
-async def _claim_loop(relay: RelayClient, worker: Worker,
-                      stop: asyncio.Event | None) -> None:
-    log.info("listening for jobs (idle until one arrives)")
-    while not _stopped(stop) and STATE.paired:
+async def _claim_loop(relay: RelayClient, worker: Worker, pairing,
+                      job_lock: asyncio.Lock, stop: asyncio.Event | None) -> None:
+    bid = pairing.backend_id
+    log.info("listening for jobs on backend %s (idle until one arrives)", bid)
+    while not _stopped(stop) and STATE.get_pairing(bid) is not None:
         try:
-            job = await relay.claim(STATE.backend_id)
+            job = await relay.claim(bid)
         except RelayError as e:
             if e.status in (401, 403):
                 raise _Revoked() from e
@@ -450,11 +522,9 @@ async def _claim_loop(relay: RelayClient, worker: Worker,
             continue
         if job:
             log.info("claimed job %s", job.get("id"))
-            STATUS.set(active=True)
-            try:
-                await worker.handle_job(job)
-            finally:
-                STATUS.set(active=False)
+            # Serialize on the single GPU; STATUS.active is set inside _run_locked
+            # only while the job is actually on the GPU (not while it queues).
+            await _run_locked(job_lock, worker, job)
 
 
 def _stopped(stop: asyncio.Event | None) -> bool:

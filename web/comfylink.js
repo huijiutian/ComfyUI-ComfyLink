@@ -1,4 +1,4 @@
-// ComfyLink panel — pair this PC and show connection status.
+// ComfyLink panel — pair this PC (to one OR MORE accounts) and show status.
 // Registers a sidebar tab (current ComfyUI frontend); falls back to a toast if
 // the sidebar API is unavailable.
 import { app } from "../../scripts/app.js";
@@ -18,8 +18,14 @@ const api = {
     });
     return r.json();
   },
-  async unpair() {
-    const r = await fetch("/comfylink/unpair", { method: "POST" });
+  // Unpair ONE account by its backend_id. Omitting it server-side unpairs all,
+  // but the panel always targets a specific row.
+  async unpair(backendId) {
+    const r = await fetch("/comfylink/unpair", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ backend_id: backendId }),
+    });
     return r.json();
   },
 };
@@ -75,7 +81,18 @@ function buildPanel(root) {
     style: "color:var(--descrip-text,#aaa);margin-bottom:14px;white-space:pre-wrap;",
   });
 
-  // pairing form (shown when not paired)
+  // --- paired accounts list (one row per account, each with its own Unpair) ---
+  const accountsTitle = h("div", {
+    style: "font-weight:600;margin-bottom:6px;display:none;",
+    textContent: "Paired accounts",
+  });
+  const accountsList = h("div", { style: "margin-bottom:14px;" });
+
+  // --- pairing form: ALWAYS visible, used to ADD (append) more accounts -------
+  const formTitle = h("div", {
+    style: "font-weight:600;margin-bottom:6px;",
+    textContent: "Pair an account",
+  });
   const nameInput = h("input", {
     type: "text",
     placeholder: "Device name",
@@ -91,17 +108,17 @@ function buildPanel(root) {
     textContent: "Pair",
     style: "width:100%;padding:8px;cursor:pointer;",
   });
-  const pairForm = h("div", {}, [nameInput, codeInput, pairBtn]);
-
-  // unpair (shown when paired)
-  const unpairBtn = h("button", {
-    textContent: "Unpair this PC",
-    style: "width:100%;padding:8px;cursor:pointer;",
-  });
+  const pairForm = h("div", { style: "margin-bottom:8px;" }, [
+    formTitle,
+    nameInput,
+    codeInput,
+    pairBtn,
+  ]);
 
   // --- workflow management (shown when paired) ----------------------------
-  // Manual upload: pick which saved workflows to push to the app, convert them
-  // on the spot, and POST manifest + blobs. No background auto-sync.
+  // Manual upload: pick which saved workflows to push, convert them on the spot,
+  // and POST manifest + blobs. The plugin pushes the SAME catalog to every paired
+  // account. No background auto-sync.
   const manageBtn = h("button", {
     textContent: "Manage workflows",
     style: "width:100%;padding:8px;margin-top:8px;cursor:pointer;",
@@ -141,13 +158,56 @@ function buildPanel(root) {
   root.append(
     statusRow,
     detail,
+    accountsTitle,
+    accountsList,
     pairForm,
-    unpairBtn,
     manageBtn,
     managePanel,
     msg,
     versionLine
   );
+
+  // Render one row per paired account: email (or "pairing…" until it registers)
+  // and a per-account Unpair button.
+  function renderAccounts(pairings) {
+    accountsList.innerHTML = "";
+    const items = Array.isArray(pairings) ? pairings : [];
+    accountsTitle.style.display = items.length ? "block" : "none";
+    for (const p of items) {
+      const email = p.account || "pairing…";
+      const label = h("span", {
+        textContent: email,
+        style:
+          "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" +
+          (p.account ? "" : "color:var(--descrip-text,#aaa);font-style:italic;"),
+        title: email,
+      });
+      const btn = h("button", {
+        textContent: "Unpair",
+        style: "padding:3px 10px;cursor:pointer;font-size:11px;",
+      });
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try {
+          await api.unpair(p.backend_id);
+        } catch (e) {
+          /* refresh shows the resulting state regardless */
+        } finally {
+          refresh();
+        }
+      };
+      const row = h(
+        "div",
+        {
+          style:
+            "display:flex;align-items:center;gap:8px;padding:5px 0;" +
+            "border-bottom:1px solid var(--border-color,#333);",
+        },
+        [label, btn]
+      );
+      accountsList.append(row);
+    }
+  }
 
   async function refresh() {
     let s;
@@ -162,9 +222,6 @@ function buildPanel(root) {
     stateText.textContent = `${label}${s.active ? " · generating" : ""}`;
 
     const lines = [`Name: ${s.backend_name || "-"}`];
-    // Account (email) only exists once paired — tells the user WHICH account this
-    // PC is paired to (and which account's app sees its workflow uploads).
-    if (s.paired && s.account) lines.push(`Account: ${s.account}`);
     if (s.state === "online") lines.push(`Nodes: ${s.node_count}`);
     if (s.error) lines.push(`Note: ${s.error}`);
     detail.textContent = lines.join("\n");
@@ -176,9 +233,11 @@ function buildPanel(root) {
       versionLine.textContent = `ComfyLink v${s.version}${c}`;
     }
 
+    renderAccounts(s.pairings);
+
     const paired = !!s.paired;
-    pairForm.style.display = paired ? "none" : "block";
-    unpairBtn.style.display = paired ? "block" : "none";
+    // The pair form is ALWAYS visible (add more accounts); workflow management
+    // only makes sense once at least one account is paired.
     manageBtn.style.display = paired ? "block" : "none";
     if (!paired) managePanel.style.display = "none"; // collapse when unpaired
     if (!nameInput.value && s.backend_name) nameInput.value = s.backend_name;
@@ -198,7 +257,7 @@ function buildPanel(root) {
       if (r.ok) {
         codeInput.value = "";
         msg.style.color = "#4caf50";
-        msg.textContent = "Paired. Open “Manage workflows” to upload.";
+        msg.textContent = "Paired. The account appears above once it connects.";
       } else {
         msg.textContent = r.error || "Pairing failed.";
       }
@@ -208,11 +267,6 @@ function buildPanel(root) {
       pairBtn.disabled = false;
       refresh();
     }
-  };
-
-  unpairBtn.onclick = async () => {
-    await api.unpair();
-    refresh();
   };
 
   // --- workflow management wiring -----------------------------------------
@@ -314,7 +368,7 @@ function buildPanel(root) {
         wfStatus.textContent = `Uploaded ${uploaded}; ${errors.length} failed: ${failed}`;
       } else {
         wfStatus.style.color = "#4caf50";
-        wfStatus.textContent = `Uploaded ${uploaded} workflow(s).`;
+        wfStatus.textContent = `Uploaded ${uploaded} workflow(s) to all accounts.`;
       }
       // Reflect new "uploaded" tags / checkboxes.
       await loadWorkflows();

@@ -42,13 +42,13 @@
 import { app } from "../../scripts/app.js";
 import { api as apiFallback } from "../../scripts/api.js";
 
-// localStorage key for the last successfully-uploaded manifest, **scoped per
-// account** so re-pairing to a different account doesn't surface the previous
-// account's "uploaded" flags. Empty account (legacy / unknown) → the old fixed
-// key for back-compat.
-const LAST_MANIFEST_PREFIX = "comfylink.lastManifest";
-function manifestKey(account) {
-  return account ? `${LAST_MANIFEST_PREFIX}.${account}` : LAST_MANIFEST_PREFIX;
+// localStorage key for the last successfully-uploaded manifest. One ComfyUI can
+// now be paired to several accounts at once, and an upload pushes the SAME
+// catalog to ALL of them — so the "uploaded" flags are a machine-level fact, not
+// per-account. A single fixed key (the legacy unscoped one) holds it.
+const LAST_MANIFEST_KEY = "comfylink.lastManifest";
+function manifestKey() {
+  return LAST_MANIFEST_KEY;
 }
 
 // Hard cap on how many workflows can be uploaded (anti-abuse). The plugin is the
@@ -88,9 +88,9 @@ async function workflowId(path) {
   return hex.slice(0, 32);
 }
 
-function loadLastManifest(account) {
+function loadLastManifest() {
   try {
-    const raw = localStorage.getItem(manifestKey(account));
+    const raw = localStorage.getItem(manifestKey());
     if (!raw) return null;
     return JSON.parse(raw);
   } catch (e) {
@@ -98,9 +98,9 @@ function loadLastManifest(account) {
   }
 }
 
-function saveLastManifest(account, manifest) {
+function saveLastManifest(manifest) {
   try {
-    localStorage.setItem(manifestKey(account), JSON.stringify(manifest));
+    localStorage.setItem(manifestKey(), JSON.stringify(manifest));
   } catch (e) {
     console.warn("[ComfyLink] failed to persist last manifest", e);
   }
@@ -199,16 +199,15 @@ function capabilitiesOk() {
   return true;
 }
 
-// Returns { paired, account } from the local status endpoint. `account` is the
-// paired account email ("" if unknown/unpaired) — used to scope the uploaded-
-// manifest cache so switching accounts resets the "uploaded" flags.
-async function pairedAccount() {
+// Returns { paired } from the local status endpoint. `paired` is true when this
+// machine has at least one paired account. (Upload pushes to all of them.)
+async function pairedStatus() {
   try {
     const r = await fetch(`/comfylink/status?_=${Date.now()}`, { cache: "no-store" });
     const s = await r.json();
-    return { paired: !!s.paired, account: s.account || "" };
+    return { paired: !!s.paired };
   } catch (e) {
-    return { paired: false, account: "" };
+    return { paired: false };
   }
 }
 
@@ -250,9 +249,8 @@ export async function listWorkflows() {
   if (!capabilitiesOk()) {
     throw new Error("ComfyUI workflow APIs are unavailable");
   }
-  const { account } = await pairedAccount();
   const entries = await enumerateWorkflows();
-  const uploaded = uploadedIndex(loadLastManifest(account));
+  const uploaded = uploadedIndex(loadLastManifest());
 
   const out = [];
   for (const entry of entries) {
@@ -287,7 +285,7 @@ export async function uploadSelected(paths) {
   if (!capabilitiesOk()) {
     throw new Error("ComfyUI workflow APIs are unavailable");
   }
-  const { paired, account } = await pairedAccount();
+  const { paired } = await pairedStatus();
   if (!paired) {
     throw new Error("This PC is not paired");
   }
@@ -365,9 +363,9 @@ export async function uploadSelected(paths) {
     throw new Error((res && res.error) || "upload failed");
   }
 
-  // 4. Persist on success only (scoped to this account), so a failed POST doesn't
-  //    poison the "uploaded" flags. Reflects exactly what the App now browses.
-  saveLastManifest(account, manifest);
+  // 4. Persist on success only, so a failed POST doesn't poison the "uploaded"
+  //    flags. Reflects exactly what every paired account's app now browses.
+  saveLastManifest(manifest);
 
   return { uploaded: Object.keys(blobs).length, errors };
 }
