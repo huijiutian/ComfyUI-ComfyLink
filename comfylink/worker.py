@@ -337,7 +337,9 @@ def object_info_hash(oi: dict) -> str:
 
 async def _register(relay: RelayClient, comfy: ComfyClient) -> None:
     try:
-        await relay.register(STATE.backend_id, STATE.backend_name)
+        resp = await relay.register(STATE.backend_id, STATE.backend_name)
+        # Account email for the panel ("paired to <email>"); best-effort, may be "".
+        STATE.account = (resp or {}).get("account", "") if isinstance(resp, dict) else ""
     except RelayError as e:
         if e.status in (401, 403):
             raise _Revoked() from e

@@ -54,6 +54,10 @@ class State:
         self.device_token: str = ""
         self.device_id: str = ""
         self.backend_name: str = _default_name()
+        # Paired account email (for the panel; "paired to <email>"). In-memory only
+        # — refreshed from the relay register response each start, cleared on unpair.
+        # Never persisted (no account PII at rest in the state file).
+        self.account: str = ""
         # Hash of the last object_info snapshot we successfully uploaded to R2.
         # Lets _register skip re-uploading an unchanged (multi-MB) snapshot. The
         # object_info bucket is non-expiring, so a remembered hash guarantees the
@@ -117,6 +121,7 @@ class State:
     def clear_pairing(self) -> None:
         self.device_token = ""
         self.device_id = ""
+        self.account = ""
 
 
 STATE = State.load()

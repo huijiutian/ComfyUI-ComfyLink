@@ -19,6 +19,11 @@ the images come back to your phone. Your PC does the work; the app is the remote
 - A working ComfyUI install.
 - The ComfyLink app, signed in.
 
+> New to ComfyUI? See the official docs to install it and learn the basics:
+> - Documentation: https://docs.comfy.org
+> - ComfyUI repository: https://github.com/comfyanonymous/ComfyUI
+> - Example workflows: https://comfyanonymous.github.io/ComfyUI_examples/
+
 ## Install
 
 Clone into your ComfyUI `custom_nodes` folder and restart ComfyUI:
@@ -35,7 +40,7 @@ ComfyUI.
 
 1. After restarting ComfyUI, open the **ComfyLink** panel in the sidebar. It
    shows the connection status.
-2. In the **ComfyLink app**, tap **Pair a new PC** to get a one-time code.
+2. In the **ComfyLink app**, tap **Pair ComfyUI** to get a one-time code.
 3. Paste the code into the panel and click **Pair**.
 
 That's it — the panel turns **Online** and your machine shows up in the app,

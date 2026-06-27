@@ -42,10 +42,14 @@
 import { app } from "../../scripts/app.js";
 import { api as apiFallback } from "../../scripts/api.js";
 
-// Single localStorage key for the last successfully-uploaded manifest. backendId
-// isn't known in the browser; the browser is the single writer for v1, so a
-// fixed key is acceptable.
-const LAST_MANIFEST_KEY = "comfylink.lastManifest";
+// localStorage key for the last successfully-uploaded manifest, **scoped per
+// account** so re-pairing to a different account doesn't surface the previous
+// account's "uploaded" flags. Empty account (legacy / unknown) → the old fixed
+// key for back-compat.
+const LAST_MANIFEST_PREFIX = "comfylink.lastManifest";
+function manifestKey(account) {
+  return account ? `${LAST_MANIFEST_PREFIX}.${account}` : LAST_MANIFEST_PREFIX;
+}
 
 // ---- small helpers -------------------------------------------------------
 
@@ -83,9 +87,9 @@ async function workflowId(path) {
   return hex.slice(0, 32);
 }
 
-function loadLastManifest() {
+function loadLastManifest(account) {
   try {
-    const raw = localStorage.getItem(LAST_MANIFEST_KEY);
+    const raw = localStorage.getItem(manifestKey(account));
     if (!raw) return null;
     return JSON.parse(raw);
   } catch (e) {
@@ -93,9 +97,9 @@ function loadLastManifest() {
   }
 }
 
-function saveLastManifest(manifest) {
+function saveLastManifest(account, manifest) {
   try {
-    localStorage.setItem(LAST_MANIFEST_KEY, JSON.stringify(manifest));
+    localStorage.setItem(manifestKey(account), JSON.stringify(manifest));
   } catch (e) {
     console.warn("[ComfyLink] failed to persist last manifest", e);
   }
@@ -186,13 +190,16 @@ function capabilitiesOk() {
   return true;
 }
 
-async function isPaired() {
+// Returns { paired, account } from the local status endpoint. `account` is the
+// paired account email ("" if unknown/unpaired) — used to scope the uploaded-
+// manifest cache so switching accounts resets the "uploaded" flags.
+async function pairedAccount() {
   try {
     const r = await fetch(`/comfylink/status?_=${Date.now()}`, { cache: "no-store" });
     const s = await r.json();
-    return !!s.paired;
+    return { paired: !!s.paired, account: s.account || "" };
   } catch (e) {
-    return false;
+    return { paired: false, account: "" };
   }
 }
 
@@ -233,8 +240,9 @@ export async function listWorkflows() {
   if (!capabilitiesOk()) {
     throw new Error("ComfyUI workflow APIs are unavailable");
   }
+  const { account } = await pairedAccount();
   const entries = await enumerateWorkflows();
-  const uploaded = uploadedIdSet(loadLastManifest());
+  const uploaded = uploadedIdSet(loadLastManifest(account));
 
   const out = [];
   for (const entry of entries) {
@@ -265,7 +273,8 @@ export async function uploadSelected(paths) {
   if (!capabilitiesOk()) {
     throw new Error("ComfyUI workflow APIs are unavailable");
   }
-  if (!(await isPaired())) {
+  const { paired, account } = await pairedAccount();
+  if (!paired) {
     throw new Error("This PC is not paired");
   }
   const a = getApi();
@@ -332,9 +341,9 @@ export async function uploadSelected(paths) {
     throw new Error((res && res.error) || "upload failed");
   }
 
-  // 4. Persist on success only, so a failed POST doesn't poison the "uploaded"
-  //    flags. Reflects exactly what the App now browses.
-  saveLastManifest(manifest);
+  // 4. Persist on success only (scoped to this account), so a failed POST doesn't
+  //    poison the "uploaded" flags. Reflects exactly what the App now browses.
+  saveLastManifest(account, manifest);
 
   return { uploaded: Object.keys(blobs).length, errors };
 }

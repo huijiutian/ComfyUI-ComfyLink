@@ -46,6 +46,7 @@ def register() -> None:
         snap = STATUS.snapshot()
         snap["paired"] = STATE.paired
         snap["backend_name"] = STATE.backend_name
+        snap["account"] = STATE.account  # paired account email (may be "")
         snap["relay_url"] = RELAY_URL
         snap["version"] = __version__
         # no-store: the panel polls this; browsers must not serve a stale value.

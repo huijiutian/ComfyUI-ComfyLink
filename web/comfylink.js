@@ -153,6 +153,9 @@ function buildPanel(root) {
     stateText.textContent = `${label}${s.active ? " · generating" : ""}`;
 
     const lines = [`Name: ${s.backend_name || "-"}`];
+    // Account (email) only exists once paired — tells the user WHICH account this
+    // PC is paired to (and which account's app sees its workflow uploads).
+    if (s.paired && s.account) lines.push(`Account: ${s.account}`);
     if (s.state === "online") lines.push(`Nodes: ${s.node_count}`);
     if (s.error) lines.push(`Note: ${s.error}`);
     detail.textContent = lines.join("\n");
