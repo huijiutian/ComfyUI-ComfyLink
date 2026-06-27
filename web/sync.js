@@ -59,15 +59,11 @@ function getApi() {
   return app?.api ?? apiFallback;
 }
 
-function basename(path) {
-  const i = path.lastIndexOf("/");
-  return i >= 0 ? path.slice(i + 1) : path;
-}
-
 function nameOf(path) {
-  // Display name = file basename without the trailing ".json".
-  const b = basename(path);
-  return b.toLowerCase().endsWith(".json") ? b.slice(0, -5) : b;
+  // Display name = the workflow's relative path minus the trailing ".json", so
+  // workflows that share a filename across subdirs (sdxl/portrait.json vs
+  // flux/portrait.json) stay distinguishable instead of both showing "portrait".
+  return path.toLowerCase().endsWith(".json") ? path.slice(0, -5) : path;
 }
 
 function fingerprintOf(entry) {
