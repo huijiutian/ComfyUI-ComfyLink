@@ -1,0 +1,13 @@
+# local config & state (contain credentials / tokens)
+comfylink.json
+comfylink_state*.json
+*.local
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# os
+.DS_Store

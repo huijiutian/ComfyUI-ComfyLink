@@ -1,0 +1,30 @@
+# Comfy Registry manifest (https://registry.comfy.org).
+# Consumed by comfy-cli (`comfy node publish`) and ComfyUI-Manager.
+#
+# NOTE: the `version` here MUST stay in sync with comfylink __version__
+# (defined in comfylink/version.py). A test in tests/ enforces this.
+
+[project]
+name = "comfyui-comfylink"
+version = "0.1.0"
+description = "Turn your ComfyUI into a phone-driven remote backend via the ComfyLink app."
+license = { text = "MIT" }
+requires-python = ">=3.10"
+readme = "README.md"
+
+# No runtime dependencies are declared on purpose: aiohttp and Pillow already
+# ship with ComfyUI. Listing them would force pip to (re)resolve/reinstall them
+# and risk clobbering the versions ComfyUI was tested against.
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/huijiutian/ComfyUI-ComfyLink"
+
+[tool.comfy]
+# PublisherId: leave EMPTY. The human fills this in after creating a publisher
+# account on registry.comfy.org (`comfy node init` / the registry dashboard).
+PublisherId = ""
+DisplayName = "ComfyLink"
+# Icon: optional URL to a square icon shown on the registry listing. Leave empty
+# until one is hosted.
+Icon = ""

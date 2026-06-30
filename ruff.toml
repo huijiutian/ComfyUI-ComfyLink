@@ -1,0 +1,15 @@
+# Minimal ruff config — matches the existing code style.
+# Default rule set is Pyflakes (F) + a subset of pycodestyle errors (E); that is
+# what the code was written against (note the deliberate `# noqa` comments).
+# We do NOT enable E501 (line-length) because the code uses lines up to ~110
+# cols by design; line-length below only governs autofix/formatting width.
+line-length = 100
+target-version = "py310"
+
+[lint]
+# Pyflakes + pycodestyle errors — the sensible defaults. `# noqa: BLE001`,
+# `E402`, `F401` etc. in the code are honored.
+select = ["E", "F"]
+ignore = [
+  "E501",  # line too long — existing code intentionally exceeds 88/100
+]

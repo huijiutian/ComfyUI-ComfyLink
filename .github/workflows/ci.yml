@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: compile / test / lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # aiohttp is a runtime dep (bundled with ComfyUI). Installing it here means
+      # the tests exercise the real import path, not the in-test stub fallback.
+      - name: Install runtime + lint deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install aiohttp ruff
+
+      - name: Byte-compile sources
+        run: python -m py_compile __init__.py comfylink/*.py
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      # web/comfylink.js is an ES module (top-level `import`). `node --check` is
+      # unreliable for a bare-.js ESM file (it can pass even on bad syntax), so we
+      # parse it with acorn in module mode — a real, reliable syntax check.
+      # ubuntu-latest ships Node.js + npx, so no setup-node step is needed.
+      - name: Syntax-check JS (acorn, ESM)
+        run: npx --yes acorn --ecma2022 --module web/comfylink.js > /dev/null
