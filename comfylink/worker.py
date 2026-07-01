@@ -71,6 +71,19 @@ OUTPUTS_GRACE = 5.0  # seconds to wait for lagging outputs after "completed"
 # ComfyUI, never on a slow-but-healthy render.
 EXECUTION_BACKSTOP_TIMEOUT = 30 * 60  # seconds before abandoning a wedged prompt
 
+# REVOKED_CONFIRM_STRIKES is the depth-in-defence guard against a transient
+# 401/403 mis-unpairing a still-valid device. A revoke is *local and permanent*
+# (STATE.remove_pairing drops the pairing for good), so we must be sure before we
+# pull the trigger. The relay's root fix already maps a transient DB error to
+# 503 and only returns 401 when the device is GENUINELY gone (ErrNotFound), so a
+# single 401 *should* be a real revoke — but a relay redeploy/restart can still
+# briefly surface a stray 401/403. This is the second line of defence: we require
+# this many CONSECUTIVE auth rejections (a successful register in between resets
+# the count) before believing the device was truly unpaired. A real revoke still
+# lands after N tries (~N×5s ≈ 15s here), which is fine for a rare, user-driven
+# action; a lone blip is absorbed.
+REVOKED_CONFIRM_STRIKES = 3
+
 
 class _Revoked(Exception):
     """Device token no longer valid (unpaired from the app)."""
@@ -453,20 +466,32 @@ async def _serve_pairing(pairing, job_lock: asyncio.Lock, session, comfy_url,
     """Serve one pairing (one backend_id) until it is unpaired or stop is set.
 
     Registers, sweeps this backend's orphans once, then claims+runs jobs under
-    the shared job_lock. A 401/403 from the relay means the account unpaired this
-    device → remove the pairing and return (the supervisor won't restart it).
-    Transient errors are logged and retried; one pairing's failure never tears
-    down the others.
+    the shared job_lock. A 401/403 from the relay usually means the account
+    unpaired this device — but because unpairing is local + permanent, we don't
+    act on a single rejection: we require REVOKED_CONFIRM_STRIKES *consecutive*
+    401/403s (a successful register resets the count) before removing the pairing
+    and returning (the supervisor won't restart it). This absorbs any stray
+    transient 401/403 (e.g. during a relay redeploy) while a genuine revoke still
+    lands after N tries. Transient errors are logged and retried; one pairing's
+    failure never tears down the others.
     """
     relay = RelayClient(session, RELAY_URL, TokenAuth(pairing))
     comfy = ComfyClient(session, comfy_url)
     worker = Worker(relay, comfy)
     bid = pairing.backend_id
+    # Consecutive 401/403 auth-rejection count for the strike-based unpair
+    # confirmation (see REVOKED_CONFIRM_STRIKES). Reset to 0 on every successful
+    # register below so unrelated blips never compound into a false unpair.
+    revoked_strikes = 0
     while not _stopped(stop) and STATE.get_pairing(bid) is not None:
         hb = None
         try:
             STATUS.set(state="connecting", error="")
             await _register(relay, comfy, pairing)
+            # A successful register proves auth is still valid → clear any strikes
+            # accumulated from earlier transient 401/403 so they can't add up
+            # across unrelated blips.
+            revoked_strikes = 0
             # One-shot orphan sweep per backend, AFTER a successful register and
             # BEFORE claiming. The shared `swept` set guards against re-sweeping
             # on a later reconnect (which would kill a job that is live by then).
@@ -477,10 +502,26 @@ async def _serve_pairing(pairing, job_lock: asyncio.Lock, session, comfy_url,
         except asyncio.CancelledError:
             raise
         except _Revoked:
-            STATE.remove_pairing(bid)
-            log.info("device unpaired — removing pairing %s (%s)",
-                     bid, pairing.account or "?")
-            return
+            # Second line of defence (relay already returns 503 for transient
+            # errors, reserving 401 for a genuinely-missing device): don't unpair
+            # on a single 401/403. Only after REVOKED_CONFIRM_STRIKES *consecutive*
+            # rejections (any successful register above zeroes the count) do we
+            # treat it as a real revoke and drop the pairing for good.
+            revoked_strikes += 1
+            if revoked_strikes >= REVOKED_CONFIRM_STRIKES:
+                STATE.remove_pairing(bid)
+                log.info(
+                    "device unpaired — removing pairing %s (%s) after %d "
+                    "consecutive auth rejections",
+                    bid, pairing.account or "?", revoked_strikes,
+                )
+                return
+            STATUS.set(error="auth rejected; retrying")
+            log.warning(
+                "pairing %s auth rejected (strike %d/%d), retrying in 5s",
+                bid, revoked_strikes, REVOKED_CONFIRM_STRIKES,
+            )
+            await asyncio.sleep(5)
         except Exception as e:  # noqa: BLE001 - isolate this pairing's failures
             STATUS.set(error=str(e))
             log.warning("pairing %s connection error: %s; retrying in 5s", bid, e)

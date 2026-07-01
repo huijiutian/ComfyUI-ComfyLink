@@ -125,7 +125,15 @@ class TestServePairingSweepsOnce(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("blip")
             raise worker._Revoked()
 
-        with mock.patch.object(worker, "RelayClient", return_value=relay), \
+        # This test exercises the orphan-sweep-once-across-reconnect path and uses
+        # _Revoked only as the terminator. _register is mocked to always succeed,
+        # which resets the revoke-strike counter each loop (see
+        # REVOKED_CONFIRM_STRIKES), so pin the threshold to 1 here — otherwise a
+        # single _Revoked after a successful register would never reach the
+        # confirm threshold and _serve_pairing would retry forever. The
+        # strike-accumulation logic itself is covered by test_revoke_strikes.
+        with mock.patch.object(worker, "REVOKED_CONFIRM_STRIKES", 1), \
+                mock.patch.object(worker, "RelayClient", return_value=relay), \
                 mock.patch.object(worker, "ComfyClient"), \
                 mock.patch.object(worker, "Worker"), \
                 mock.patch.object(worker, "STATUS"), \
