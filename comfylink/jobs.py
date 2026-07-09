@@ -13,6 +13,15 @@ from xml.sax.saxutils import escape
 
 from .log import log
 
+
+class WebpConversionError(Exception):
+    """Raised when a WebP conversion was requested but failed (Pillow missing /
+    no libwebp encoder / decode error). encode_output raises this instead of
+    silently shipping the original PNG, so the unconverted PNG never reaches R2
+    and the worker reports a clear "failed" job. Caught by the worker's generic
+    job handler (handle_job) → reported as failed."""
+
+
 # Quality for PNG->WebP re-encode. 90 is a good size/fidelity tradeoff: it
 # shrinks typical diffusion outputs well below their PNG size while staying
 # visually lossless enough for the subscription "convert to WebP" feature.
@@ -89,11 +98,14 @@ def encode_output(
     through unchanged, with the content-type derived from the filename. We never
     run Pillow over a video — it would flatten/corrupt an animation.
 
-    The whole conversion is wrapped in try/except: if Pillow can't open/encode
-    the bytes, is too old to accept ``xmp=``, or is missing entirely, we fall
-    back to the original bytes/filename so a job is never crashed by the WebP
-    step. ``prompt`` only rides along when present in the source; its absence is
-    not an error.
+    Failure handling: an old Pillow that can't accept ``xmp=`` degrades to a
+    prompt-less WebP (still WebP — acceptable). But if the conversion genuinely
+    fails (Pillow missing, no libwebp encoder, undecodable bytes) we raise
+    :class:`WebpConversionError` rather than silently shipping the original PNG:
+    the user asked for WebP, and quietly uploading a larger unconverted PNG to R2
+    would inflate their staging usage and can trip the output-size cap. Failing
+    loudly surfaces the cause (fix the ComfyUI env or turn WebP off). ``prompt``
+    only rides along when present in the source; its absence is not an error.
 
     Note: we deliberately do NOT re-encode PNGs that stay PNG — ComfyUI already
     writes the prompt into the PNG ``tEXt`` and re-saving would risk dropping it.
@@ -125,9 +137,19 @@ def encode_output(
         webp = buf.getvalue()
         new_name = _swap_ext(filename, ".webp")
         return webp, new_name, "image/webp"
-    except Exception as e:  # noqa: BLE001 - never let conversion crash a job
-        log.warning("webp conversion failed for %s (%s); shipping original", filename, e)
-        return data, filename, content_type_for(filename)
+    except Exception as e:  # noqa: BLE001
+        # WebP was explicitly requested but conversion failed (Pillow missing, no
+        # libwebp encoder, decode error, …). Do NOT silently ship the original PNG
+        # — that puts an unconverted, larger PNG into R2 behind the user's back
+        # (they asked for WebP, and it inflates their staging usage / can trip the
+        # output-size cap). Fail loudly instead so the cause is visible and the PNG
+        # never reaches R2; the worker turns this into a reported "failed" job.
+        log.error("webp conversion failed for %s: %s", filename, e)
+        raise WebpConversionError(
+            f"WebP conversion failed for {filename}: {e}. "
+            "Ensure Pillow with WebP support is installed in your ComfyUI "
+            "environment, or turn off WebP output in the app settings."
+        ) from e
 
 
 def _swap_ext(filename: str, new_ext: str) -> str:

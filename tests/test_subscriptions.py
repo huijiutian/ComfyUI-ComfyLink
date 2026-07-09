@@ -15,7 +15,11 @@ from io import BytesIO
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from comfylink.jobs import encode_output, within_cap  # noqa: E402
+from comfylink.jobs import (  # noqa: E402
+    WebpConversionError,
+    encode_output,
+    within_cap,
+)
 
 try:
     from PIL import Image  # noqa: F401
@@ -90,13 +94,14 @@ class TestEncodeOutput(unittest.TestCase):
         self.assertEqual(filename, "a.png")
         self.assertEqual(ct, "image/png")
 
-    def test_garbage_bytes_fall_back_to_original(self):
+    def test_webp_conversion_failure_raises_not_fallback(self):
+        # WebP requested but bytes are undecodable → raise WebpConversionError
+        # rather than silently shipping the original (which would put an
+        # unconverted PNG into R2 behind the user's back). The worker turns this
+        # into a reported "failed" job; the original bytes never reach upload.
         garbage = b"not an image at all"
-        data, filename, ct = encode_output(garbage, "weird.dat", "webp")
-        # Conversion failed -> original bytes/filename, content-type by extension.
-        self.assertEqual(data, garbage)
-        self.assertEqual(filename, "weird.dat")
-        self.assertEqual(ct, "application/octet-stream")
+        with self.assertRaises(WebpConversionError):
+            encode_output(garbage, "weird.dat", "webp")
 
     def test_webp_preserves_prompt_but_not_workflow(self):
         # The prompt has XML-special chars so we also exercise escaping.
