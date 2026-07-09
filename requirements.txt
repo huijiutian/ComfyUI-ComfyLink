@@ -1,0 +1,14 @@
+# ComfyUI-ComfyLink runtime dependencies (installed by ComfyUI-Manager when the
+# custom node is added). Constraints are intentionally LOOSE (>=) so pip is very
+# unlikely to reinstall/downgrade the versions ComfyUI already ships — both of
+# these normally come with ComfyUI, so this file mainly guarantees a fresh or
+# minimal environment has them.
+
+# HTTP client for talking to the relay (long-poll claim, presigned upload, etc.).
+aiohttp>=3.9
+
+# Image handling for the "Convert outputs to WebP" output option. WebP is
+# best-effort: without Pillow (built with libwebp) the plugin ships the original
+# PNG instead of failing the job — installing this enables the conversion. Pillow
+# ships with WebP support on all mainstream platforms.
+Pillow>=9.1
