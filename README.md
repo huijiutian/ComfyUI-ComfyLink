@@ -1,9 +1,9 @@
-# ComfyUI-ComfyLink — run your ComfyUI from your phone
+# ComfyUI-ComfyLink — run your ComfyUI from your phone, from anywhere
 
 **ComfyLink lets you remotely control your own ComfyUI from a mobile app (iOS &
-Android).** Run your saved workflows from your phone, tweak the prompt and
-parameters, tap generate, and the images come back to your device — while the
-generation runs on your own PC/GPU at home.
+Android) — from anywhere, with a real prompt manager.** Run your saved workflows
+from your phone, tweak the prompt and parameters, tap generate, and the images
+come back to your device — while the generation runs on your own PC/GPU at home.
 
 If you've ever wanted a **ComfyUI mobile app**, **remote access to ComfyUI**, or
 a way to **start a generation from your phone and get the result on your phone**,
@@ -12,7 +12,25 @@ local ComfyUI with the ComfyLink app.
 
 - 📱 App: iOS (App Store) & Android (Google Play) — search "ComfyLink"
 - 🖥️ Your PC does the work; the app is just the remote control.
-- 🔒 Outbound-only, pair-once, no port forwarding, no cloud GPU.
+- 🔒 Outbound-only, pair-once — **no port forwarding, no VPN, no cloud GPU, and
+  your PC is never exposed to the internet.** Works on WiFi or 4G.
+- 🧩 **A real prompt manager on your phone** — not just a text box.
+
+## How is this different from other ComfyUI mobile tools?
+
+Most ComfyUI mobile tools are just a remote screen: they need your phone on the
+**same LAN** (or a port-forward / VPN / cloud box to reach your PC), and prompts
+are a **plain text box** — you retype or paste every time. ComfyLink is different
+on two fronts:
+
+1. **Works from anywhere, safely.** The plugin is **outbound-only** — your PC
+   connects out to a lightweight relay, so it works behind home NAT with **no port
+   forwarding, no VPN, and nothing exposed to the public internet**. On WiFi or on
+   4G, same thing.
+2. **A real prompt manager, on your phone.** Not a text box — organize prompts
+   into **presets and categories**, star your favorite terms into a **reusable
+   library**, tune **per-term weights**, and drop a whole preset into any workflow
+   with a tap. Build your prompt library once, reuse it everywhere.
 
 ## How it works
 
@@ -103,6 +121,13 @@ phone.
 The node is **outbound-only**: your PC connects out to a small relay, so it works
 behind home NAT with no port forwarding, no reverse proxy, and no VPN. You pair
 with a one-time code; nothing is exposed to the public internet.
+
+**Can I manage prompts on my phone, or is it just a text box?**
+It's a full prompt manager, not a plain text box. Organize prompts into presets
+and categories, star favorite terms into a reusable library, tune per-term
+weights, and drop a whole preset into any workflow with a tap — all on your phone.
+Most mobile ComfyUI tools only let you retype prompts in a text field; ComfyLink
+lets you build a prompt library once and reuse it everywhere.
 
 **Does it run generation on someone else's servers / a cloud GPU?**
 No. All image generation runs on **your own hardware**. Our relay only passes small
