@@ -1,10 +1,18 @@
-# ComfyUI-ComfyLink
+# ComfyUI-ComfyLink — run your ComfyUI from your phone
 
-Drive your own ComfyUI from your phone with the **ComfyLink** app.
+**ComfyLink lets you remotely control your own ComfyUI from a mobile app (iOS &
+Android).** Run your saved workflows from your phone, tweak the prompt and
+parameters, tap generate, and the images come back to your device — while the
+generation runs on your own PC/GPU at home.
 
-This custom node connects your local ComfyUI to ComfyLink so the mobile app can
-run your workflows remotely — pick a workflow, tweak parameters, generate, and
-the images come back to your phone. Your PC does the work; the app is the remote.
+If you've ever wanted a **ComfyUI mobile app**, **remote access to ComfyUI**, or
+a way to **start a generation from your phone and get the result on your phone**,
+that's exactly what this is. This repo is the ComfyUI custom node; it pairs your
+local ComfyUI with the ComfyLink app.
+
+- 📱 App: iOS (App Store) & Android (Google Play) — search "ComfyLink"
+- 🖥️ Your PC does the work; the app is just the remote control.
+- 🔒 Outbound-only, pair-once, no port forwarding, no cloud GPU.
 
 ## How it works
 
@@ -76,6 +84,53 @@ git pull
 
 The sidebar panel shows the running version and commit, so you can confirm
 you're on the latest.
+
+## FAQ
+
+**Can I run ComfyUI from my phone?**
+Yes. ComfyLink is a mobile app (iOS & Android) that runs your existing ComfyUI
+workflows remotely. You install this custom node on your PC's ComfyUI, pair it
+once with the app, and then trigger generations from your phone — the images come
+back to your device.
+
+**Is there a ComfyUI mobile app?**
+ComfyLink is a mobile companion for your *own* ComfyUI. It doesn't generate images
+in the cloud — your PC/GPU does the work, and the app is the remote control. You
+pick a workflow, adjust the prompt/parameters, generate, and view results on your
+phone.
+
+**How do I access ComfyUI remotely without port forwarding or a VPN?**
+The node is **outbound-only**: your PC connects out to a small relay, so it works
+behind home NAT with no port forwarding, no reverse proxy, and no VPN. You pair
+with a one-time code; nothing is exposed to the public internet.
+
+**Does it run generation on someone else's servers / a cloud GPU?**
+No. All image generation runs on **your own hardware**. Our relay only passes small
+job messages and briefly stages the output image so it can reach your phone (then
+it's auto-deleted). No cloud GPU, no images stored long-term on our side.
+
+**Can I keep using ComfyUI on my PC while using the app?**
+Yes. App jobs and anything you run locally share the same ComfyUI queue (one GPU),
+but each job's outputs stay with that job — your local generations are never mixed
+into the app's gallery.
+
+**Which workflows show up in the app?**
+Only the ones you pick. After pairing, use **Manage workflows** in the panel to
+select which saved workflows are pushed to the app.
+
+**Is it free? What are the limits?**
+The core remote-control features work on the free tier. Paid tiers (Plus/Pro) raise
+usage limits (prompt presets, per-generation size, staging throughput). See the app.
+
+**iPhone or Android?**
+Both — the app is on the App Store (iOS) and Google Play (Android). Search
+"ComfyLink".
+
+## Keywords
+
+ComfyUI mobile app · run ComfyUI from phone · remote control ComfyUI · ComfyUI
+remote access · ComfyUI iOS app · ComfyUI Android app · control ComfyUI from
+iPhone · trigger ComfyUI workflow from phone · self-hosted Stable Diffusion remote
 
 ## License
 
