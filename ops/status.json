@@ -3,5 +3,12 @@
   "severity": "info",
   "message_en": "",
   "message_zh": "",
-  "url": ""
+  "url": "",
+  "promo": {
+    "active": false,
+    "message_en": "",
+    "message_zh": "",
+    "cta_en": "",
+    "cta_zh": ""
+  }
 }
