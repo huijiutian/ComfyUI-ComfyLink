@@ -61,6 +61,13 @@ POLL_INTERVAL = 1.0  # seconds between REST status polls
 # outputs to materialise before handing off to _collect_outputs.
 OUTPUTS_GRACE = 5.0  # seconds to wait for lagging outputs after "completed"
 
+# UPLOAD_CONCURRENCY caps how many collected outputs upload to R2 at once. The
+# local→R2 uplink is the bottleneck for multi-image batches, so a small fan-out
+# (sign_upload + put_object per output) meaningfully cuts wall time; the cap
+# keeps it a steady parallelism that a slow/thin connection can sustain without
+# exhausting its connection slots.
+UPLOAD_CONCURRENCY = 4  # max outputs uploading to R2 concurrently
+
 # EXECUTION_BACKSTOP_TIMEOUT is a conservative last-resort cap: if a prompt sits
 # in ComfyUI's running queue this long without ever completing, we give up on it
 # and report failed(error_code='execution_stalled') so the worker is freed for
@@ -334,16 +341,30 @@ class Worker:
 
         Each payload carries ``media_type`` ("image"|"video") and the resolved
         ``content_type`` so the relay/app can render images vs videos correctly.
+
+        Uploads run concurrently (bounded by UPLOAD_CONCURRENCY) since the R2
+        uplink dominates a multi-image batch's wall time. The returned list is
+        gathered in ``items`` order — the app renders outputs in sequence, so it
+        must never be reordered. Failure semantics are unchanged: any single
+        sign_upload/put_object exception propagates out (gather's default), and
+        handle_job's except turns it into a failed result.
         """
-        out: list[dict] = []
-        for it in items:
-            ct = it["content_type"]
-            key, url = await self.relay.sign_upload(job_id, "output", it["filename"], ct)
-            await self.relay.put_object(url, it["data"], ct)
-            out.append({"r2_key": key, "filename": it["filename"],
+        sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+
+        async def upload_one(it: dict) -> dict:
+            async with sem:
+                ct = it["content_type"]
+                key, url = await self.relay.sign_upload(
+                    job_id, "output", it["filename"], ct)
+                await self.relay.put_object(url, it["data"], ct)
+                return {"r2_key": key, "filename": it["filename"],
                         "subfolder": it["subfolder"], "type": it["type"],
-                        "media_type": it["media_type"], "content_type": ct})
-        return out
+                        "media_type": it["media_type"], "content_type": ct}
+
+        # Tasks are built in items order, and gather preserves that order, so the
+        # returned payloads stay aligned with the input regardless of completion
+        # order. return_exceptions defaults to False → first error propagates.
+        return await asyncio.gather(*(upload_one(it) for it in items))
 
 
 def _queue_has(q: dict, key: str, prompt_id: str) -> bool:
