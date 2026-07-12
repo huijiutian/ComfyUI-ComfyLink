@@ -43,12 +43,14 @@ import { app } from "../../scripts/app.js";
 import { api as apiFallback } from "../../scripts/api.js";
 
 // localStorage key for the last successfully-uploaded manifest. One ComfyUI can
-// now be paired to several accounts at once, and an upload pushes the SAME
-// catalog to ALL of them — so the "uploaded" flags are a machine-level fact, not
-// per-account. A single fixed key (the legacy unscoped one) holds it.
-const LAST_MANIFEST_KEY = "comfylink.lastManifest";
-function manifestKey() {
-  return LAST_MANIFEST_KEY;
+// be paired to several accounts at once, and an upload targets a SET of accounts
+// (the ones checked in the panel) — so the "uploaded" flags are an ACCOUNT-LEVEL
+// fact, not machine-level. Each account gets its own key, scoped by backend_id,
+// so the UI reflects what THAT account has actually received. The list UI shows
+// the INTERSECTION across the currently-checked accounts.
+const LAST_MANIFEST_PREFIX = "comfylink.lastManifest";
+function manifestKey(backendId) {
+  return `${LAST_MANIFEST_PREFIX}:${backendId}`;
 }
 
 // Hard cap on how many workflows can be uploaded (anti-abuse). The plugin is the
@@ -88,9 +90,9 @@ async function workflowId(path) {
   return hex.slice(0, 32);
 }
 
-function loadLastManifest() {
+function loadLastManifest(backendId) {
   try {
-    const raw = localStorage.getItem(manifestKey());
+    const raw = localStorage.getItem(manifestKey(backendId));
     if (!raw) return null;
     return JSON.parse(raw);
   } catch (e) {
@@ -98,9 +100,9 @@ function loadLastManifest() {
   }
 }
 
-function saveLastManifest(manifest) {
+function saveLastManifest(manifest, backendId) {
   try {
-    localStorage.setItem(manifestKey(), JSON.stringify(manifest));
+    localStorage.setItem(manifestKey(backendId), JSON.stringify(manifest));
   } catch (e) {
     console.warn("[ComfyLink] failed to persist last manifest", e);
   }
@@ -200,7 +202,7 @@ function capabilitiesOk() {
 }
 
 // Returns { paired } from the local status endpoint. `paired` is true when this
-// machine has at least one paired account. (Upload pushes to all of them.)
+// machine has at least one paired account. (Upload targets the checked accounts.)
 async function pairedStatus() {
   try {
     const r = await fetch(`/comfylink/status?_=${Date.now()}`, { cache: "no-store" });
@@ -211,13 +213,14 @@ async function pairedStatus() {
   }
 }
 
-async function postSync(manifest, blobs) {
+async function postSync(manifest, blobs, backendIds) {
   const r = await fetch("/comfylink/sync", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ manifest, blobs }),
+    body: JSON.stringify({ manifest, blobs, backend_ids: backendIds }),
   });
-  // Python returns { ok, uploaded } or { ok:false, error }.
+  // Python returns { ok, uploaded, results:[{backend_id,account,ok,error?}] }
+  // or { ok:false, error, results? }.
   return r.json();
 }
 
@@ -239,18 +242,26 @@ async function enumerateWorkflows() {
 // ---- public API (consumed by the panel UI) -------------------------------
 
 // List the saved workflows for the management UI.
+//   backendIds: the currently-checked accounts; markers are the INTERSECTION of
+//     their per-account "uploaded" indexes.
 //   -> [{ path, name, fingerprint, uploaded, uploadedAt, changed }]
-// `uploaded` = previously uploaded (by id = hash(path)); `uploadedAt` = ISO time
-// of that upload; `changed` = uploaded but the file changed on disk since (its
-// fingerprint differs) → the user should re-upload to refresh it. The UI default-
-// checks uploaded ones. Sorted by path for stable display. Throws if the ComfyUI
-// APIs are unavailable so the UI can surface a clear message.
-export async function listWorkflows() {
+// `uploaded` = previously uploaded to EVERY checked account (by id = hash(path)),
+// so the UI default-checks it only when all targets already have it;
+// `uploadedAt` = the most-recent upload time across those accounts; `changed` =
+// uploaded to all accounts but the file changed on disk since (its fingerprint
+// differs for at least one account) → re-upload to refresh it. Empty backendIds
+// → no markers (all unchecked). Sorted by path for stable display. Throws if the
+// ComfyUI APIs are unavailable so the UI can surface a clear message.
+export async function listWorkflows(backendIds) {
   if (!capabilitiesOk()) {
     throw new Error("ComfyUI workflow APIs are unavailable");
   }
+  const ids = (Array.isArray(backendIds) ? backendIds : []).filter(
+    (b) => typeof b === "string" && b
+  );
   const entries = await enumerateWorkflows();
-  const uploaded = uploadedIndex(loadLastManifest());
+  // One uploaded index per checked account; markers = intersection across them.
+  const indexes = ids.map((b) => uploadedIndex(loadLastManifest(b)));
 
   const out = [];
   for (const entry of entries) {
@@ -258,32 +269,58 @@ export async function listWorkflows() {
     if (typeof path !== "string" || !path) continue;
     const id = await workflowId(path);
     const fp = fingerprintOf(entry);
-    const up = uploaded.get(id);
+    let uploaded = false;
+    let changed = false;
+    let uploadedAt = "";
+    if (ids.length) {
+      // Uploaded only when it's in EVERY checked account's manifest.
+      uploaded = indexes.every((idx) => idx.has(id));
+      if (uploaded) {
+        for (const idx of indexes) {
+          const up = idx.get(id);
+          // Most-recent upload time across the accounts (display only).
+          if (up && up.at && up.at > uploadedAt) uploadedAt = up.at;
+          // Changed if ANY account's stored fingerprint differs from disk.
+          if (up && up.fingerprint !== "" && up.fingerprint !== fp) changed = true;
+        }
+      }
+    }
     out.push({
       path,
       name: nameOf(path),
       fingerprint: fp,
-      uploaded: !!up,
-      uploadedAt: up ? up.at : "",
-      changed: !!up && up.fingerprint !== "" && up.fingerprint !== fp,
+      uploaded,
+      uploadedAt,
+      changed,
     });
   }
   out.sort((x, y) => x.path.localeCompare(y.path));
   return out;
 }
 
-// Upload exactly the selected workflows.
+// Upload exactly the selected workflows to a SET of accounts.
 //   paths: string[] of workflow-relative paths (from listWorkflows()).
-//   -> { uploaded, errors: [{ path, error }] }
-// For each selected path we read its saved UI graph, convert it on the spot,
-// and collect a blob; conversion/read failures are recorded as status:"error"
-// (no blob) and surfaced in `errors`. The manifest contains ONLY the selected
-// items, so the App will browse exactly this set. On a successful POST the
-// localStorage manifest is updated (drives the "uploaded" flag next time).
-// Throws if not paired, capabilities are missing, or the POST itself fails.
-export async function uploadSelected(paths) {
+//   backendIds: the checked accounts (backend_id[]) this catalog is pushed to.
+//   -> { uploaded, errors: [{ path, error }], accounts: string[] }
+// For each selected path we read its saved UI graph and convert it on the spot
+// ONCE; the resulting blobs + manifest are POSTed a single time and the plugin
+// fans them out to every target account. Conversion/read failures are recorded
+// as status:"error" (no blob) and surfaced in `errors`. The manifest contains
+// ONLY the selected items, so each target account's App browses exactly this
+// set. On a successful POST the per-account localStorage manifest is saved for
+// EACH account that synced OK (from the response's per-account results); accounts
+// that failed keep their old marker. `accounts` is the human-readable list of
+// successfully-synced accounts. Throws if no account is checked, not paired,
+// capabilities are missing, or the POST itself fails outright.
+export async function uploadSelected(paths, backendIds) {
   if (!capabilitiesOk()) {
     throw new Error("ComfyUI workflow APIs are unavailable");
+  }
+  const ids = (Array.isArray(backendIds) ? backendIds : []).filter(
+    (b) => typeof b === "string" && b
+  );
+  if (!ids.length) {
+    throw new Error("no account selected");
   }
   const { paired } = await pairedStatus();
   if (!paired) {
@@ -358,14 +395,32 @@ export async function uploadSelected(paths) {
     updated_at: new Date().toISOString(),
     workflows,
   };
-  const res = await postSync(manifest, blobs);
+  const res = await postSync(manifest, blobs, ids);
   if (!res || !res.ok) {
     throw new Error((res && res.error) || "upload failed");
   }
 
-  // 4. Persist on success only, so a failed POST doesn't poison the "uploaded"
-  //    flags. Reflects exactly what every paired account's app now browses.
-  saveLastManifest(manifest);
+  // 4. Persist per account that actually synced OK, so a failed account doesn't
+  //    poison its "uploaded" flags. Each account's manifest reflects exactly what
+  //    THAT account's app now browses. Fall back to all ids if the server didn't
+  //    return per-account results (older shape).
+  const results = Array.isArray(res.results) ? res.results : [];
+  const okResults = results.filter((r) => r && r.ok);
+  const okIds = results.length
+    ? okResults.map((r) => r.backend_id).filter((b) => typeof b === "string" && b)
+    : ids;
+  for (const bid of okIds) {
+    saveLastManifest(manifest, bid);
+  }
 
-  return { uploaded: Object.keys(blobs).length, errors };
+  // Human-readable list of the accounts that succeeded (email, else backend_id).
+  const accounts = results.length
+    ? okResults.map((r) => r.account || r.backend_id)
+    : ids;
+
+  return {
+    uploaded: Object.keys(blobs).length,
+    errors,
+    accounts,
+  };
 }

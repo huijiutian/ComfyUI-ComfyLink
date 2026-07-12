@@ -5,6 +5,7 @@ The web/ frontend extension calls these:
   POST /comfylink/pair    → redeem a one-time pairing code
   POST /comfylink/unpair  → drop the pairing (and revoke server-side)
   POST /comfylink/sync    → push a workflow catalog (manifest + blobs) to R2
+                            for a chosen set of accounts (by backend_ids)
 """
 
 from __future__ import annotations
@@ -127,33 +128,62 @@ def register() -> None:
             return web.json_response({"ok": False, "error": "manifest required"}, status=400)
         if not isinstance(blobs, dict):
             blobs = {}
-        # Push the SAME catalog to every paired account so each account's app sees
-        # this machine's workflows (incl. any review/audit account). Per-pairing
-        # results are collected; one account's failure doesn't abort the others.
-        pairings = list(STATE.pairings)
+        # Push this catalog to the SET of accounts the user checked in the panel
+        # (identified by backend_ids). One ComfyUI can be paired to several
+        # accounts; each upload targets one or more of them. The same blobs +
+        # manifest are pushed once per account (each with its own device token).
+        backend_ids = data.get("backend_ids")
+        if not isinstance(backend_ids, list) or not backend_ids:
+            return web.json_response(
+                {"ok": False, "error": "backend_ids required"}, status=400
+            )
+        # Normalize + dedupe (preserve order); blank/whitespace ids drop out.
+        ids: list[str] = []
+        for raw in backend_ids:
+            bid = str(raw or "").strip()
+            if bid and bid not in ids:
+                ids.append(bid)
+        if not ids:
+            return web.json_response(
+                {"ok": False, "error": "backend_ids required"}, status=400
+            )
+        by_id = {p.backend_id: p for p in STATE.pairings}
+        # Per-account outcome; device token stays server-side. `backend_id` is
+        # the reliable key the browser maps success back to (account email may be
+        # "" until that pairing registers).
         results: list[dict] = []
-        errors: list[str] = []
         async with aiohttp.ClientSession() as session:
-            for pr in pairings:
+            for bid in ids:
+                pr = by_id.get(bid)
+                if pr is None:
+                    results.append({
+                        "backend_id": bid, "account": "",
+                        "ok": False, "error": "unknown account",
+                    })
+                    continue
                 relay = RelayClient(session, RELAY_URL, TokenAuth(pr))
                 try:
-                    # device token stays server-side; only ok/uploaded/error go back.
                     await _do_sync(relay, manifest, blobs, pr.backend_id)
-                    results.append({"account": pr.account, "ok": True})
                 except Exception as e:  # noqa: BLE001
                     log.warning("workflow sync failed for backend %s: %s",
                                 pr.backend_id, e)
-                    errors.append(str(e))
-                    results.append({"account": pr.account, "ok": False, "error": str(e)})
-        if errors and len(errors) == len(pairings):
-            # Every account failed → surface an error so the panel shows it.
+                    results.append({
+                        "backend_id": bid, "account": pr.account,
+                        "ok": False, "error": str(e),
+                    })
+                    continue
+                results.append({
+                    "backend_id": bid, "account": pr.account, "ok": True,
+                })
+        ok_count = sum(1 for r in results if r["ok"])
+        if ok_count == 0:
+            # Nothing landed (all unknown and/or all failed).
             return web.json_response(
-                {"ok": False, "error": errors[0], "results": results}, status=502
+                {"ok": False, "error": "sync failed", "results": results},
+                status=502,
             )
-        log.info("workflow sync: %d blob(s) + manifest pushed to %d account(s)",
-                 len(blobs), len(pairings))
-        # `uploaded` mirrors the per-account blob count (the panel counts blobs
-        # itself); `results` carries the per-account breakdown.
+        log.info("workflow sync: %d blob(s) + manifest pushed to %d/%d account(s)",
+                 len(blobs), ok_count, len(ids))
         return web.json_response(
             {"ok": True, "uploaded": len(blobs), "results": results}
         )

@@ -43,6 +43,28 @@ function nameFromPath(path) {
   return base.toLowerCase().endsWith(".json") ? base.slice(0, -5) : base;
 }
 
+// Sync-target selection persistence. We store the backend_ids the user has
+// EXPLICITLY unchecked; anything NOT in this set is a target. This guarantees a
+// newly-paired account defaults ON (it's absent from the "off" set), and a fresh
+// install (no stored set) checks every account.
+const SYNC_OFF_KEY = "comfylink.syncAccountsOff";
+function loadSyncOff() {
+  try {
+    const raw = localStorage.getItem(SYNC_OFF_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(arr) ? arr : []);
+  } catch (e) {
+    return new Set();
+  }
+}
+function saveSyncOff(set) {
+  try {
+    localStorage.setItem(SYNC_OFF_KEY, JSON.stringify([...set]));
+  } catch (e) {
+    console.warn("[ComfyLink] failed to persist sync-account selection", e);
+  }
+}
+
 // Compact local "YYYY-MM-DD HH:MM" for an ISO upload timestamp ("" if invalid).
 function fmtUploadedAt(iso) {
   if (!iso) return "";
@@ -117,8 +139,8 @@ function buildPanel(root) {
 
   // --- workflow management (shown when paired) ----------------------------
   // Manual upload: pick which saved workflows to push, convert them on the spot,
-  // and POST manifest + blobs. The plugin pushes the SAME catalog to every paired
-  // account. No background auto-sync.
+  // and POST manifest + blobs. The plugin fans the catalog out to every account
+  // checked below. No background auto-sync.
   const manageBtn = h("button", {
     textContent: "Manage workflows",
     style: "width:100%;padding:8px;margin-top:8px;cursor:pointer;",
@@ -141,10 +163,30 @@ function buildPanel(root) {
     textContent: "Refresh list",
     style: "width:100%;padding:6px;margin-bottom:8px;cursor:pointer;",
   });
+
+  // Account picker: uploads target the CHECKED accounts (this ComfyUI can be
+  // paired to several, and a single upload can push to any subset). One checkbox
+  // row per pairing.
+  const accountSelectTitle = h("div", {
+    style: "font-weight:600;margin-bottom:4px;font-size:12px;",
+    textContent: "Sync to accounts",
+  });
+  const accountsSyncList = h("div", {
+    style: "max-height:120px;overflow-y:auto;margin-bottom:8px;",
+  });
+  // Tracks which backend_ids the checkbox list currently reflects, so the 3s
+  // poll only rebuilds the rows when the SET of accounts actually changes (never
+  // yanking the boxes out from under a mid-selection user).
+  let accountKeys = "";
+  const currentBackendIds = () =>
+    Array.from(accountsSyncList.querySelectorAll("input[type=checkbox]"))
+      .filter((c) => c.checked)
+      .map((c) => c.dataset.backendId);
+
   const managePanel = h(
     "div",
     { style: "display:none;margin-top:8px;" },
-    [reloadBtn, wfList, wfStatus, uploadBtn]
+    [accountSelectTitle, accountsSyncList, reloadBtn, wfList, wfStatus, uploadBtn]
   );
 
   const msg = h("div", { style: "margin-top:10px;min-height:18px;color:#f44336;" });
@@ -218,6 +260,52 @@ function buildPanel(root) {
     }
   }
 
+  // Build the sync-target checkbox list from the pairings. Only rebuild when the
+  // SET of backend_ids changes (so the 3s poll never disturbs a user mid-check).
+  // Each row's checked state comes from the persisted "off" set, so a newly-
+  // paired account defaults ON and prior explicit unchecks are honored across
+  // rebuilds. Toggling a box persists the change + reloads the workflow list.
+  // Returns true when the list was rebuilt (caller may refresh the list).
+  function syncAccountCheckboxes(pairings) {
+    const items = Array.isArray(pairings) ? pairings : [];
+    const key = items.map((p) => p.backend_id).join("|");
+    if (key === accountKeys) return false;
+    accountKeys = key;
+    const off = loadSyncOff();
+    accountsSyncList.innerHTML = "";
+    for (const p of items) {
+      const checked = !off.has(p.backend_id);
+      const cb = h("input", { type: "checkbox", checked });
+      cb.dataset.backendId = p.backend_id;
+      cb.onchange = () => {
+        const s = loadSyncOff();
+        if (cb.checked) s.delete(p.backend_id);
+        else s.add(p.backend_id);
+        saveSyncOff(s);
+        loadWorkflows();
+      };
+      const label = h(
+        "label",
+        {
+          style:
+            "display:flex;align-items:center;gap:6px;padding:3px 0;cursor:pointer;font-size:12px;",
+          title: p.account || "pairing…",
+        },
+        [
+          cb,
+          h("span", {
+            textContent: p.account || "pairing…",
+            style:
+              "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" +
+              (p.account ? "" : "color:var(--descrip-text,#aaa);font-style:italic;"),
+          }),
+        ]
+      );
+      accountsSyncList.append(label);
+    }
+    return true;
+  }
+
   async function refresh() {
     let s;
     try {
@@ -257,6 +345,11 @@ function buildPanel(root) {
     }
 
     renderAccounts(s.pairings);
+    // Keep the sync-target list in sync; if the set of accounts changed (e.g. one
+    // was unpaired or newly paired) and the panel is open, reload so the markers
+    // reflect the new checked set.
+    const rebuilt = syncAccountCheckboxes(s.pairings);
+    if (rebuilt && managePanel.style.display !== "none") loadWorkflows();
 
     const paired = !!s.paired;
     // The pair form is ALWAYS visible (add more accounts); workflow management
@@ -343,7 +436,7 @@ function buildPanel(root) {
     reloadBtn.disabled = true;
     uploadBtn.disabled = true;
     try {
-      const items = await listWorkflows();
+      const items = await listWorkflows(currentBackendIds());
       renderWorkflows(items);
       wfStatus.textContent = `${items.length} workflow(s) on this PC.`;
     } catch (e) {
@@ -379,19 +472,27 @@ function buildPanel(root) {
       wfStatus.textContent = "Select at least one workflow.";
       return;
     }
+    const backendIds = currentBackendIds();
+    if (!backendIds.length) {
+      wfStatus.style.color = "#ff9800";
+      wfStatus.textContent = "Check at least one account to sync to.";
+      return;
+    }
     uploadBtn.disabled = true;
     reloadBtn.disabled = true;
     wfStatus.style.color = "var(--descrip-text,#aaa)";
     wfStatus.textContent = `Uploading ${paths.length}…`;
     try {
-      const { uploaded, errors } = await uploadSelected(paths);
+      const { uploaded, errors, accounts } = await uploadSelected(paths, backendIds);
+      // Number of accounts that actually synced OK (fall back to requested set).
+      const n = (accounts && accounts.length) || backendIds.length;
       if (errors.length) {
         wfStatus.style.color = "#ff9800";
         const failed = errors.map((e) => nameFromPath(e.path)).join(", ");
-        wfStatus.textContent = `Uploaded ${uploaded}; ${errors.length} failed: ${failed}`;
+        wfStatus.textContent = `Uploaded ${uploaded} to ${n} account(s); ${errors.length} failed: ${failed}`;
       } else {
         wfStatus.style.color = "#4caf50";
-        wfStatus.textContent = `Uploaded ${uploaded} workflow(s) to all accounts.`;
+        wfStatus.textContent = `Uploaded ${uploaded} workflow(s) to ${n} account(s).`;
       }
       // Reflect new "uploaded" tags / checkboxes.
       await loadWorkflows();
