@@ -1,0 +1,25 @@
+{
+  "_comment": "Version manifest for the update reminders. The App fetches this raw file (same idea as ops/status.json): edit + commit + push to main and every App picks it up on its next fetch — no store release, no relay redeploy. The relay's GET /v1/versions is only a fallback for clients that cannot reach GitHub.",
+  "_fields": {
+    "latest": "newest published build — the App shows a dismissible 'update available' hint when the running plugin/app is older",
+    "min": "oldest build that still works with the current contracts. BELOW IT THE APP BLOCKS (plugin: red warning only, never blocks generation). This is the fuse for a breaking contract change — leave it at 0.0.0 in normal times",
+    "url": "where to get the update. Empty string = no link (the App only informs, no jump button)"
+  },
+  "plugin": {
+    "latest": "0.2.0",
+    "min": "0.0.0",
+    "url": "https://github.com/huijiutian/ComfyUI-ComfyLink"
+  },
+  "app": {
+    "ios": {
+      "latest": "1.0.3",
+      "min": "0.0.0",
+      "url": "https://apps.apple.com/app/id6783214394"
+    },
+    "android": {
+      "latest": "1.0.3",
+      "min": "0.0.0",
+      "url": "https://play.google.com/store/apps/details?id=com.huijiutian.comfylink"
+    }
+  }
+}

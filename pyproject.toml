@@ -6,7 +6,7 @@
 
 [project]
 name = "comfyui-comfylink"
-version = "0.1.0"
+version = "0.2.0"
 description = "Turn your ComfyUI into a phone-driven remote backend via the ComfyLink app."
 license = { text = "MIT" }
 requires-python = ">=3.10"

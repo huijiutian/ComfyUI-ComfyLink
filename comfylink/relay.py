@@ -11,6 +11,8 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+from .version import __commit__, __version__
+
 # Claim is a server-held long-poll (~28s); allow margin over it.
 CLAIM_TIMEOUT = aiohttp.ClientTimeout(total=45)
 DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=30)
@@ -127,8 +129,11 @@ class RelayClient:
         return {"Authorization": f"Bearer {await self._auth.token()}"}
 
     async def register(self, backend_id: str, name: str) -> dict:
+        # version/commit let the app tell the user their plugin is out of date.
+        # Optional server-side, so older relays simply ignore them.
         return await self._json("POST", "/v1/backends/register",
-                                {"backend_id": backend_id, "name": name})
+                                {"backend_id": backend_id, "name": name,
+                                 "version": __version__, "commit": __commit__})
 
     async def sign_object_info(self, backend_id: str) -> tuple[str, str]:
         """Request a presigned PUT URL for this backend's object_info snapshot.
@@ -164,7 +169,11 @@ class RelayClient:
         return d["key"], d["url"]
 
     async def heartbeat(self, backend_id: str) -> None:
-        await self._json("POST", "/v1/backends/heartbeat", {"backend_id": backend_id})
+        # Re-sent every beat so a `git pull` + ComfyUI restart refreshes the
+        # version the relay/app sees without waiting for a re-register.
+        await self._json("POST", "/v1/backends/heartbeat",
+                         {"backend_id": backend_id,
+                          "version": __version__, "commit": __commit__})
 
     async def abandon_jobs(self, backend_id: str) -> int:
         """Fail every still-claimed/running job left on this backend.

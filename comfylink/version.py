@@ -7,7 +7,7 @@ Registry reads pyproject; this constant feeds the runtime/panel).
 import subprocess
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def _detect_commit() -> str:
