@@ -16,6 +16,8 @@ local ComfyUI with the ComfyLink app.
   your PC is never exposed to the internet.** Works on WiFi or 4G.
 - 🧩 **A real prompt manager on your phone** — not just a text box.
 
+📖 **New here? Full setup & usage guide → https://comfylink.app/guide**
+
 ## How is this different from other ComfyUI mobile tools?
 
 Most ComfyUI mobile tools are just a remote screen: they need your phone on the
@@ -81,6 +83,10 @@ workflows. Tick the ones you want available on your phone and click
 **Upload / update selected** — they're converted and pushed to the app. Edited a
 workflow? Its row is tagged as changed; re-upload to refresh it. Only the
 workflows you select appear in the app.
+
+> On the phone, they don't appear on their own: open the **Workflows** tab, tap
+> **sync** on this ComfyUI's row, and pick which ones to import. Full walkthrough:
+> https://comfylink.app/guide
 
 ## Status & control
 
