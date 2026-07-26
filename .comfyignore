@@ -1,0 +1,16 @@
+# Comfy Registry publish 排除清单(gitignore 语法)。
+# 只发布运行 ComfyUI 节点所需的东西,把开发/测试/本地状态挡在发布包外。
+.venv/
+venv/
+__pycache__/
+.ruff_cache/
+tests/
+.github/
+ops/
+uv.lock
+ruff.toml
+# 本地配对状态(含 backend_id / 可能的 token),绝不进发布包
+comfylink.json
+comfylink_state*.json
+*.local
+.DS_Store

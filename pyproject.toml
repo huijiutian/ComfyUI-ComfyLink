@@ -22,9 +22,7 @@ dependencies = []
 Repository = "https://github.com/huijiutian/ComfyUI-ComfyLink"
 
 [tool.comfy]
-# PublisherId: leave EMPTY. The human fills this in after creating a publisher
-# account on registry.comfy.org (`comfy node init` / the registry dashboard).
-PublisherId = ""
+PublisherId = "comfylink"
 DisplayName = "ComfyLink"
 # Icon: optional URL to a square icon shown on the registry listing. Leave empty
 # until one is hosted.
