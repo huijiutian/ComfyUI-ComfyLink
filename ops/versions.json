@@ -3,12 +3,14 @@
   "_fields": {
     "latest": "newest published build — the App shows a dismissible 'update available' hint when the running plugin/app is older",
     "min": "oldest build that still works with the current contracts. BELOW IT THE APP BLOCKS (plugin: red warning only, never blocks generation). This is the fuse for a breaking contract change — leave it at 0.0.0 in normal times",
-    "url": "where to get the update. Empty string = no link (the App only informs, no jump button)"
+    "url": "where to get the update. Empty string = no link (the App only informs, no jump button)",
+    "remind": "(plugin only) whether the App shows its soft 'plugin update available' reminder. Default off — flip to true by hand only when there is a substantive plugin change worth nudging users about. Keep 'latest' at the real newest version regardless; 'min' (the hard block) is never affected by this switch"
   },
   "plugin": {
     "latest": "0.2.1",
     "min": "0.0.0",
-    "url": "https://github.com/huijiutian/ComfyUI-ComfyLink"
+    "url": "https://github.com/huijiutian/ComfyUI-ComfyLink",
+    "remind": false
   },
   "app": {
     "ios": {
