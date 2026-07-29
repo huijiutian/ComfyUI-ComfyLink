@@ -5,9 +5,11 @@
 
 版本号同时被 App/中继的更新提醒机制消费——发版要 bump 的完整文件清单见插件仓库 `ops/versions.json` 与 `app/docs/version-reminders.md`。
 
-## [未发布] — 2026-07-29
+## [0.2.1] — 2026-07-29
 
-⚠️ 发版前记得同步 bump `pyproject.toml` + `comfylink/version.py`（当前 `0.2.0`），并更新 `ops/versions.json` 的插件版本，否则用户端不会收到更新提醒。
+版本号四处已同步：`pyproject.toml`、`comfylink/version.py`、`ops/versions.json` 的 `plugin.latest`、中继 `internal/api/versions.go` 的 `defaultPluginLatest`（少改中继那处，连不上 GitHub 的用户会被兜底源喂过期版本号）。
+
+> ⚠️ **Comfy Registry 需要单独发布**。仓库里没有 publish workflow，`git push` 到 GitHub **不等于**发到 Registry —— 不发的话 Manager 用户不会收到更新，只有手动 `git pull` 的人能拿到。
 
 ### Added
 - **面板柔和提醒插件有新版可更新**：不打断工作流，只在 ComfyLink 面板里给一个不刺眼的提示。

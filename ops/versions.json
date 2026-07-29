@@ -6,13 +6,13 @@
     "url": "where to get the update. Empty string = no link (the App only informs, no jump button)"
   },
   "plugin": {
-    "latest": "0.2.0",
+    "latest": "0.2.1",
     "min": "0.0.0",
     "url": "https://github.com/huijiutian/ComfyUI-ComfyLink"
   },
   "app": {
     "ios": {
-      "latest": "1.0.3",
+      "latest": "1.0.4",
       "min": "0.0.0",
       "url": "https://apps.apple.com/app/id6783214394"
     },
