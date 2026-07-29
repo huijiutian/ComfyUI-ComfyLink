@@ -1,0 +1,9 @@
+{
+  "_comment": "Community links for the ComfyLink app's feedback entry. The App fetches this raw file (same idea as ops/status.json and ops/versions.json): edit + commit + push to main and every App picks it up on its next fetch — no store release, no relay redeploy. Leave discord_url empty to hide the Discord button (the App then only offers the support email); fill it in once the Discord server is ready and the button appears automatically.",
+  "_fields": {
+    "discord_url": "invite/community URL for the 'Join Discord' button. Empty string = no button (App falls back to the support email only). Opened in the system browser.",
+    "email": "support email (informational only — the App currently uses its own hardcoded support@huijiutian.com so a bad remote value can never break the fallback). Kept here for a possible future switch to remote-driven email."
+  },
+  "discord_url": "",
+  "email": "support@huijiutian.com"
+}
