@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from typing import Optional
 from uuid import uuid4
 
 import aiohttp
@@ -91,9 +92,93 @@ EXECUTION_BACKSTOP_TIMEOUT = 30 * 60  # seconds before abandoning a wedged promp
 # action; a lone blip is absorbed.
 REVOKED_CONFIRM_STRIKES = 3
 
+# PLUGIN_TOO_OLD_RETRY is the backoff after the relay refuses to serve this
+# plugin version (403 + error_code "plugin_too_old"). Deliberately much longer
+# than the 5s generic-error retry: a blocked plugin can do nothing useful, so it
+# must not hammer the relay. We DO keep retrying (rather than giving up) so that
+# rolling the relay's `min` back — or the user updating the files in place —
+# recovers on its own without a ComfyUI restart.
+PLUGIN_TOO_OLD_RETRY = 60  # seconds between re-register attempts while blocked
+
+# The relay's fixed contract for the "your plugin is too old" refusal.
+PLUGIN_TOO_OLD_CODE = "plugin_too_old"
+
 
 class _Revoked(Exception):
     """Device token no longer valid (unpaired from the app)."""
+
+
+class _PluginTooOld(Exception):
+    """The relay refuses to serve this plugin version (403 plugin_too_old).
+
+    DELIBERATELY a different exception from _Revoked: a revoke is destructive
+    (STATE.remove_pairing, permanent), while being too old is a *temporary,
+    recoverable* server-side policy that says nothing about whether this device
+    is still paired. Conflating the two would self-destruct a perfectly valid
+    pairing within seconds of the relay raising its minimum version.
+    """
+
+    def __init__(self, min_version: str = "", update_url: str = ""):
+        self.min_version = min_version
+        self.update_url = update_url
+        super().__init__(
+            "relay refuses this plugin version"
+            + (f" (requires v{min_version} or newer)" if min_version else "")
+        )
+
+
+class _TooOldLatch:
+    """Per-pairing signal: "the heartbeat learned we are blocked".
+
+    Why this exists: the relay's version gate lives on register + heartbeat, NOT
+    on the hot /v1/jobs/claim long-poll (gating claim would cost a DB read per
+    poll and add a fail-open surface). So an already-registered, always-on
+    ComfyUI would otherwise keep claiming jobs forever after the operator raises
+    the minimum version — the block would only bite on the next process restart.
+    The heartbeat loop arms this latch and stops beating; the claim loop reads it
+    at the top of each iteration and unwinds into _serve_pairing's existing
+    _PluginTooOld handler (pairing kept, STATUS set, long backoff, re-register).
+
+    One instance per _serve_pairing call, so pairings never interfere; cleared on
+    every successful register so recovery (operator rolls `min` back) works.
+    Not thread-safe by design — a single pairing's loops are one event loop's
+    tasks, and every access is a plain attribute read/write with no await in
+    between.
+    """
+
+    def __init__(self) -> None:
+        self._blocked: Optional[_PluginTooOld] = None
+
+    def arm(self, e: _PluginTooOld) -> None:
+        self._blocked = e
+
+    def clear(self) -> None:
+        self._blocked = None
+
+    @property
+    def armed(self) -> bool:
+        return self._blocked is not None
+
+    def check(self) -> None:
+        """Raise _PluginTooOld if armed; no-op otherwise."""
+        if self._blocked is not None:
+            raise _PluginTooOld(self._blocked.min_version, self._blocked.update_url)
+
+
+def _as_plugin_too_old(e: RelayError) -> Optional[_PluginTooOld]:
+    """_PluginTooOld built from a 403 + error_code "plugin_too_old"; else None.
+
+    Pure + separately testable. Every place that maps a 403 onto _Revoked MUST
+    consult this first, so a version block can never be counted as an auth
+    rejection (i.e. never becomes a revoke strike).
+    """
+    if e.status != 403 or getattr(e, "code", "") != PLUGIN_TOO_OLD_CODE:
+        return None
+    p = getattr(e, "payload", None) or {}
+    return _PluginTooOld(
+        str(p.get("min_version") or ""),
+        str(p.get("update_url") or ""),
+    )
 
 
 class JobCanceled(Exception):
@@ -495,6 +580,10 @@ async def _serve_pairing(pairing, job_lock: asyncio.Lock, session, comfy_url,
     transient 401/403 (e.g. during a relay redeploy) while a genuine revoke still
     lands after N tries. Transient errors are logged and retried; one pairing's
     failure never tears down the others.
+
+    A 403 carrying error_code "plugin_too_old" is handled SEPARATELY and never
+    counts as an auth rejection: the pairing is kept, no strike is recorded, the
+    panel shows a loud "update the plugin" bar, and we retry on a long backoff.
     """
     relay = RelayClient(session, RELAY_URL, TokenAuth(pairing))
     comfy = ComfyClient(session, comfy_url)
@@ -504,6 +593,10 @@ async def _serve_pairing(pairing, job_lock: asyncio.Lock, session, comfy_url,
     # confirmation (see REVOKED_CONFIRM_STRIKES). Reset to 0 on every successful
     # register below so unrelated blips never compound into a false unpair.
     revoked_strikes = 0
+    # Per-pairing "the heartbeat saw a version block" latch (see _TooOldLatch):
+    # the relay gates register + heartbeat but not claim, so this is how a block
+    # armed AFTER we registered reaches the claim loop.
+    blocked = _TooOldLatch()
     while not _stopped(stop) and STATE.get_pairing(bid) is not None:
         hb = None
         try:
@@ -513,15 +606,55 @@ async def _serve_pairing(pairing, job_lock: asyncio.Lock, session, comfy_url,
             # accumulated from earlier transient 401/403 so they can't add up
             # across unrelated blips.
             revoked_strikes = 0
+            # ...and proves the relay is serving this version again, so drop any
+            # latched block (operator rolled `min` back / user updated in place)
+            # and let the fresh heartbeat + claim loops below run normally.
+            blocked.clear()
             # One-shot orphan sweep per backend, AFTER a successful register and
             # BEFORE claiming. The shared `swept` set guards against re-sweeping
             # on a later reconnect (which would kill a job that is live by then).
             if bid not in swept:
                 await _abandon_orphans(relay, pairing, swept)
-            hb = asyncio.create_task(_heartbeat_loop(relay, pairing, stop))
-            await _claim_loop(relay, worker, pairing, job_lock, stop)
+            # Reached ONLY after _register returned normally. A blocked plugin
+            # raises _PluginTooOld out of _register above, so control never gets
+            # here and NO job is ever claimed while blocked — the heartbeat loop
+            # isn't started either. (_claim_loop additionally re-raises
+            # _PluginTooOld if the relay starts blocking mid-loop — either from a
+            # claim 403 or from the latch the heartbeat arms — which lands in the
+            # handler below and stops claiming.)
+            hb = asyncio.create_task(_heartbeat_loop(relay, pairing, stop, blocked))
+            await _claim_loop(relay, worker, pairing, job_lock, stop, blocked)
         except asyncio.CancelledError:
             raise
+        except _PluginTooOld as e:
+            # NON-DESTRUCTIVE, on purpose. The relay refuses to serve this plugin
+            # version; that says nothing about whether the device is still paired,
+            # and the block may be a misjudgement or may be lifted (operator rolls
+            # `min` back / user updates). So we:
+            #   * NEVER call STATE.remove_pairing — the pairing survives forever,
+            #     no matter how many times this fires;
+            #   * NEVER touch revoked_strikes (neither += nor reset): a version
+            #     block is orthogonal to auth, so it must not push the device
+            #     toward an unpair, nor mask a genuine revoke by clearing strikes;
+            #   * surface it loudly (red bar in the panel) and keep retrying on a
+            #     long backoff so recovery is automatic, no restart needed.
+            STATUS.set(
+                state="error",
+                error="Plugin too old — the relay stopped serving it. "
+                      + (f"Update to v{e.min_version} or newer and restart ComfyUI."
+                         if e.min_version else "Update the plugin and restart ComfyUI."),
+                plugin_too_old=True,
+                plugin_min_version=e.min_version,
+                plugin_update_url=e.update_url,
+            )
+            log.warning(
+                "relay refuses this plugin version (min %s) for pairing %s — "
+                "pairing KEPT, no jobs will be claimed; retrying in %ds. "
+                "Update the plugin (%s) and restart ComfyUI.",
+                e.min_version or "?", bid, PLUGIN_TOO_OLD_RETRY,
+                e.update_url or "https://github.com/huijiutian/ComfyUI-ComfyLink",
+            )
+            await asyncio.sleep(PLUGIN_TOO_OLD_RETRY)
         except _Revoked:
             # Second line of defence (relay already returns 503 for transient
             # errors, reserving 401 for a genuinely-missing device): don't unpair
@@ -543,6 +676,25 @@ async def _serve_pairing(pairing, job_lock: asyncio.Lock, session, comfy_url,
                 bid, revoked_strikes, REVOKED_CONFIRM_STRIKES,
             )
             await asyncio.sleep(5)
+        except TypeError:
+            # A TypeError here is a PROGRAMMING error (wrong signature, wrong
+            # argument type), never a network blip — and the broad `except
+            # Exception` below would treat it as one and retry it forever. That
+            # is exactly how a signature drift between _claim_loop and a test's
+            # stand-in turned into a silently hanging test suite instead of a
+            # failing one; in production it is just as bad, a permanent 5s retry
+            # loop that never makes progress and never says why.
+            #
+            # So: log it with a full traceback and let it out. The supervisor
+            # (_reconcile) reaps the task, logs "task exited unexpectedly", and
+            # restarts the pairing on the next IDLE_RECHECK tick — so this is
+            # still self-healing, it is just LOUD instead of silent, and a test
+            # driving _serve_pairing directly now fails immediately.
+            log.exception(
+                "pairing %s hit a programming error (not a transient fault) — "
+                "letting it surface instead of retrying it forever", bid,
+            )
+            raise
         except Exception as e:  # noqa: BLE001 - isolate this pairing's failures
             STATUS.set(error=str(e))
             log.warning("pairing %s connection error: %s; retrying in 5s", bid, e)
@@ -613,6 +765,12 @@ async def _register(relay: RelayClient, comfy: ComfyClient, pairing) -> None:
     try:
         resp = await relay.register(pairing.backend_id, STATE.backend_name)
     except RelayError as e:
+        # FIRST: a 403 that carries error_code "plugin_too_old" is a VERSION
+        # block, not an auth failure. It must never fall through to _Revoked
+        # below (that path unpairs the device for good after a few strikes).
+        too_old = _as_plugin_too_old(e)
+        if too_old is not None:
+            raise too_old from e
         # 401/403 = this device was unpaired from the app (or its token is no
         # longer valid) → treat as revoked so the supervisor drops the pairing.
         # Each pairing owns a unique backend_id, so the old "owned by another
@@ -620,6 +778,10 @@ async def _register(relay: RelayClient, comfy: ComfyClient, pairing) -> None:
         if e.status in (401, 403):
             raise _Revoked() from e
         raise
+    # Register succeeded → this plugin is being served again; clear any "too old"
+    # banner left over from an earlier block so a recovered plugin stops showing
+    # the red bar in the panel.
+    STATUS.set(plugin_too_old=False, plugin_min_version="", plugin_update_url="")
     # Account email for the panel ("paired to <email>"); best-effort, may be "".
     pairing.account = (resp or {}).get("account", "") if isinstance(resp, dict) else ""
     try:
@@ -648,23 +810,63 @@ async def _register(relay: RelayClient, comfy: ComfyClient, pairing) -> None:
 
 
 async def _heartbeat_loop(relay: RelayClient, pairing,
-                          stop: asyncio.Event | None) -> None:
+                          stop: asyncio.Event | None,
+                          blocked: Optional[_TooOldLatch] = None) -> None:
+    """Keep this backend marked online. Errors are swallowed — with ONE exception.
+
+    Every failure stays a debug-level no-op (the claim loop owns revoke handling
+    and the result path owns job errors) EXCEPT a "plugin_too_old" 403: the relay
+    gates on register + heartbeat but NOT on claim, so for an always-on ComfyUI
+    that already registered before the block was armed, this is the only place
+    the block is ever observed. We arm the latch and stop beating; the claim loop
+    picks it up within one poll and unwinds into the non-destructive handler.
+    """
     while not _stopped(stop) and STATE.get_pairing(pairing.backend_id) is not None:
         try:
             await relay.heartbeat(pairing.backend_id)
+        except RelayError as e:
+            too_old = _as_plugin_too_old(e)
+            if too_old is not None:
+                if blocked is not None:
+                    blocked.arm(too_old)
+                log.warning(
+                    "heartbeat refused: plugin too old (min %s) — stopping the "
+                    "heartbeat; this pairing will stop claiming new jobs",
+                    too_old.min_version or "?",
+                )
+                return
+            log.debug("heartbeat error: %s", e)
         except Exception as e:  # noqa: BLE001 - claim loop handles revoke
             log.debug("heartbeat error: %s", e)
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 
 async def _claim_loop(relay: RelayClient, worker: Worker, pairing,
-                      job_lock: asyncio.Lock, stop: asyncio.Event | None) -> None:
+                      job_lock: asyncio.Lock, stop: asyncio.Event | None,
+                      blocked: Optional[_TooOldLatch] = None) -> None:
     bid = pairing.backend_id
     log.info("listening for jobs on backend %s (idle until one arrives)", bid)
     while not _stopped(stop) and STATE.get_pairing(bid) is not None:
+        # Checked at the TOP of every iteration, which is deliberately the only
+        # place the version block can stop us:
+        #   * we do NOT interrupt an in-flight claim long-poll (~28s) — the
+        #     worst case is one beat + one poll before claiming stops, which is
+        #     fine for a policy change and keeps the poll path simple;
+        #   * we do NOT abort a job that is already generating — _run_locked
+        #     completes at the bottom of the loop body, so a running job finishes
+        #     and reports its result normally. Only NEW work is stopped.
+        if blocked is not None:
+            blocked.check()  # raises _PluginTooOld → _serve_pairing's handler
         try:
             job = await relay.claim(bid)
         except RelayError as e:
+            # Same discrimination as _register: a "plugin_too_old" 403 is a
+            # version block, NOT an auth rejection, so it must never become a
+            # revoke strike. It propagates to _serve_pairing's non-destructive
+            # handler, which stops this claim loop for the backoff window.
+            too_old = _as_plugin_too_old(e)
+            if too_old is not None:
+                raise too_old from e
             if e.status in (401, 403):
                 raise _Revoked() from e
             log.warning("claim error: %s; retrying in 3s", e)

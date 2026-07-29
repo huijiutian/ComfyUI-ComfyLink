@@ -119,7 +119,14 @@ class TestServePairingSweepsOnce(unittest.IsolatedAsyncioTestCase):
         # 2nd raises _Revoked so _serve_pairing returns.
         calls = {"n": 0}
 
-        async def fake_claim_loop(relay_, worker_, pairing_, job_lock_, stop_):
+        # NOTE: this stand-in is patched OVER worker._claim_loop, so its
+        # parameter list must track the real one exactly. `blocked_` is the
+        # plugin-too-old latch (_TooOldLatch) that the heartbeat arms and the
+        # claim loop polls; this test is about the orphan sweep and deliberately
+        # ignores it. Spelling it out rather than swallowing it in *args keeps
+        # the drift visible: if the real signature changes again, this line is
+        # the one that has to change with it.
+        async def fake_claim_loop(relay_, worker_, pairing_, job_lock_, stop_, blocked_):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("blip")
@@ -151,6 +158,51 @@ class TestServePairingSweepsOnce(unittest.IsolatedAsyncioTestCase):
         self.assertIn("b1", swept)
         # The revoke removed the pairing from STATE.
         self.assertIsNone(state.get_pairing("b1"))
+
+
+class TestServePairingSurfacesProgrammingErrors(unittest.IsolatedAsyncioTestCase):
+    """A TypeError must ESCAPE _serve_pairing instead of being retried forever.
+
+    Regression guard for a real incident: _claim_loop grew a parameter, a test's
+    stand-in kept the old one, and the resulting TypeError was caught by the
+    broad `except Exception` retry branch. With asyncio.sleep patched out (as
+    every test here does) that became an infinite tight loop — the suite hung
+    instead of failing, which is far harder to diagnose than a red test.
+    """
+
+    async def test_typeerror_from_claim_loop_propagates(self):
+        from comfylink.config import Pairing
+
+        relay = mock.AsyncMock()
+        relay.abandon_jobs.return_value = 0
+        pairing = Pairing(backend_id="b1", device_token="clr")
+        state = _SupervisorState([pairing])
+
+        # Deliberately WRONG arity — stands in for a future signature drift.
+        async def stale_claim_loop(relay_, worker_, pairing_, job_lock_, stop_):
+            raise AssertionError("must not be reached — the call itself must fail")
+
+        with mock.patch.object(worker, "RelayClient", return_value=relay), \
+                mock.patch.object(worker, "ComfyClient"), \
+                mock.patch.object(worker, "Worker"), \
+                mock.patch.object(worker, "STATUS"), \
+                mock.patch.object(worker, "STATE", state), \
+                mock.patch.object(worker, "_register", mock.AsyncMock()), \
+                mock.patch.object(worker, "_heartbeat_loop", mock.AsyncMock()), \
+                mock.patch.object(worker, "_claim_loop", stale_claim_loop), \
+                mock.patch.object(worker.asyncio, "sleep", mock.AsyncMock()):
+            # If the guard regresses this call never returns, so bound it: a hang
+            # then surfaces as a TimeoutError failure rather than a stuck suite.
+            with self.assertRaises(TypeError):
+                await asyncio.wait_for(
+                    worker._serve_pairing(
+                        pairing, asyncio.Lock(), None, "http://comfy", None, set()
+                    ),
+                    timeout=5,
+                )
+
+        # The programming error must NOT be mistaken for a revoke: pairing kept.
+        self.assertIsNotNone(state.get_pairing("b1"))
 
 
 if __name__ == "__main__":

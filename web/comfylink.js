@@ -89,6 +89,18 @@ function buildPanel(root) {
   root.style.padding = "12px";
   root.style.fontSize = "13px";
 
+  // HARD block bar: the relay has stopped serving this plugin version (403
+  // plugin_too_old). Deliberately at the very top and far louder than the soft
+  // amber `updateLine` hint below — nothing works until the user updates. A
+  // single reused element toggled from s.plugin_too_old (never re-created by the
+  // 3s poll).
+  const tooOldBar = h("div", {
+    style:
+      "display:none;margin-bottom:10px;padding:8px 10px;border-radius:4px;" +
+      "background:#b71c1c;color:#fff;font-size:12px;font-weight:700;" +
+      "line-height:1.4;",
+  });
+
   const dot = h("span", {
     style:
       "display:inline-block;width:10px;height:10px;border-radius:50%;background:#9e9e9e;margin-right:8px;",
@@ -215,6 +227,7 @@ function buildPanel(root) {
   });
 
   root.append(
+    tooOldBar,
     statusRow,
     relayWarn,
     detail,
@@ -324,6 +337,31 @@ function buildPanel(root) {
       stateText.textContent = "Panel offline";
       return;
     }
+    // Hard block: relay refuses this plugin version. Missing field (older
+    // plugin state / undefined) reads as false → bar stays hidden.
+    if (s.plugin_too_old === true) {
+      const min = s.plugin_min_version ? `v${s.plugin_min_version}` : "a newer version";
+      tooOldBar.innerHTML = "";
+      tooOldBar.append(
+        `⛔ ComfyLink plugin too old — the relay has stopped serving this plugin. ` +
+          `Update to ${min} or newer and restart ComfyUI. (Your pairing is kept.)`
+      );
+      if (s.plugin_update_url) {
+        tooOldBar.append(
+          h("a", {
+            textContent: "Get the update",
+            href: s.plugin_update_url,
+            target: "_blank",
+            rel: "noopener noreferrer",
+            style: "color:#fff;text-decoration:underline;margin-left:6px;",
+          })
+        );
+      }
+      tooOldBar.style.display = "block";
+    } else {
+      tooOldBar.style.display = "none";
+    }
+
     const [label, color] = STATE_LABEL[s.state] || ["Unknown", "#9e9e9e"];
     dot.style.background = color;
     stateText.textContent = `${label}${s.active ? " · generating" : ""}`;

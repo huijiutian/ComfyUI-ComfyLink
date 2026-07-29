@@ -45,7 +45,10 @@ def register() -> None:
 
     @routes.get("/comfylink/status")
     async def _status(_request):
-        snap = STATUS.snapshot()  # machine-level: state/active/node_count/error
+        # Machine-level: state/active/node_count/error plus the plugin_too_old /
+        # plugin_min_version / plugin_update_url block — snapshot() always
+        # includes them, so nothing to add here.
+        snap = STATUS.snapshot()
         snap["paired"] = STATE.paired
         snap["backend_name"] = STATE.backend_name
         # One row per paired account; account email may be "" until that pairing

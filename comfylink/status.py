@@ -16,6 +16,13 @@ class Status:
         self.node_count = 0
         self.error = ""
         self.active = False  # a job is currently running
+        # Relay refused to serve this plugin version (403 error_code
+        # "plugin_too_old"). Field names match the relay/app contract exactly —
+        # one spelling across all three repos. Always present in snapshot() so
+        # the panel can rely on them rather than probing for undefined.
+        self.plugin_too_old = False
+        self.plugin_min_version = ""
+        self.plugin_update_url = ""
 
     def set(self, **kw) -> None:
         with self._lock:
@@ -29,6 +36,9 @@ class Status:
                 "node_count": self.node_count,
                 "error": self.error,
                 "active": self.active,
+                "plugin_too_old": self.plugin_too_old,
+                "plugin_min_version": self.plugin_min_version,
+                "plugin_update_url": self.plugin_update_url,
             }
 
 

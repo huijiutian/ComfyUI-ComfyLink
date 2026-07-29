@@ -43,9 +43,23 @@ _DOWNLOAD_CHUNK = 256 * 1024
 
 
 class RelayError(RuntimeError):
-    def __init__(self, message: str, status: int = 0):
+    """A non-2xx relay response (or a locally-refused request when status == 0).
+
+    `code` carries the relay's machine-readable ``error_code`` when the error
+    body was JSON and contained one (e.g. "plugin_too_old"); it is "" otherwise.
+    `payload` is the parsed JSON error body (``{}`` when the body wasn't a JSON
+    object) so callers can read companion fields such as ``min_version`` /
+    ``update_url`` without re-reading the response. Both are keyword-only with
+    safe defaults so every existing ``RelayError(msg, status)`` call site is
+    unaffected.
+    """
+
+    def __init__(self, message: str, status: int = 0, *, code: str = "",
+                 payload: Optional[dict] = None):
         super().__init__(message)
         self.status = status
+        self.code = code
+        self.payload = payload or {}
 
 
 def _insecure_allowed() -> bool:
@@ -331,9 +345,31 @@ class RelayClient:
             return await r.json() if "json" in ctype else {}
 
 
+def _error_payload(body: str) -> dict:
+    """Best-effort parse of a relay error body into a dict. NEVER raises.
+
+    A non-JSON body, an empty body, or JSON that isn't an object all degrade to
+    ``{}`` (=> RelayError.code == ""). We deliberately swallow everything: this
+    runs on the failure path, so a surprise here must not replace the real error
+    with a parse error.
+    """
+    try:
+        data = json.loads(body)
+    except Exception:  # noqa: BLE001 - any parse failure => no structured info
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 async def _check(r: aiohttp.ClientResponse) -> None:
     if r.status >= 300:
+        # Read the body ONCE: it is both the human message and the source of the
+        # machine-readable error_code (aiohttp won't let us read it twice).
+        body = await r.text()
+        payload = _error_payload(body)
+        code = payload.get("error_code")
         raise RelayError(
-            f"relay {r.request_info.method} {r.url.path} -> {r.status}: {await r.text()}",
+            f"relay {r.request_info.method} {r.url.path} -> {r.status}: {body}",
             r.status,
+            code=code if isinstance(code, str) else "",
+            payload=payload,
         )
