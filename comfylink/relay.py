@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
+import logging
 import os
 import socket
 from typing import Optional
@@ -13,9 +15,26 @@ import aiohttp
 
 from .version import __commit__, __version__
 
+log = logging.getLogger("comfylink.relay")
+
 # Claim is a server-held long-poll (~28s); allow margin over it.
 CLAIM_TIMEOUT = aiohttp.ClientTimeout(total=45)
 DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
+# ── Delivery retry (ride a short relay/network outage, e.g. a relay redeploy) ──
+# Only the DELIVERY-critical, one-shot calls (result / sign_upload / put_object)
+# use this: a job whose render finishes during the deploy window would otherwise
+# lose its result (the rendered image is safe on disk, but never reaches the app,
+# so the user must regenerate). We retry ONLY infrastructure blips — connection
+# errors, timeouts, and 502/503/504 — with capped exponential backoff up to
+# _RETRY_MAX_ELAPSED of cumulative wait. That budget sits comfortably under the
+# relay reaper's 5-minute job-stale threshold, so a late-but-delivered result is
+# never mistaken for a dead job. Permanent errors (4xx auth/revoke, SSRF, R2 4xx)
+# propagate IMMEDIATELY so a real failure or an unpair is never masked as a retry.
+_RETRY_MAX_ELAPSED = 90.0   # seconds of cumulative backoff before giving up
+_RETRY_BASE = 1.0           # first backoff
+_RETRY_CAP = 15.0           # per-attempt backoff ceiling
+_RETRY_STATUSES = frozenset({502, 503, 504})  # transient proxy/relay; 4xx never retried
 
 # Cap on object-storage downloads (input images). Bounds memory so a malicious
 # or buggy relay can't point get_object at a huge/endless body and OOM the host.
@@ -128,6 +147,42 @@ class RelayClient:
     async def _headers(self) -> dict:
         return {"Authorization": f"Bearer {await self._auth.token()}"}
 
+    async def _deliver(self, what: str, thunk):
+        """Run a delivery-critical call, retrying across a short relay/network
+        outage. `thunk` is a zero-arg async factory (called fresh each attempt);
+        its return value is passed straight back on success.
+
+        Retries ONLY transient infrastructure failures — connection errors,
+        timeouts, and 502/503/504 — with capped exponential backoff, up to
+        _RETRY_MAX_ELAPSED of cumulative sleep. A non-transient RelayError (any
+        other status, incl. 4xx auth/revoke and 0 = SSRF/validation) propagates
+        immediately. Retrying is safe: the relay's result write is terminal-
+        guarded (a re-POST is a benign no-op, no duplicate job_event) and a
+        presigned sign/PUT is repeatable.
+        """
+        slept = 0.0
+        delay = _RETRY_BASE
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await thunk()
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+                err = e
+            except RelayError as e:
+                if e.status not in _RETRY_STATUSES:
+                    raise
+                err = e
+            if slept >= _RETRY_MAX_ELAPSED:
+                log.warning("%s: giving up after %d attempt(s): %s", what, attempt, err)
+                raise err
+            sleep_for = min(delay, _RETRY_CAP, _RETRY_MAX_ELAPSED - slept)
+            log.warning("%s: transient failure (attempt %d), retrying in %.0fs: %s",
+                        what, attempt, sleep_for, err)
+            await asyncio.sleep(sleep_for)
+            slept += sleep_for
+            delay = min(delay * 2, _RETRY_CAP)
+
     async def register(self, backend_id: str, name: str) -> dict:
         # version/commit let the app tell the user their plugin is out of date.
         # Optional server-side, so older relays simply ignore them.
@@ -215,21 +270,38 @@ class RelayClient:
                       "total_bytes": total_bytes}
         if error_code:
             body["error_code"] = error_code
-        await self._json("POST", f"/v1/jobs/{job_id}/result", body)
+        # Delivery-critical: retry across a short relay outage so a finished job's
+        # result isn't lost to a redeploy window. Idempotent (terminal-guarded).
+        await self._deliver(
+            f"result[{job_id}]",
+            lambda: self._json("POST", f"/v1/jobs/{job_id}/result", body),
+        )
 
     async def sign_upload(self, job_id: str, kind: str, filename: str, content_type: str) -> tuple[str, str]:
         """Request a presigned PUT URL. Returns (r2_key, url)."""
-        d = await self._json("POST", "/v1/uploads/sign",
-                             {"job_id": job_id, "kind": kind, "filename": filename,
-                              "content_type": content_type})
+        d = await self._deliver(
+            f"sign_upload[{job_id}]",
+            lambda: self._json("POST", "/v1/uploads/sign",
+                               {"job_id": job_id, "kind": kind, "filename": filename,
+                                "content_type": content_type}),
+        )
         return d["r2_key"], d["url"]
 
     async def put_object(self, url: str, data: bytes, content_type: str) -> None:
         """Upload bytes to object storage via a presigned PUT URL (no auth header)."""
-        _validate_url(url)  # SSRF guard: relay-supplied URL.
-        async with self._session.put(url, data=data, headers={"Content-Type": content_type}) as r:
-            if r.status >= 300:
-                raise RelayError(f"storage PUT {r.status}: {await r.text()}")
+        _validate_url(url)  # SSRF guard: relay-supplied URL (permanent — outside retry).
+
+        async def _put():
+            async with self._session.put(url, data=data,
+                                         headers={"Content-Type": content_type}) as r:
+                if r.status >= 300:
+                    # Carry the status so a transient R2 5xx is retried while a 4xx
+                    # (expired/forbidden presign) fails fast.
+                    raise RelayError(f"storage PUT {r.status}: {await r.text()}", r.status)
+
+        # A presigned PUT is idempotent (same key, overwrite), so retrying a blip
+        # is safe. Upload is the other half of delivery — ride the outage here too.
+        await self._deliver("put_object", _put)
 
     async def get_object(self, url: str, max_bytes: int = MAX_OBJECT_BYTES) -> bytes:
         _validate_url(url)  # SSRF guard: relay-supplied URL.
