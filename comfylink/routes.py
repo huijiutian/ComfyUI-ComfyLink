@@ -21,6 +21,7 @@ from .log import log
 from .relay import RelayClient, redeem_pair_code
 from .status import STATUS
 from .version import __commit__, __version__
+from .version_check import get_update_info
 
 
 async def _do_sync(relay, manifest: dict, blobs: dict, backend_id: str) -> int:
@@ -57,6 +58,14 @@ def register() -> None:
         snap["relay_is_default"] = RELAY_IS_DEFAULT  # panel warns when on test relay
         snap["version"] = __version__
         snap["commit"] = __commit__  # git short commit (panel display; "dev" if unknown)
+        # Soft "a newer plugin is available" hint for the panel. Best-effort and
+        # heavily cached (see version_check); must never break or slow status, so
+        # a defensive guard falls back to "no update info" on any surprise.
+        try:
+            snap["update"] = await get_update_info(RELAY_URL)
+        except Exception:  # noqa: BLE001 - the hint must never break status
+            snap["update"] = {"available": False, "latest": "",
+                              "below_min": False, "url": ""}
         # no-store: the panel polls this; browsers must not serve a stale value.
         return web.json_response(snap, headers=_NO_CACHE)
 

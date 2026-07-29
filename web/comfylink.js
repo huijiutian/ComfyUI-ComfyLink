@@ -197,6 +197,15 @@ function buildPanel(root) {
     textContent: "ComfyLink",
   });
 
+  // Soft "an update is available" hint, shown just under the version line. A
+  // single reused element (never re-created per refresh) that we toggle + fill
+  // from s.update; hidden entirely when there's nothing to say.
+  const updateLine = h("div", {
+    style:
+      "display:none;margin-top:3px;color:var(--descrip-text,#888);" +
+      "font-size:11px;opacity:0.75;",
+  });
+
   // Test-relay warning (hidden on the production relay): makes it obvious when
   // the plugin is pointed at a non-default relay via comfylink.json.
   const relayWarn = h("div", {
@@ -215,7 +224,8 @@ function buildPanel(root) {
     manageBtn,
     managePanel,
     msg,
-    versionLine
+    versionLine,
+    updateLine
   );
 
   // Render one row per paired account: email (or "pairing…" until it registers)
@@ -342,6 +352,39 @@ function buildPanel(root) {
       // the latest; hide the commit when unknown ("dev").
       const c = s.commit && s.commit !== "dev" ? ` · ${s.commit}` : "";
       versionLine.textContent = `ComfyLink v${s.version}${c}`;
+    }
+
+    // Soft update hint (never a popup, never blocks anything). Reuse updateLine:
+    // fill + show when an update is available, otherwise hide.
+    const up = s.update;
+    if (up && up.available) {
+      const latest = up.latest ? `v${up.latest}` : "a newer version";
+      updateLine.innerHTML = "";
+      if (up.below_min) {
+        // Amber, slightly stronger wording — still only a hint.
+        updateLine.style.color = "#ffb74d";
+        updateLine.style.opacity = "0.95";
+        updateLine.append(
+          `Update recommended — your version may be out of date (${latest})`
+        );
+      } else {
+        updateLine.style.color = "var(--descrip-text,#888)";
+        updateLine.style.opacity = "0.75";
+        updateLine.append(`Update available → ${latest}`);
+      }
+      if (up.url) {
+        const link = h("a", {
+          textContent: "  Get it",
+          href: up.url,
+          target: "_blank",
+          rel: "noopener noreferrer",
+          style: "color:inherit;text-decoration:underline;margin-left:4px;",
+        });
+        updateLine.append(link);
+      }
+      updateLine.style.display = "block";
+    } else {
+      updateLine.style.display = "none";
     }
 
     renderAccounts(s.pairings);
