@@ -1,7 +1,13 @@
-# 发布到 Comfy Registry(registry.comfy.org)。
+# 发布到 Comfy Registry(registry.comfy.org)—— 官方推荐的触发方式。
 #
-# 触发:推 `v*` 形式的 tag(例:`git tag v0.2.1 && git push origin v0.2.1`)。
-# 只推 main 不会发版 —— Registry 上的版本只由 tag 决定。
+# 触发:main 分支上 `pyproject.toml` 发生变化时自动发布(版本号取自
+# `[project].version`)。git tag 只作里程碑记录、**不参与触发**,发布成功之后再补打。
+#
+# ⚠️ 这套触发方式的一个副作用,别被吓到:
+#     改 `pyproject.toml` 的**任何内容**(哪怕只改 description / Icon)都会触发这条
+#     流水线。如果 version 没跟着变,Registry 会以「该版本已存在」拒绝(已发布的版本
+#     不可覆盖),workflow 报红。**这不是故障,只是噪音** —— 所以改 pyproject 的非
+#     版本字段时,尽量和版本 bump 放进同一个提交。
 #
 # ⚠️ 一次性配置(没配就永远发不出去,只做一次):
 #     仓库需要一个名为 REGISTRY_ACCESS_TOKEN 的 Actions secret。
@@ -17,10 +23,11 @@ name: Publish to Comfy Registry
 
 on:
   push:
-    tags:
-      - "v*"
-  # 手动补发(例如 Registry 当时挂了)。在 Actions 页面运行时,ref 必须选一个
-  # v* tag —— 选分支会被下面的 guard 拒掉。
+    branches:
+      - main
+    paths:
+      - "pyproject.toml"
+  # 手动补发(例如 Registry 当时挂了、或某次 push 没触发)。
   workflow_dispatch:
 
 permissions:
@@ -33,20 +40,12 @@ concurrency:
 jobs:
   # 发布前的闸门:版本号自洽 + ci.yml 的核心校验(byte-compile / unittest / ruff)。
   # 这里刻意重复 ci.yml 的三条命令而不是用 workflow_run:workflow_run 拿到的
-  # 上下文 ref 是默认分支而不是 tag,要自己反查 tag 的 SHA、还会被每次普通 CI
-  # 触发,复杂且容易漏判。三条命令的重复成本远低于那份复杂度。
-  # (ci.yml 未做任何改动。)
+  # 上下文 ref 是默认分支、还会被每次普通 CI 触发,要自己反查 SHA 且容易漏判。
+  # 三条命令的重复成本远低于那份复杂度。(ci.yml 未做任何改动。)
   verify:
     name: verify (version + compile/test/lint)
     runs-on: ubuntu-latest
     steps:
-      - name: Guard — must run on a v* tag
-        run: |
-          if [ "${{ github.ref_type }}" != "tag" ]; then
-            echo "::error::This workflow publishes a tagged release, but it was started on ${{ github.ref_type }} '${{ github.ref_name }}'. Re-run it from the Actions page with a v* tag selected as the ref, or push a tag: git tag v0.2.1 && git push origin v0.2.1"
-            exit 1
-          fi
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -62,20 +61,16 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install aiohttp ruff
 
-      # 发版最容易出的错:tag 打了 v0.2.2 但忘了 bump pyproject。
-      # 那样 Registry 收到的还是旧版本号(或直接被拒),对不上号。
-      - name: Verify tag matches pyproject.toml version
-        env:
-          TAG: ${{ github.ref_name }}
+      # Registry 读 pyproject 的版本号,插件运行时/面板读 comfylink/version.py 的
+      # __version__ —— 两处漂移就会发出一个「对不上号」的版本。tests/ 里已有测试守着,
+      # 这里再挡一道:让失败挡在发布之前,而不是发完(不可撤回)才发现。
+      - name: Verify pyproject.toml and comfylink/version.py agree
         run: |
-          python - "$TAG" <<'PY'
+          python - <<'PY'
           import pathlib
           import re
           import sys
           import tomllib
-
-          tag = sys.argv[1]
-          tag_version = tag[1:] if tag.startswith("v") else tag
 
           pyproject_version = tomllib.loads(
               pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
@@ -85,28 +80,16 @@ jobs:
           m = re.search(r'^__version__\s*=\s*"([^"]+)"', src, re.M)
           package_version = m.group(1) if m else "<__version__ not found>"
 
-          print(f"git tag              : {tag}   (version part: {tag_version})")
           print(f"pyproject.toml       : {pyproject_version}")
           print(f"comfylink/version.py : {package_version}")
 
-          errors = []
-          if tag_version != pyproject_version:
-              errors.append(
-                  f"git tag '{tag}' means version '{tag_version}', "
-                  f"but pyproject.toml [project].version is '{pyproject_version}'"
-              )
           if package_version != pyproject_version:
-              errors.append(
-                  f"comfylink/version.py __version__ is '{package_version}', "
-                  f"but pyproject.toml [project].version is '{pyproject_version}'"
-              )
-
-          if errors:
-              for e in errors:
-                  print(f"::error::Version mismatch — {e}")
               print(
-                  "::error::Refusing to publish. Fix the version(s), commit, then move the tag: "
-                  "git tag -d <tag> && git push origin :refs/tags/<tag> && git tag <tag> && git push origin <tag>"
+                  "::error::Version mismatch — pyproject.toml [project].version is "
+                  f"'{pyproject_version}', but comfylink/version.py __version__ is "
+                  f"'{package_version}'. Refusing to publish: fix both (and while you "
+                  "are at it ops/versions.json + the relay's defaultPluginLatest — see "
+                  "RELEASING.md), then push again."
               )
               sys.exit(1)
 
@@ -137,9 +120,10 @@ jobs:
             exit 1
           fi
 
-      # 官方 action。默认自带 checkout(取当前 ref = 本次的 tag),
+      # 官方 action。默认自带 checkout(取当前 ref),
       # 内部 = pip install comfy-cli + `comfy node publish --token …`。
       # 发布包的排除清单在仓库根的 .comfyignore。
+      # 这一步若因「版本已存在」失败:多半是改了 pyproject 但没 bump version(见文件顶部)。
       - name: Publish custom node
         uses: Comfy-Org/publish-node-action@main
         with:
