@@ -9,6 +9,9 @@ tests/
 ops/
 uv.lock
 ruff.toml
+RELEASING.md
+# `comfy node publish` 自己打的包,别把上一版的 zip 塞进新包里
+node.zip
 # 本地配对状态(含 backend_id / 可能的 token),绝不进发布包
 comfylink.json
 comfylink_state*.json

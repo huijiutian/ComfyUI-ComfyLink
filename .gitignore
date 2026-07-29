@@ -14,3 +14,6 @@ venv/
 
 # uv 本地锁文件:插件运行时依赖故意不锁(见 pyproject.toml),避免破坏 ComfyUI 自带版本
 uv.lock
+
+# `comfy node publish` 打包的中间产物,不该进仓库
+node.zip
