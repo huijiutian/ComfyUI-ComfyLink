@@ -11,8 +11,8 @@
 #
 # ⚠️ 一次性配置(没配就永远发不出去,只做一次):
 #     仓库需要一个名为 REGISTRY_ACCESS_TOKEN 的 Actions secret。
-#     完整步骤 + 发版清单(版本号四处同步)见 comfylink-ops 仓库的 plugin-releasing.md
-#     (workspace 布局里 = ../../ops/plugin-releasing.md;发版工具已集中到 comfylink-ops)。
+#     完整步骤 + 发版清单(版本号四处同步)见内部发版文档 plugin-releasing.md
+#     (workspace 布局里 = ../../ops/plugin-releasing.md)。
 #
 # 官方发布方式(2026-07 核对):
 #   https://docs.comfy.org/registry/publishing
@@ -90,7 +90,7 @@ jobs:
                   f"'{pyproject_version}', but comfylink/version.py __version__ is "
                   f"'{package_version}'. Refusing to publish: fix both (and while you "
                   "are at it ops/versions.json + the relay's defaultPluginLatest — see "
-                  "the comfylink-ops repo plugin-releasing.md), then push again."
+                  "the internal release doc), then push again."
               )
               sys.exit(1)
 
@@ -117,7 +117,7 @@ jobs:
           TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
         run: |
           if [ -z "${TOKEN}" ]; then
-            echo "::error::Repository secret REGISTRY_ACCESS_TOKEN is missing or empty. Create a key at https://registry.comfy.org/nodes (publisher 'comfylink') and add it under Settings → Secrets and variables → Actions. See plugin-releasing.md in the comfylink-ops repo."
+            echo "::error::Repository secret REGISTRY_ACCESS_TOKEN is missing or empty. Create a key at https://registry.comfy.org/nodes (publisher 'comfylink') and add it under Settings → Secrets and variables → Actions. See the internal release doc."
             exit 1
           fi
 

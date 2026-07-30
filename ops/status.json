@@ -1,4 +1,19 @@
 {
+  "_comment": "Service-status document for the ComfyLink app. Two independent banners share one file: the outage notice (top-level fields) and the in-app promo banner (the `promo` block) — `active` and `promo.active` never affect each other. The App fetches this raw file (same idea as ops/versions.json and ops/community.json): edit + commit + push to main and every App picks it up on its next fetch — no store release, no relay redeploy. Parsing is fail-safe by design: a fetch error, timeout, non-200, malformed body, or a missing/mistyped field all degrade to 'nothing shown', so this file can only add a notice, never break the App. Outage-banner dismissal is session-only and keyed by content (severity + both messages + url), so editing any of those makes a banner the user had already dismissed reappear. The promo banner has extra conditions beyond `promo.active`: the user must be signed in and not already on a paid tier; it auto-hides after a few seconds, is not persisted (it shows again on the next cold start), and tapping it opens the subscription page.",
+  "_fields": {
+    "active": "master switch for the outage banner — must be boolean true to show it; false, missing, or any other type hides it",
+    "severity": "outage banner color/icon: 'info' | 'warn' | 'critical'. Unknown, empty or missing falls back to 'info'",
+    "message_en": "English banner text. The App picks by locale and falls back to the other language when the preferred one is empty; empty in both = nothing shown",
+    "message_zh": "Chinese banner text — same locale/fallback rule as message_en",
+    "url": "optional 'learn more' link on the banner. Empty string = no link button",
+    "promo": {
+      "active": "master switch for the in-app promo banner — must be boolean true to show it. Independent of the top-level `active`",
+      "message_en": "English promo text (same locale/fallback rule as the outage messages). Empty in both languages = not shown",
+      "message_zh": "Chinese promo text",
+      "cta_en": "English label for the banner's button. Empty string = the App's own built-in label",
+      "cta_zh": "Chinese label for the banner's button"
+    }
+  },
   "active": false,
   "severity": "info",
   "message_en": "",
