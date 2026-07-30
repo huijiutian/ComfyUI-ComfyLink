@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from typing import Optional
 from uuid import uuid4
 
@@ -48,12 +49,41 @@ IDLE_RECHECK = 2  # seconds between "am I paired yet?" checks while unpaired
 # well under the relay's reaper staleThreshold (5 min): the reaper marks any
 # claimed/running job whose updated_at hasn't advanced for that long as failed, so
 # a steady ~20s heartbeat keeps a legitimately long generation alive forever.
+# This is the ONLY knob that sets how much traffic a running job sends to the
+# relay — _run_prompt schedules its beat off the wall clock, so it stays ~20s no
+# matter how fast POLL_INTERVAL spins the local loop.
 JOB_HEARTBEAT_INTERVAL = 20  # seconds
 
-# POLL_INTERVAL is how often _run_prompt re-reads ComfyUI's /history and /queue
-# while waiting for a job to finish. ~1s is responsive without hammering the
-# local server.
-POLL_INTERVAL = 1.0  # seconds between REST status polls
+# POLL_INTERVAL is how often _run_prompt re-reads ComfyUI's *scoped*
+# /history/{prompt_id} while waiting for a job to finish. It is the dominant
+# term in "ComfyUI finished" → "the app sees the image": whatever we pick here
+# is the average detection lag we add on top of the render itself. The request
+# is a localhost GET for a single prompt id (cheap, and cheap regardless of how
+# much history the user has accumulated), so 0.25s is affordable and cuts ~0.4s
+# of average lag versus the old 1s.
+#
+# ⚠️ This constant deliberately drives NOTHING but that one local GET:
+#   * the relay beat / cancel check is on its own wall-clock schedule
+#     (JOB_HEARTBEAT_INTERVAL) — polling ComfyUI 4× faster must NOT mean 4×
+#     the traffic to the relay;
+#   * /queue has its own, deliberately slower cadence (QUEUE_POLL_INTERVAL);
+#   * every timeout below (OUTPUTS_GRACE, EXECUTION_BACKSTOP_TIMEOUT) is judged
+#     against time.monotonic(), not against "how many times we looped", so
+#     changing this value cannot silently change how long they last.
+POLL_INTERVAL = 0.25  # seconds between local /history polls
+
+# QUEUE_POLL_INTERVAL is how often _run_prompt additionally reads ComfyUI's
+# /queue. That read answers only one question — "is our prompt still
+# queued/running, or did it vanish (user hit interrupt / cleared the queue)?" —
+# and unlike /history/{id} it is NOT scoped: ComfyUI serialises every queued
+# entry, prompt graphs included, so a user sitting on a deep local queue makes
+# it a multi-MB response on the same event loop that is driving their render.
+# Detecting a vanished prompt a fraction of a second sooner buys nothing (it is
+# already an error path), so this stays at the historical 1s cadence while the
+# cheap /history poll speeds up. Every /queue read is skipped, never batched:
+# an un-read window simply means "assume still running", which is what the
+# previous iteration concluded anyway.
+QUEUE_POLL_INTERVAL = 1.0  # seconds between local /queue polls
 
 # OUTPUTS_GRACE handles ComfyUI Issue #11540: status can flip to
 # completed/success a beat BEFORE the outputs are written into /history. If we
@@ -76,7 +106,9 @@ UPLOAD_CONCURRENCY = 4  # max outputs uploading to R2 concurrently
 # poll must never kill a user's local generation; the relay's reaper plus the
 # next process restart's orphan sweep reconcile the abandoned job. The window is
 # intentionally generous (30 min) so it only ever trips on a genuinely wedged
-# ComfyUI, never on a slow-but-healthy render.
+# ComfyUI, never on a slow-but-healthy render. Measured against time.monotonic()
+# from the moment we submit, so it is 30 minutes of real time whatever
+# POLL_INTERVAL is set to.
 EXECUTION_BACKSTOP_TIMEOUT = 30 * 60  # seconds before abandoning a wedged prompt
 
 # REVOKED_CONFIRM_STRIKES is the depth-in-defence guard against a transient
@@ -294,7 +326,7 @@ class Worker:
 
         Version-independent: instead of parsing websocket frames (whose format
         drifts across ComfyUI releases) we poll the stable /history and /queue
-        endpoints every POLL_INTERVAL. Each iteration decides the job's fate:
+        endpoints. Each iteration decides the job's fate:
 
           * /history has our prompt with status_str == "error"  -> JobFailed
           * /history has our prompt with outputs                 -> return pid
@@ -309,20 +341,36 @@ class Worker:
           * still running past EXECUTION_BACKSTOP_TIMEOUT -> JobFailed(
             error_code="execution_stalled") WITHOUT a global interrupt
 
-        Every JOB_HEARTBEAT_INTERVAL it also re-pokes the relay (fixed 0, 0) and
-        honours a cancel request by cancelling ONLY our prompt (see
-        _cancel_comfy) — never a blanket interrupt that could kill a user's
-        local generation.
+        Three independent cadences, deliberately NOT one loop counter:
+
+          * POLL_INTERVAL (0.25s) — the scoped, cheap /history/{id} read that
+            actually decides "is it done"; the thing worth making fast.
+          * QUEUE_POLL_INTERVAL (1s) — the unscoped /queue read, only needed for
+            the "did it vanish" error path, kept at its historical rate so a
+            faster loop cannot multiply the load on the user's ComfyUI.
+          * JOB_HEARTBEAT_INTERVAL (20s) — the only thing that touches the
+            NETWORK: re-poke the relay (fixed 0, 0) and pick up a cancel
+            request. Its schedule is wall-clock, so relay traffic per running
+            job is a constant, independent of how fast we poll locally.
+
+        Every deadline below is judged against time.monotonic(), never against
+        an "elapsed += POLL_INTERVAL" accumulator, so the poll rate is free to
+        change without moving any timeout (an accumulator also silently drifts
+        long, since it ignores the per-request latency it never counts).
+
+        A cancel is honoured by cancelling ONLY our prompt (see _cancel_comfy) —
+        never a blanket interrupt that could kill a user's local generation.
         """
         client_id = str(uuid4())
         prompt_id = await self.comfy.submit(prompt, client_id)
 
-        elapsed = 0.0       # total time since submit (drives the backstop)
-        since_beat = 0.0    # time since the last relay heartbeat / cancel check
-        grace = 0.0         # time spent waiting for lagging outputs (#11540)
-        completed = False   # ComfyUI reported completion; outputs not yet present
+        started = time.monotonic()      # submit time; the backstop counts from here
+        next_beat = started + JOB_HEARTBEAT_INTERVAL  # next relay poke / cancel check
+        next_queue = started            # ≤ now → the first "missing" poll reads /queue
+        completed_at: Optional[float] = None  # when ComfyUI said done (outputs lagging)
 
         while True:
+            now = time.monotonic()
             hist = await self.comfy.history(prompt_id)
             entry = hist.get(prompt_id)
             if entry is not None:
@@ -332,11 +380,15 @@ class Worker:
                 if entry.get("outputs"):
                     # Outputs are present — _collect_outputs takes it from here.
                     return prompt_id
-                if status.get("completed"):
+                if status.get("completed") and completed_at is None:
                     # #11540: completed flipped true before outputs landed. Wait
                     # them out, then give up the grace and hand off regardless.
-                    completed = True
-            else:
+                    completed_at = now
+            elif now >= next_queue:
+                # Not in history. Only *now and then* (QUEUE_POLL_INTERVAL) do we
+                # pay for the unscoped /queue read; in between we assume it is
+                # still queued/running, exactly as the last read concluded.
+                next_queue = now + QUEUE_POLL_INTERVAL
                 q = await self.comfy.queue()
                 if not _in_queue(q, prompt_id):
                     # Neither in history nor queued/running: the prompt was
@@ -344,36 +396,32 @@ class Worker:
                     raise JobFailed("job was interrupted on ComfyUI",
                                     error_code="interrupted")
 
-            if completed:
-                grace += POLL_INTERVAL
-                if grace >= OUTPUTS_GRACE:
-                    # Outputs never materialised; return and let _collect_outputs
-                    # report the empty result as "no valid output".
-                    return prompt_id
+            if completed_at is not None and now - completed_at >= OUTPUTS_GRACE:
+                # Outputs never materialised; return and let _collect_outputs
+                # report the empty result as "no valid output".
+                return prompt_id
 
-            if elapsed >= EXECUTION_BACKSTOP_TIMEOUT:
+            if now - started >= EXECUTION_BACKSTOP_TIMEOUT:
                 # Wedged for too long. Abandon WITHOUT a global interrupt so we
                 # never kill a user's local generation; the relay reaper / next
                 # orphan sweep reconcile the row.
                 log.warning(
                     "job %s: still running after %ds — abandoning (no interrupt)",
-                    job_id, int(elapsed),
+                    job_id, int(now - started),
                 )
                 raise JobFailed(
                     "ComfyUI execution exceeded the safety timeout",
                     error_code="execution_stalled",
                 )
 
-            if since_beat >= JOB_HEARTBEAT_INTERVAL:
-                since_beat = 0.0
+            if now >= next_beat:
+                next_beat = now + JOB_HEARTBEAT_INTERVAL
                 r = await self.relay.progress(job_id, "running", 0, 0)
                 if r.get("cancel"):
                     await self._cancel_comfy(prompt_id)
                     raise JobCanceled()
 
             await asyncio.sleep(POLL_INTERVAL)
-            elapsed += POLL_INTERVAL
-            since_beat += POLL_INTERVAL
 
     async def _cancel_comfy(self, prompt_id: str) -> None:
         """Cancel OUR prompt precisely, never killing a user's local generation.

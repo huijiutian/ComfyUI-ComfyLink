@@ -14,7 +14,10 @@ state. These tests pin the contract:
     again with NO global interrupt (never kill a user's local generation);
   * cancel of a PENDING prompt -> precise queue_delete (no interrupt);
   * cancel of a RUNNING prompt -> global interrupt (it IS ours on the GPU);
-  * the heartbeat re-pokes the relay with a fixed (0, 0).
+  * the heartbeat re-pokes the relay with a fixed (0, 0);
+  * the local poll rate is decoupled from everything else — changing
+    POLL_INTERVAL moves neither the backstop's real duration nor how often the
+    relay is poked (see TestPollRateDecoupled).
 
 The crucial invariant throughout: the plugin issues a *global* interrupt ONLY
 when it has confirmed OUR job is the one currently running on ComfyUI — never on
@@ -27,6 +30,7 @@ Run:  python -m unittest discover -s tests
 import asyncio
 import os
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -38,8 +42,8 @@ from comfylink.worker import JobCanceled, JobFailed, Worker  # noqa: E402
 PID = "pid-1"
 
 # Fast timings so the polling loop spins quickly in tests (real defaults are
-# ~1s poll / 5s grace / 30min backstop / 20s heartbeat).
-_FAST = dict(POLL_INTERVAL=0.001, OUTPUTS_GRACE=0.05,
+# 0.25s history poll / 1s queue poll / 5s grace / 30min backstop / 20s heartbeat).
+_FAST = dict(POLL_INTERVAL=0.001, QUEUE_POLL_INTERVAL=0.001, OUTPUTS_GRACE=0.05,
              EXECUTION_BACKSTOP_TIMEOUT=10.0, JOB_HEARTBEAT_INTERVAL=10.0)
 
 
@@ -209,6 +213,59 @@ class TestRunPrompt(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(JobFailed("boom").error_code, "")
         self.assertEqual(JobFailed("boom", error_code="interrupted").error_code,
                          "interrupted")
+
+
+class TestPollRateDecoupled(unittest.IsolatedAsyncioTestCase):
+    """POLL_INTERVAL must buy latency and nothing else.
+
+    It is tempting to "just" lower the poll interval, but the loop used to
+    derive both the backstop timeout and the relay heartbeat from an
+    ``elapsed += POLL_INTERVAL`` accumulator — i.e. from the ITERATION COUNT.
+    Under that model, polling 4× faster silently meant 4× the traffic to the
+    relay (I-05's heartbeat is what keeps the reaper from failing a healthy
+    long render) and a timeout that drifts with request latency.
+
+    These two tests pin the decoupling by running the SAME scenario at two very
+    different poll rates and asserting the wall-clock behaviour is unchanged.
+    """
+
+    async def _stall(self, poll_interval, backstop=0.2, beat=0.05):
+        """Run a never-completing prompt to the backstop; return (secs, beats)."""
+        comfy = FakeComfy(history=[{}], queue=[_running()])
+        w, relay = _make_worker(comfy)
+        t0 = time.monotonic()
+        with _fast(POLL_INTERVAL=poll_interval,
+                   QUEUE_POLL_INTERVAL=poll_interval,
+                   EXECUTION_BACKSTOP_TIMEOUT=backstop,
+                   JOB_HEARTBEAT_INTERVAL=beat), \
+                self.assertRaises(JobFailed) as cm:
+            await asyncio.wait_for(w._run_prompt("j", {}), 10)
+        self.assertEqual(cm.exception.error_code, "execution_stalled")
+        return time.monotonic() - t0, len(relay.progress.call_args_list)
+
+    async def test_backstop_duration_does_not_move_with_poll_rate(self):
+        # 4× faster polling must NOT make the safety timeout trip 4× sooner.
+        # Lower bound only in the strict sense (a loaded machine may overshoot);
+        # the bug this guards against is an EARLY trip.
+        for poll in (0.005, 0.02):
+            with self.subTest(poll=poll):
+                secs, _ = await self._stall(poll, backstop=0.2)
+                self.assertGreaterEqual(secs, 0.2)
+                self.assertLess(secs, 2.0)
+
+    async def test_relay_beats_do_not_scale_with_poll_rate(self):
+        # The heartbeat is on a wall-clock schedule, so ~0.2s / 0.05s ≈ 4-5 beats
+        # at ANY poll rate. Were it per-iteration, the 0.005s run would send ~40.
+        fast_secs, fast_beats = await self._stall(0.005, backstop=0.2, beat=0.05)
+        slow_secs, slow_beats = await self._stall(0.02, backstop=0.2, beat=0.05)
+        for beats in (fast_beats, slow_beats):
+            self.assertGreaterEqual(beats, 1)
+            self.assertLessEqual(beats, 10)
+        # And specifically: polling 4× faster must not multiply relay traffic.
+        self.assertLessEqual(fast_beats, slow_beats + 3,
+                             f"relay beats scaled with poll rate: "
+                             f"{fast_beats} (fast, {fast_secs:.2f}s) vs "
+                             f"{slow_beats} (slow, {slow_secs:.2f}s)")
 
 
 if __name__ == "__main__":
