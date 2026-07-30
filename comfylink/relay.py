@@ -21,6 +21,12 @@ log = logging.getLogger("comfylink.relay")
 CLAIM_TIMEOUT = aiohttp.ClientTimeout(total=45)
 DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
+# progress(wait=True) 也是服务端持有的长轮询:中继会把请求挂起最多 ~25s 等取消。
+# 客户端超时必须**大于**那个窗口,否则长轮询会被我们自己掐断(每 30s 一次
+# TimeoutError,取消也就等不到了)。只给这一个请求放宽,DEFAULT_TIMEOUT 保持 30s
+# 不动 —— 其它调用都是普通的一来一回,给它们放宽只会让真故障拖更久才暴露。
+PROGRESS_WAIT_TIMEOUT = aiohttp.ClientTimeout(total=45)
+
 # ── Delivery retry (ride a short relay/network outage, e.g. a relay redeploy) ──
 # Only the DELIVERY-critical, one-shot calls (result / sign_upload / put_object)
 # use this: a job whose render finishes during the deploy window would otherwise
@@ -273,10 +279,23 @@ class RelayClient:
             await _check(r)
             return await r.json()
 
-    async def progress(self, job_id: str, status: str, value: int, maximum: int) -> dict:
-        """Report progress. Returns {"cancel": bool}."""
-        return await self._json("POST", f"/v1/jobs/{job_id}/progress",
-                                {"status": status, "progress": value, "max": maximum})
+    async def progress(self, job_id: str, status: str, value: int, maximum: int,
+                       wait: bool = False) -> dict:
+        """Report progress. Returns {"cancel": bool}.
+
+        ``wait=True`` 打开中继的「带取消等待的长轮询」:中继照常推进这个 job 的
+        心跳(updated_at,reaper 据此判活),然后把请求挂起最多 ~25s,取消一被置位
+        就立刻返回 —— 生成期的心跳因此同时就是取消通道,取消延迟从「最长一个心跳
+        间隔」压到秒级。请求超时随之放宽到 PROGRESS_WAIT_TIMEOUT。
+
+        ``wait`` 字段只在 True 时才写进 body:不带这个字段 = 老行为(中继立刻回),
+        对老中继(不认识 wait)也天然兼容 —— 它会忽略这个字段照旧立刻返回。
+        """
+        body: dict = {"status": status, "progress": value, "max": maximum}
+        if wait:
+            body["wait"] = True
+        return await self._json("POST", f"/v1/jobs/{job_id}/progress", body,
+                                timeout=PROGRESS_WAIT_TIMEOUT if wait else None)
 
     async def result(self, job_id: str, status: str, images: list[dict], error: str = "",
                      error_code: str = "", total_bytes: int = 0) -> None:
@@ -333,10 +352,13 @@ class RelayClient:
                     raise RelayError(f"object exceeded {max_bytes} bytes")
             return bytes(buf)
 
-    async def _json(self, method: str, path: str, body: dict) -> dict:
+    async def _json(self, method: str, path: str, body: dict,
+                    timeout: Optional[aiohttp.ClientTimeout] = None) -> dict:
+        """One JSON round-trip. ``timeout`` defaults to DEFAULT_TIMEOUT; only the
+        server-held long-poll (progress wait=True) passes its own, longer one."""
         async with self._session.request(
             method, self._base + path, json=body,
-            headers=await self._headers(), timeout=DEFAULT_TIMEOUT,
+            headers=await self._headers(), timeout=timeout or DEFAULT_TIMEOUT,
         ) as r:
             await _check(r)
             if r.content_length == 0:

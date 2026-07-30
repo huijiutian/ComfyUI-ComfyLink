@@ -6,7 +6,9 @@ driven by the relay instead of a user:
   claim → (stage input images) → submit to local ComfyUI → POLL ComfyUI's
   stable REST state (/history + /queue) until it finishes/errors/vanishes →
   /view bytes → presigned PUT to R2 → POST result. Cancellation is learned from
-  the relay's progress response.
+  the relay's progress response — on a single background beat that the relay
+  HOLDS until a cancel arrives (see _job_heartbeat), so it lands within seconds
+  instead of at the next scheduled beat.
 
 Why poll REST instead of the websocket: the WS message format (which event
 signals "done") changes across ComfyUI releases that users routinely install,
@@ -44,15 +46,28 @@ from .status import STATUS
 HEARTBEAT_INTERVAL = 25  # seconds
 IDLE_RECHECK = 2  # seconds between "am I paired yet?" checks while unpaired
 
-# JOB_HEARTBEAT_INTERVAL is how often a claimed-but-not-yet-finished job re-pokes
-# the relay's progress endpoint (and checks for a cancel request). It MUST stay
-# well under the relay's reaper staleThreshold (5 min): the reaper marks any
-# claimed/running job whose updated_at hasn't advanced for that long as failed, so
-# a steady ~20s heartbeat keeps a legitimately long generation alive forever.
-# This is the ONLY knob that sets how much traffic a running job sends to the
-# relay — _run_prompt schedules its beat off the wall clock, so it stays ~20s no
-# matter how fast POLL_INTERVAL spins the local loop.
-JOB_HEARTBEAT_INTERVAL = 20  # seconds
+# JOB_HEARTBEAT_INTERVAL is the FLOOR on how often a claimed-but-not-yet-finished
+# job re-pokes the relay's progress endpoint. It MUST stay well under the relay's
+# reaper staleThreshold (5 min): the reaper marks any claimed/running job whose
+# updated_at hasn't advanced for that long as failed, so a steady beat keeps a
+# legitimately long generation alive forever.
+#
+# Since the "带取消等待的长轮询" change there is exactly ONE beat for a running job
+# (_job_heartbeat; _run_prompt no longer beats inline), and it uses
+# progress(wait=True): the relay bumps updated_at the moment the request ARRIVES
+# and then holds it ~25s waiting for a cancel. So the beat's real cadence is set
+# by the relay's hold, and this constant only serves as the floor for the case
+# where the request comes back immediately — an OLD relay that doesn't know the
+# `wait` field. Without that floor a rolled-back relay would turn the heartbeat
+# into a tight request loop.
+JOB_HEARTBEAT_INTERVAL = 20  # seconds (floor between beats)
+
+# JOB_HEARTBEAT_RETRY is the backoff after a FAILED beat. A failure is logged and
+# ignored (the result path reports real errors), but we must not retry instantly:
+# a relay redeploy / network blip would otherwise become a hot loop against a
+# struggling relay. Small enough that a healthy job's updated_at stays far from
+# the reaper's 5-minute threshold across a short outage.
+JOB_HEARTBEAT_RETRY = 5  # seconds to wait after a failed beat
 
 # POLL_INTERVAL is how often _run_prompt re-reads ComfyUI's *scoped*
 # /history/{prompt_id} while waiting for a job to finish. It is the dominant
@@ -63,9 +78,9 @@ JOB_HEARTBEAT_INTERVAL = 20  # seconds
 # of average lag versus the old 1s.
 #
 # ⚠️ This constant deliberately drives NOTHING but that one local GET:
-#   * the relay beat / cancel check is on its own wall-clock schedule
-#     (JOB_HEARTBEAT_INTERVAL) — polling ComfyUI 4× faster must NOT mean 4×
-#     the traffic to the relay;
+#   * the relay beat / cancel pickup lives in its own task (_job_heartbeat) and
+#     is paced by the relay's own hold — polling ComfyUI 4× faster must NOT mean
+#     4× the traffic to the relay;
 #   * /queue has its own, deliberately slower cadence (QUEUE_POLL_INTERVAL);
 #   * every timeout below (OUTPUTS_GRACE, EXECUTION_BACKSTOP_TIMEOUT) is judged
 #     against time.monotonic(), not against "how many times we looped", so
@@ -240,18 +255,23 @@ class Worker:
         Returns the final status string (for tests/logging).
         """
         job_id = job["id"]
-        # Background heartbeat: keep poking the relay's progress endpoint (~every
-        # JOB_HEARTBEAT_INTERVAL) with a fixed (0, 0) "running" beat so the job's
+        # 取消信号:心跳任务是唯一的观察者,_run_prompt 是唯一的消费者。一旦置位就
+        # 永远置位(粘性)—— 后续心跳失败也绝不清掉它。
+        canceled = asyncio.Event()
+        # Background heartbeat: the job's ONLY channel to the relay while it runs.
+        # It re-pokes progress with a fixed (0, 0) "running" beat so the job's
         # updated_at advances through the long collect/upload phase too and the
-        # relay reaper never mistakes a healthy plugin for a dead one. Cancelled
-        # in finally — the task is bounded to this job's lifetime and never leaks.
-        hb = asyncio.create_task(self._job_heartbeat(job_id))
+        # relay reaper never mistakes a healthy plugin for a dead one — and, since
+        # it goes out with wait=True, the SAME request is what learns about a
+        # cancel (the relay holds it until one arrives). Cancelled in finally —
+        # the task is bounded to this job's lifetime and never leaks.
+        hb = asyncio.create_task(self._job_heartbeat(job_id, canceled))
         try:
             prompt = dict(job.get("api_prompt") or {})
             inputs = job.get("inputs") or []
             await self._stage_inputs(prompt, inputs)
             await self.relay.progress(job_id, "running", 0, 0)
-            prompt_id = await self._run_prompt(job_id, prompt)
+            prompt_id = await self._run_prompt(job_id, prompt, canceled)
             max_bytes = int(job.get("max_output_bytes") or 0)
             output_format = job.get("output_format") or "png"
             images, total = await self._collect_outputs(prompt_id, output_format)
@@ -291,22 +311,48 @@ class Worker:
             except asyncio.CancelledError:
                 pass
 
-    async def _job_heartbeat(self, job_id: str) -> None:
-        """Re-poke the relay with a fixed (0, 0) keep-alive every interval.
+    async def _job_heartbeat(self, job_id: str, canceled: asyncio.Event) -> None:
+        """The running job's single relay channel: keep-alive AND cancel pickup.
 
-        We no longer report real progress numbers (the app renders a spinner +
-        elapsed time, not a bar), so this just re-sends a "running" beat so the
-        relay's updated_at keeps advancing while a long generation — or the
-        collect/upload phase — runs. A failed beat is logged and ignored; the
-        result path reports real errors and _run_prompt's own loop carries the
-        cancel signal.
+        Each beat is progress(wait=True) with a fixed (0, 0) "running" payload —
+        we no longer report real progress numbers (the app renders a spinner +
+        elapsed time, not a bar). The relay bumps updated_at the moment the
+        request ARRIVES (so the reaper keeps seeing a live job through a long
+        generation and the whole collect/upload phase) and then HOLDS the request
+        ~25s waiting for a cancel. That makes the beat its own rhythm — no fixed
+        sleep needed — and drops the cancel latency from "up to one beat
+        interval" to seconds.
+
+        On a cancel we set the (sticky) event and STOP beating: the relay would
+        answer every subsequent wait immediately (cancel is already set), which
+        would turn this loop into a hot request loop. The remaining work is short
+        — _run_prompt sees the event within one local poll, cancels our prompt,
+        and handle_job posts the terminal result.
+
+        A failed beat is logged and ignored (the result path reports real
+        errors), but with a JOB_HEARTBEAT_RETRY backoff so a relay/network blip
+        can't become a tight retry loop. And when a beat returns EARLY without a
+        cancel — an old relay that ignores the `wait` field — we top the wait up
+        to JOB_HEARTBEAT_INTERVAL for the same reason.
         """
         while True:
-            await asyncio.sleep(JOB_HEARTBEAT_INTERVAL)
+            started = time.monotonic()
             try:
-                await self.relay.progress(job_id, "running", 0, 0)
+                r = await self.relay.progress(job_id, "running", 0, 0, wait=True)
             except Exception as e:  # noqa: BLE001 - keep beating; result path reports real errors
                 log.debug("job %s heartbeat error: %s", job_id, e)
+                await asyncio.sleep(JOB_HEARTBEAT_RETRY)
+                continue
+            if r.get("cancel"):
+                canceled.set()
+                log.info("job %s: relay requested cancel", job_id)
+                return
+            # Floor between beats (see JOB_HEARTBEAT_INTERVAL): with a relay that
+            # honours `wait` this sleep is skipped entirely — the hold already
+            # paced us.
+            elapsed = time.monotonic() - started
+            if elapsed < JOB_HEARTBEAT_INTERVAL:
+                await asyncio.sleep(JOB_HEARTBEAT_INTERVAL - elapsed)
 
     async def _stage_inputs(self, prompt: dict, inputs: list[dict]) -> None:
         if not inputs:
@@ -321,7 +367,8 @@ class Worker:
             key_to_name[inp.get("r2_key", "")] = up.get("name") or inp.get("name", "")
         apply_inputs(prompt, inputs, key_to_name)
 
-    async def _run_prompt(self, job_id: str, prompt: dict) -> str:
+    async def _run_prompt(self, job_id: str, prompt: dict,
+                          canceled: Optional[asyncio.Event] = None) -> str:
         """Submit the prompt and watch ComfyUI's REST state until it terminates.
 
         Version-independent: instead of parsing websocket frames (whose format
@@ -341,17 +388,20 @@ class Worker:
           * still running past EXECUTION_BACKSTOP_TIMEOUT -> JobFailed(
             error_code="execution_stalled") WITHOUT a global interrupt
 
-        Three independent cadences, deliberately NOT one loop counter:
+        This loop touches ONLY the local ComfyUI — it makes no relay request at
+        all. Two independent cadences, deliberately NOT one loop counter:
 
           * POLL_INTERVAL (0.25s) — the scoped, cheap /history/{id} read that
             actually decides "is it done"; the thing worth making fast.
           * QUEUE_POLL_INTERVAL (1s) — the unscoped /queue read, only needed for
             the "did it vanish" error path, kept at its historical rate so a
             faster loop cannot multiply the load on the user's ComfyUI.
-          * JOB_HEARTBEAT_INTERVAL (20s) — the only thing that touches the
-            NETWORK: re-poke the relay (fixed 0, 0) and pick up a cancel
-            request. Its schedule is wall-clock, so relay traffic per running
-            job is a constant, independent of how fast we poll locally.
+
+        The relay side lives entirely in _job_heartbeat, which runs as its own
+        task: it keeps the job's updated_at fresh AND, because its beat is a
+        wait-for-cancel long-poll, learns about a cancel within seconds. All this
+        loop does is read the `canceled` event it sets — so relay traffic per
+        running job is one held request, whatever the local poll rate is.
 
         Every deadline below is judged against time.monotonic(), never against
         an "elapsed += POLL_INTERVAL" accumulator, so the poll rate is free to
@@ -361,16 +411,25 @@ class Worker:
         A cancel is honoured by cancelling ONLY our prompt (see _cancel_comfy) —
         never a blanket interrupt that could kill a user's local generation.
         """
+        if canceled is None:
+            # No cancel channel wired (no heartbeat running) → an event nobody
+            # ever sets, so the check below is a cheap no-op.
+            canceled = asyncio.Event()
         client_id = str(uuid4())
         prompt_id = await self.comfy.submit(prompt, client_id)
 
         started = time.monotonic()      # submit time; the backstop counts from here
-        next_beat = started + JOB_HEARTBEAT_INTERVAL  # next relay poke / cancel check
         next_queue = started            # ≤ now → the first "missing" poll reads /queue
         completed_at: Optional[float] = None  # when ComfyUI said done (outputs lagging)
 
         while True:
             now = time.monotonic()
+            if canceled.is_set():
+                # The heartbeat picked up the relay's cancel. Cancel PRECISELY
+                # (pending → targeted queue delete, running → interrupt; see
+                # _cancel_comfy) and unwind — never a blanket interrupt.
+                await self._cancel_comfy(prompt_id)
+                raise JobCanceled()
             hist = await self.comfy.history(prompt_id)
             entry = hist.get(prompt_id)
             if entry is not None:
@@ -413,13 +472,6 @@ class Worker:
                     "ComfyUI execution exceeded the safety timeout",
                     error_code="execution_stalled",
                 )
-
-            if now >= next_beat:
-                next_beat = now + JOB_HEARTBEAT_INTERVAL
-                r = await self.relay.progress(job_id, "running", 0, 0)
-                if r.get("cancel"):
-                    await self._cancel_comfy(prompt_id)
-                    raise JobCanceled()
 
             await asyncio.sleep(POLL_INTERVAL)
 
