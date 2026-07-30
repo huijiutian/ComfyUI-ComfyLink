@@ -53,9 +53,20 @@ function manifestKey(backendId) {
   return `${LAST_MANIFEST_PREFIX}:${backendId}`;
 }
 
-// Hard cap on how many workflows can be uploaded (anti-abuse). The plugin is the
-// gate: the App mirrors the manifest 1:1, so blocking here keeps the synced set
-// within the limit. Keep in sync with the App's AppLimits.workflowFloor.
+// Hard cap on how many workflows can be uploaded in one go (anti-abuse).
+//
+// NOTE: this is NOT the only gate. The App enforces its own cap on the total
+// number of workflows stored on the device (across all paired ComfyUIs) when
+// importing. Both sides block, on purpose: this one is per-upload and per
+// machine, the App's is account-wide.
+//
+// The comment here used to say "the App mirrors the manifest 1:1, so blocking
+// here is enough" — that stopped being true when sync became manual pick +
+// add/update-only (never mirror-delete). Do not restore that assumption.
+//
+// Hardcoded on purpose: this runs in the ComfyUI browser frontend, which has no
+// authenticated access to GET /v1/me. It is a MIRROR of the relay's
+// tiers.go MaxWorkflows — changing the cap there means hand-editing this line.
 const MAX_WORKFLOWS = 100;
 
 // ---- small helpers -------------------------------------------------------
@@ -329,8 +340,8 @@ export async function uploadSelected(paths, backendIds) {
   const selected = (Array.isArray(paths) ? paths : []).filter(
     (p) => typeof p === "string" && p
   );
-  // Anti-abuse cap: block (don't upload) when over the limit. The App mirrors
-  // the manifest 1:1, so this is where the 100-workflow ceiling is enforced.
+  // Anti-abuse cap: block (don't upload) when this single batch is over the
+  // limit. The App enforces the device-wide total separately (both sides block).
   if (selected.length > MAX_WORKFLOWS) {
     throw new Error(
       `Over the limit: ${selected.length} selected, max ${MAX_WORKFLOWS}. Uncheck some and upload again.`
