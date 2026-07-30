@@ -65,8 +65,10 @@ function manifestKey(backendId) {
 // add/update-only (never mirror-delete). Do not restore that assumption.
 //
 // Hardcoded on purpose: this runs in the ComfyUI browser frontend, which has no
-// authenticated access to GET /v1/me. It is a MIRROR of the relay's
-// tiers.go MaxWorkflows — changing the cap there means hand-editing this line.
+// authenticated access to GET /v1/me. The cap is NOT tier-dependent — it is a flat
+// anti-abuse ceiling, defined as MaxWorkflowsPerAccount in the relay's limits.go
+// and mirrored here and in the App's AppLimits.workflowFloor. Raising it means
+// hand-editing all three.
 const MAX_WORKFLOWS = 100;
 
 // ---- small helpers -------------------------------------------------------
