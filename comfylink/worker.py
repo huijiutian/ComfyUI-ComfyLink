@@ -30,6 +30,7 @@ from uuid import uuid4
 
 import aiohttp
 
+from . import loras
 from .auth import TokenAuth
 from .comfy import ComfyClient
 from .config import RELAY_URL, STATE, detect_comfy_url
@@ -149,6 +150,28 @@ PLUGIN_TOO_OLD_RETRY = 60  # seconds between re-register attempts while blocked
 
 # The relay's fixed contract for the "your plugin is too old" refusal.
 PLUGIN_TOO_OLD_CODE = "plugin_too_old"
+
+# LORA_REFRESH_INTERVAL is how often the background inventory loop re-checks the
+# loras directory. Unlike object_info (collected once per register, i.e. only on
+# a ComfyUI restart/reconnect), a LoRA is something users add *while ComfyUI is
+# running* — download a file, drop it in the folder, hit refresh in the web UI.
+# Tying the inventory to register alone would mean "install a LoRA, then restart
+# ComfyUI before your phone can show its trigger words", which defeats the point
+# of a remote-control app.
+#
+# A warm refresh is cheap enough to afford on a timer: folder_paths caches its
+# own listing behind a directory-mtime check, every digest is served from the
+# path+size+mtime cache, and an unchanged manifest is dropped by the content-hash
+# compare before any network call. So the steady-state cost is one os.stat per
+# LoRA every 10 minutes and zero requests. Only genuinely new/changed files are
+# ever hashed.
+LORA_REFRESH_INTERVAL = 10 * 60  # seconds between inventory re-checks
+
+# LORA_UNSUPPORTED_RETRY backs the loop right off once the relay has told us it
+# has no inventory endpoint (404 — i.e. an older relay). We keep retrying rather
+# than giving up so a relay deploy is picked up without a ComfyUI restart, but at
+# a cadence that costs nothing.
+LORA_UNSUPPORTED_RETRY = 60 * 60  # seconds between retries against an old relay
 
 
 class _Revoked(Exception):
@@ -699,6 +722,7 @@ async def _serve_pairing(pairing, job_lock: asyncio.Lock, session, comfy_url,
     blocked = _TooOldLatch()
     while not _stopped(stop) and STATE.get_pairing(bid) is not None:
         hb = None
+        lo = None
         try:
             STATUS.set(state="connecting", error="")
             await _register(relay, comfy, pairing)
@@ -723,6 +747,10 @@ async def _serve_pairing(pairing, job_lock: asyncio.Lock, session, comfy_url,
             # claim 403 or from the latch the heartbeat arms — which lands in the
             # handler below and stops claiming.)
             hb = asyncio.create_task(_heartbeat_loop(relay, pairing, stop, blocked))
+            # LoRA inventory: its own task, so a cold run that spends minutes
+            # hashing hundreds of GB delays neither the heartbeat nor the claim
+            # loop below. Torn down with hb in the finally — never leaked.
+            lo = asyncio.create_task(_loras_loop(relay, pairing, stop))
             await _claim_loop(relay, worker, pairing, job_lock, stop, blocked)
         except asyncio.CancelledError:
             raise
@@ -800,10 +828,12 @@ async def _serve_pairing(pairing, job_lock: asyncio.Lock, session, comfy_url,
             log.warning("pairing %s connection error: %s; retrying in 5s", bid, e)
             await asyncio.sleep(5)
         finally:
-            if hb is not None:
-                hb.cancel()
+            for t in (hb, lo):
+                if t is None:
+                    continue
+                t.cancel()
                 try:
-                    await hb
+                    await t
                 except asyncio.CancelledError:
                     pass
                 except Exception:  # noqa: BLE001
@@ -939,6 +969,90 @@ async def _heartbeat_loop(relay: RelayClient, pairing,
         except Exception as e:  # noqa: BLE001 - claim loop handles revoke
             log.debug("heartbeat error: %s", e)
         await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+
+async def _report_loras(relay: RelayClient, pairing) -> bool:
+    """Ship this machine's LoRA inventory to R2 if it changed. Never raises.
+
+    Returns True while the relay supports the endpoint, False once it has
+    answered 404 (an older relay) so the caller can back right off.
+
+    Failure is ALWAYS non-fatal here, deliberately unlike _register: the
+    inventory is a convenience (trigger words in the app), so a missing endpoint,
+    an unconfigured R2, or a network blip must leave the backend online and
+    claiming jobs exactly as before. Nothing in this function touches STATUS —
+    the panel has no business showing an error because a nice-to-have did not
+    upload.
+    """
+    try:
+        manifest = await loras.collect()
+    except Exception as e:  # noqa: BLE001 - inventory must never break the worker
+        log.warning("lora inventory: collection failed: %s", e)
+        return True
+    if not manifest.get("loras") and not manifest.get("checkpoints"):
+        # No models installed (or none readable). Nothing to say; an empty upload
+        # would only overwrite a previously-good manifest with nothing. Note both
+        # arrays are checked: a machine with checkpoints but no LoRAs still has
+        # something the app can use (the family check).
+        return True
+    new_hash = loras.manifest_hash(manifest)
+    if pairing.loras_hash and pairing.loras_hash == new_hash:
+        log.debug("lora inventory unchanged (hash %s), skipping upload", new_hash[:12])
+        return True
+    try:
+        await relay.upload_loras(pairing.backend_id, manifest)
+    except RelayError as e:
+        if e.status == 404:
+            # Old relay, new plugin: the route simply does not exist. Expected
+            # during a staged rollout — a warning, not an error, and everything
+            # else carries on untouched.
+            log.warning(
+                "relay has no LoRA inventory endpoint (404) — skipping upload; "
+                "trigger words will appear once the relay is updated"
+            )
+            return False
+        log.warning("lora inventory upload failed: %s", e)
+        return True
+    except Exception as e:  # noqa: BLE001 - best-effort
+        log.warning("lora inventory upload failed: %s", e)
+        return True
+    # Only remember the hash after a successful upload, so a failure re-uploads
+    # on the next pass (same rule as object_info_hash).
+    pairing.loras_hash = new_hash
+    STATE.save()
+    log.info("uploaded model inventory (%d LoRA(s), %d checkpoint(s), hash %s)",
+             len(manifest.get("loras") or []),
+             len(manifest.get("checkpoints") or []), new_hash[:12])
+    return True
+
+
+async def _loras_loop(relay: RelayClient, pairing,
+                      stop: asyncio.Event | None) -> None:
+    """Background LoRA inventory reporter for one pairing.
+
+    Runs as its OWN task next to the heartbeat, never inline in _register: the
+    first pass may spend minutes hashing tens of GB (in a worker thread — see
+    loras.collect), and registration, heartbeats and job claims must not wait a
+    single millisecond for it.
+
+    Exits immediately outside ComfyUI: without folder_paths there is no
+    inventory to build, and that will not change later in this process, so
+    looping would just burn a wakeup every interval forever.
+    """
+    if not loras.folder_paths_available():
+        log.debug("lora inventory: folder_paths unavailable, not collecting")
+        return
+    while not _stopped(stop) and STATE.get_pairing(pairing.backend_id) is not None:
+        try:
+            supported = await _report_loras(relay, pairing)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - the loop itself must never die
+            log.warning("lora inventory: %s", e)
+            supported = True
+        await asyncio.sleep(
+            LORA_REFRESH_INTERVAL if supported else LORA_UNSUPPORTED_RETRY
+        )
 
 
 async def _claim_loop(relay: RelayClient, worker: Worker, pairing,

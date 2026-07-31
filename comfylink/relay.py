@@ -230,6 +230,30 @@ class RelayClient:
         data = json.dumps(object_info).encode()
         await self.put_object(url, data, "application/json")
 
+    async def sign_put_loras(self, backend_id: str) -> tuple[str, str]:
+        """Presigned PUT for this backend's LoRA inventory manifest.
+
+        Same two-step shape as sign_object_info. A relay that predates this
+        feature simply has no such route and answers 404 — the caller treats that
+        as "this relay can't take an inventory yet" and moves on.
+        """
+        d = await self._json("POST", "/v1/backends/loras/sign-put",
+                             {"backend_id": backend_id})
+        return d["key"], d["url"]
+
+    async def upload_loras(self, backend_id: str, manifest: dict) -> None:
+        """Ship the LoRA inventory to R2: sign a PUT, then upload the JSON.
+
+        ``retry=False`` on purpose. The delivery retry (see _deliver) exists so a
+        FINISHED job's result survives a relay redeploy — losing it costs the
+        user a regeneration. An inventory upload is not on that path: it is
+        refreshed on a timer anyway, so burning 90s of backoff here would only
+        keep a background task alive longer for no benefit.
+        """
+        _key, url = await self.sign_put_loras(backend_id)
+        data = json.dumps(manifest).encode()
+        await self.put_object(url, data, "application/json", retry=False)
+
     async def sign_put_workflow(self, backend_id: str, artifact: str,
                                 workflow_id: Optional[str] = None) -> tuple[str, str]:
         """Request a presigned PUT URL for a workflow manifest or blob.
@@ -320,8 +344,15 @@ class RelayClient:
         )
         return d["r2_key"], d["url"]
 
-    async def put_object(self, url: str, data: bytes, content_type: str) -> None:
-        """Upload bytes to object storage via a presigned PUT URL (no auth header)."""
+    async def put_object(self, url: str, data: bytes, content_type: str,
+                         retry: bool = True) -> None:
+        """Upload bytes to object storage via a presigned PUT URL (no auth header).
+
+        ``retry`` defaults to True (the historical behaviour — every existing
+        caller is on the delivery path). Pass False for background, re-runnable
+        uploads such as the LoRA inventory, where riding out an outage buys
+        nothing and only prolongs a best-effort task.
+        """
         _validate_url(url)  # SSRF guard: relay-supplied URL (permanent — outside retry).
 
         async def _put():
@@ -332,6 +363,9 @@ class RelayClient:
                     # (expired/forbidden presign) fails fast.
                     raise RelayError(f"storage PUT {r.status}: {await r.text()}", r.status)
 
+        if not retry:
+            await _put()
+            return
         # A presigned PUT is idempotent (same key, overwrite), so retrying a blip
         # is safe. Upload is the other half of delivery — ride the outage here too.
         await self._deliver("put_object", _put)

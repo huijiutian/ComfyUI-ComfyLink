@@ -118,6 +118,12 @@ class Pairing:
     # snapshot. The object_info bucket is non-expiring, so a remembered hash
     # guarantees the object is still there. Empty == "never uploaded" => uploads.
     object_info_hash: str = ""
+    # Same trick for the LoRA inventory (see loras.manifest_hash): the content
+    # hash of the last manifest successfully uploaded for THIS backend_id, so a
+    # refresh that finds nothing changed uploads nothing. Per-pairing because
+    # each account has its own R2 key — the same machine may have shipped the
+    # manifest to account A but not yet to account B.
+    loras_hash: str = ""
 
 
 class State:
@@ -130,6 +136,13 @@ class State:
     def __init__(self) -> None:
         self.backend_name: str = _default_name()
         self.pairings: list[Pairing] = []
+        # SHA256 cache for the LoRA inventory: {"<path>|<size>|<mtime_ns>": hex}.
+        # MACHINE-level, not per-pairing — the digest of a file on disk does not
+        # depend on which account we report it to, and re-hashing it once per
+        # paired account would multiply a cold run that already reads tens of GB.
+        # Rebuilt (not merged) on every scan, so entries for deleted LoRAs are
+        # pruned rather than accumulating. See loras.build_manifest.
+        self.lora_hashes: dict[str, str] = {}
 
     @classmethod
     def load(cls) -> "State":
@@ -144,6 +157,11 @@ class State:
         if not isinstance(d, dict):
             return st
         st.backend_name = d.get("backend_name") or st.backend_name
+        lh = d.get("lora_hashes")
+        if isinstance(lh, dict):
+            # Values must be strings; a hand-mangled file must not poison the
+            # cache with something that later gets written into a manifest.
+            st.lora_hashes = {str(k): str(v) for k, v in lh.items() if v}
         raw = d.get("pairings")
         if isinstance(raw, list):
             # New multi-pairing format.
@@ -158,6 +176,7 @@ class State:
                     device_token=token,
                     device_id=item.get("device_id", ""),
                     object_info_hash=item.get("object_info_hash", ""),
+                    loras_hash=item.get("loras_hash", ""),
                 ))
         else:
             # Back-compat: old single-pairing top-level format. Convert to a
@@ -226,9 +245,14 @@ class State:
                         "device_token": pr.device_token,
                         "device_id": pr.device_id,
                         "object_info_hash": pr.object_info_hash,
+                        "loras_hash": pr.loras_hash,
                     }
                     for pr in self.pairings
                 ],
+                # LoRA digest cache (see State.lora_hashes). Local file paths
+                # only — no account data — but it rides in the same 0600 file as
+                # the device tokens, which is strictly the safer default.
+                "lora_hashes": self.lora_hashes,
             })
             # Create with 0600 atomically (O_CREAT honors the mode only on
             # creation), then chmod to also tighten a pre-existing file that may
