@@ -74,6 +74,29 @@ function fmtUploadedAt(iso) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+// One paired account's display text: the email, or a placeholder while it is
+// still unknown. The email is NOT known the instant a pairing appears — the
+// worker learns it from the relay's register response a few seconds later, and
+// it is deliberately never persisted, so it is unknown again after every ComfyUI
+// restart until the worker re-registers. Any row that shows an account must
+// therefore be able to go from placeholder -> email WITHOUT being rebuilt.
+const ACCOUNT_PENDING = "pairing…";
+
+// Paint an account's text into an EXISTING row: text, tooltip, and the muted
+// italic styling used for the placeholder. Nothing else about the row is
+// touched — no node is created, replaced or removed — so this is safe to call on
+// every poll even while the user is interacting with the row.
+// Early-outs when the text already matches (an email can never equal the
+// placeholder), so a steady-state poll writes to the DOM zero times.
+function paintAccount(span, titleEl, account) {
+  const text = account || ACCOUNT_PENDING;
+  if (span.textContent === text) return;
+  span.textContent = text;
+  titleEl.title = text;
+  span.style.color = account ? "" : "var(--descrip-text,#aaa)";
+  span.style.fontStyle = account ? "" : "italic";
+}
+
 function h(tag, props = {}, children = []) {
   const e = document.createElement(tag);
   Object.assign(e, props);
@@ -121,6 +144,12 @@ function buildPanel(root) {
     textContent: "Paired accounts",
   });
   const accountsList = h("div", { style: "margin-bottom:14px;" });
+  // Which backend_ids the rendered rows currently are, plus the elements whose
+  // text has to keep up with the status poll. Same contract as the sync-target
+  // list below: rebuild rows only when the SET of accounts changes, repaint
+  // their text on every poll.
+  let accountRowKeys = "";
+  const accountRows = new Map(); // backend_id -> { row, span }
 
   // --- pairing form: ALWAYS visible, used to ADD (append) more accounts -------
   const formTitle = h("div", {
@@ -188,8 +217,11 @@ function buildPanel(root) {
   });
   // Tracks which backend_ids the checkbox list currently reflects, so the 3s
   // poll only rebuilds the rows when the SET of accounts actually changes (never
-  // yanking the boxes out from under a mid-selection user).
+  // yanking the boxes out from under a mid-selection user). Everything that can
+  // change WITHOUT the set changing (the account email) is repainted in place
+  // instead — see syncAccountCheckboxes.
   let accountKeys = "";
+  const syncRows = new Map(); // backend_id -> { label, span }
   const currentBackendIds = () =>
     Array.from(accountsSyncList.querySelectorAll("input[type=checkbox]"))
       .filter((c) => c.checked)
@@ -243,43 +275,60 @@ function buildPanel(root) {
 
   // Render one row per paired account: email (or "pairing…" until it registers)
   // and a per-account Unpair button.
+  //
+  // Rows are rebuilt ONLY when the set of backend_ids changes; on every other
+  // poll we just repaint the text. The rows carry state of their own — an Unpair
+  // button that is disabled while its request is in flight, and keyboard focus —
+  // and a blind rebuild every 3s would silently re-enable a button mid-unpair and
+  // steal focus. The email still refreshes, because it is repainted below.
   function renderAccounts(pairings) {
-    accountsList.innerHTML = "";
     const items = Array.isArray(pairings) ? pairings : [];
     accountsTitle.style.display = items.length ? "block" : "none";
+    const key = items.map((p) => p.backend_id).join("|");
+    if (key !== accountRowKeys) {
+      accountRowKeys = key;
+      accountRows.clear();
+      accountsList.innerHTML = "";
+      for (const p of items) {
+        const label = h("span", {
+          style: "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
+        });
+        const btn = h("button", {
+          textContent: "Unpair",
+          style: "padding:3px 10px;cursor:pointer;font-size:11px;",
+        });
+        btn.onclick = async () => {
+          btn.disabled = true;
+          try {
+            await api.unpair(p.backend_id);
+          } catch (e) {
+            /* refresh shows the resulting state regardless */
+          } finally {
+            // Re-enable explicitly: on success refresh() drops this row anyway,
+            // but on failure the row survives and must stay clickable (the poll
+            // no longer rebuilds it for us).
+            btn.disabled = false;
+            refresh();
+          }
+        };
+        const row = h(
+          "div",
+          {
+            style:
+              "display:flex;align-items:center;gap:8px;padding:5px 0;" +
+              "border-bottom:1px solid var(--border-color,#333);",
+          },
+          [label, btn]
+        );
+        accountRows.set(p.backend_id, { row, span: label });
+        accountsList.append(row);
+      }
+    }
+    // EVERY poll: the email arrives after the row does (and again after every
+    // ComfyUI restart), so refresh the text whether or not we rebuilt.
     for (const p of items) {
-      const email = p.account || "pairing…";
-      const label = h("span", {
-        textContent: email,
-        style:
-          "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" +
-          (p.account ? "" : "color:var(--descrip-text,#aaa);font-style:italic;"),
-        title: email,
-      });
-      const btn = h("button", {
-        textContent: "Unpair",
-        style: "padding:3px 10px;cursor:pointer;font-size:11px;",
-      });
-      btn.onclick = async () => {
-        btn.disabled = true;
-        try {
-          await api.unpair(p.backend_id);
-        } catch (e) {
-          /* refresh shows the resulting state regardless */
-        } finally {
-          refresh();
-        }
-      };
-      const row = h(
-        "div",
-        {
-          style:
-            "display:flex;align-items:center;gap:8px;padding:5px 0;" +
-            "border-bottom:1px solid var(--border-color,#333);",
-        },
-        [label, btn]
-      );
-      accountsList.append(row);
+      const r = accountRows.get(p.backend_id);
+      if (r) paintAccount(r.span, r.span, p.account);
     }
   }
 
@@ -289,44 +338,57 @@ function buildPanel(root) {
   // paired account defaults ON and prior explicit unchecks are honored across
   // rebuilds. Toggling a box persists the change + reloads the workflow list.
   // Returns true when the list was rebuilt (caller may refresh the list).
+  //
+  // The rebuild guard deliberately keys on backend_ids ONLY — but that means the
+  // account email, which lands a few seconds AFTER the pairing itself (and again
+  // after every restart), changes without changing the key. So the text of the
+  // existing rows is repainted on EVERY poll, below the guard. Repainting touches
+  // only the <span>'s text/tooltip/colour: the checkbox element, its checked
+  // state, its focus and its handler are never re-created, so a user mid-check is
+  // still never disturbed.
   function syncAccountCheckboxes(pairings) {
     const items = Array.isArray(pairings) ? pairings : [];
     const key = items.map((p) => p.backend_id).join("|");
-    if (key === accountKeys) return false;
-    accountKeys = key;
-    const off = loadSyncOff();
-    accountsSyncList.innerHTML = "";
-    for (const p of items) {
-      const checked = !off.has(p.backend_id);
-      const cb = h("input", { type: "checkbox", checked });
-      cb.dataset.backendId = p.backend_id;
-      cb.onchange = () => {
-        const s = loadSyncOff();
-        if (cb.checked) s.delete(p.backend_id);
-        else s.add(p.backend_id);
-        saveSyncOff(s);
-        loadWorkflows();
-      };
-      const label = h(
-        "label",
-        {
-          style:
-            "display:flex;align-items:center;gap:6px;padding:3px 0;cursor:pointer;font-size:12px;",
-          title: p.account || "pairing…",
-        },
-        [
-          cb,
-          h("span", {
-            textContent: p.account || "pairing…",
+    const rebuilt = key !== accountKeys;
+    if (rebuilt) {
+      accountKeys = key;
+      syncRows.clear();
+      const off = loadSyncOff();
+      accountsSyncList.innerHTML = "";
+      for (const p of items) {
+        const checked = !off.has(p.backend_id);
+        const cb = h("input", { type: "checkbox", checked });
+        cb.dataset.backendId = p.backend_id;
+        cb.onchange = () => {
+          const s = loadSyncOff();
+          if (cb.checked) s.delete(p.backend_id);
+          else s.add(p.backend_id);
+          saveSyncOff(s);
+          loadWorkflows();
+        };
+        const span = h("span", {
+          style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
+        });
+        const label = h(
+          "label",
+          {
             style:
-              "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" +
-              (p.account ? "" : "color:var(--descrip-text,#aaa);font-style:italic;"),
-          }),
-        ]
-      );
-      accountsSyncList.append(label);
+              "display:flex;align-items:center;gap:6px;padding:3px 0;cursor:pointer;font-size:12px;",
+          },
+          [cb, span]
+        );
+        syncRows.set(p.backend_id, { label, span });
+        accountsSyncList.append(label);
+      }
     }
-    return true;
+    // EVERY poll, rebuilt or not: pull the (late-arriving) account email into the
+    // rows that already exist. Without this the row stays on "pairing…" forever,
+    // because the email never changes the rebuild key above.
+    for (const p of items) {
+      const r = syncRows.get(p.backend_id);
+      if (r) paintAccount(r.span, r.label, p.account);
+    }
+    return rebuilt;
   }
 
   async function refresh() {
@@ -334,6 +396,9 @@ function buildPanel(root) {
     try {
       s = await api.status();
     } catch (e) {
+      // The plugin's own HTTP route is unreachable (ComfyUI restarting, etc).
+      // Grey the dot too, so a stale green "Online" dot can't outlive the text.
+      dot.style.background = "#9e9e9e";
       stateText.textContent = "Panel offline";
       return;
     }

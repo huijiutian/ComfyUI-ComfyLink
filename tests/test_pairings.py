@@ -208,6 +208,53 @@ class TestReconcile(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(starts["n"], 1)
 
 
+class TestAccountFromRegister(unittest.IsolatedAsyncioTestCase):
+    """Where the panel's "paired to <email>" text comes from.
+
+    The email lives ONLY in memory (never persisted — no PII at rest), so it is
+    unknown on every fresh start and is filled in by the register response. The
+    panel shows a "pairing…" placeholder until then, which makes any path that
+    silently clears it a permanent-looking bug in the UI.
+    """
+
+    def _fixtures(self, register_returns):
+        relay = mock.AsyncMock()
+        relay.register.return_value = register_returns
+        comfy = mock.AsyncMock()
+        comfy.object_info.return_value = {"A": {}}
+        return relay, comfy
+
+    async def _register(self, pairing, register_returns):
+        relay, comfy = self._fixtures(register_returns)
+        with mock.patch.object(worker, "STATUS"), \
+                mock.patch.object(worker, "STATE", _SupervisorState([pairing])):
+            await worker._register(relay, comfy, pairing)
+
+    async def test_register_fills_the_account(self):
+        pr = Pairing(backend_id="b1", device_token="t1")
+        await self._register(pr, {"account": "alice@example.com"})
+        self.assertEqual(pr.account, "alice@example.com")
+
+    async def test_a_response_without_an_account_keeps_the_known_one(self):
+        # ⛔ A pairing's backend_id ↔ account binding never changes, so a body
+        # that says nothing about the account means "no news". Clearing it would
+        # send the panel back to "pairing…" on every reconnect — and the panel
+        # only repaints text, it can't invent an email it was never told.
+        pr = Pairing(backend_id="b1", device_token="t1",
+                     account="alice@example.com")
+        for body in ({}, {"account": ""}, {"account": None}, None, "nope"):
+            with self.subTest(body=body):
+                await self._register(pr, body)
+                self.assertEqual(pr.account, "alice@example.com")
+
+    async def test_unknown_stays_unknown_until_the_relay_says_otherwise(self):
+        # No invented value either: "" is honest, and the panel's placeholder
+        # says exactly that.
+        pr = Pairing(backend_id="b1", device_token="t1")
+        await self._register(pr, {})
+        self.assertEqual(pr.account, "")
+
+
 class TestRunLockedSerializes(unittest.IsolatedAsyncioTestCase):
     async def test_one_job_at_a_time_across_accounts(self):
         lock = asyncio.Lock()

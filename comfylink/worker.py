@@ -1010,7 +1010,17 @@ async def _register(relay: RelayClient, comfy: ComfyClient, pairing) -> None:
     # the red bar in the panel.
     STATUS.set(plugin_too_old=False, plugin_min_version="", plugin_update_url="")
     # Account email for the panel ("paired to <email>"); best-effort, may be "".
-    pairing.account = (resp or {}).get("account", "") if isinstance(resp, dict) else ""
+    #
+    # ONLY overwritten when the response actually carries one. A pairing's
+    # backend_id ↔ account binding never changes, so a response that says nothing
+    # about the account (older relay, unexpected body shape) means "no news", not
+    # "no account" — and clearing it would drop the panel back to the "pairing…"
+    # placeholder on every reconnect, for a pairing that is perfectly healthy.
+    # Still "" until the FIRST register that reports one: the email is deliberately
+    # never persisted (no PII at rest), so it is unknown on every fresh start.
+    account = (resp or {}).get("account", "") if isinstance(resp, dict) else ""
+    if account:
+        pairing.account = account
     try:
         node_count, _uploaded = await _report_object_info(relay, comfy, pairing)
         STATUS.set(state="online", node_count=node_count, error="")
@@ -1074,12 +1084,14 @@ async def _heartbeat_loop(relay: RelayClient, pairing,
     try:
         while not _stopped(stop) and STATE.get_pairing(pairing.backend_id) is not None:
             try:
-                # The hash is read FRESH on every beat: a refresh that finished
-                # since the last one updated it in place, so the very next beat
-                # is the receipt the app is waiting for. "" until we have ever
-                # captured a snapshot (see RelayClient.heartbeat).
+                # Both receipt fields are read FRESH on every beat: a refresh that
+                # finished since the last one updated them in place, so the very
+                # next beat is the receipt the app is waiting for. Empty/0 until
+                # we have ever captured a snapshot / served a refresh request
+                # (see RelayClient.heartbeat).
                 resp = await relay.heartbeat(pairing.backend_id,
-                                             pairing.object_info_hash)
+                                             pairing.object_info_hash,
+                                             pairing.object_info_synced_at)
             except RelayError as e:
                 too_old = _as_plugin_too_old(e)
                 if too_old is not None:
@@ -1320,23 +1332,32 @@ async def _refresh_object_info(relay: RelayClient, comfy: ComfyClient,
     pairing.object_info_synced_at = max(
         pairing.object_info_synced_at or 0, requested)
     STATE.save()
-    if uploaded:
-        # A NEW snapshot is in R2 and nobody knows yet: it went there over a
-        # presigned PUT, so the relay never saw it land. Beat once right now
-        # rather than letting the app wait out the rest of the heartbeat
-        # interval to learn the refresh finished.
-        #
-        # Only when we actually uploaded: an unchanged snapshot carries the same
-        # fingerprint the relay already has, so an extra beat would say nothing.
-        await _announce_object_info(relay, pairing)
+    # Beat once right now, WHETHER OR NOT anything was uploaded — the watermark
+    # above just moved, and that is the receipt the app is waiting on.
+    #
+    # This used to be `if uploaded:`, which deadlocked the unchanged case: the
+    # snapshot goes to R2 over a presigned PUT so the relay never sees it land,
+    # the app therefore waits for the beat, and a machine whose node set had not
+    # changed uploads nothing and so never beat — the app waited until it timed
+    # out even though the refresh had completed instantly. "The refresh you asked
+    # for is done" and "the content changed" are two different facts: the
+    # watermark carries the first, the fingerprint carries the second, and the
+    # beat must therefore go out on both paths. (Not uploading an unchanged
+    # snapshot remains correct and is untouched — only the beat moved.)
+    await _announce_object_info(relay, pairing)
 
 
 async def _announce_object_info(relay: RelayClient, pairing) -> None:
-    """Beat once, immediately, so the relay learns the new snapshot fingerprint.
+    """Beat once, immediately, so the relay learns the refresh finished.
+
+    Carries BOTH receipt fields: the served-request watermark
+    (object_info_synced_at — "your refresh is done") and the snapshot fingerprint
+    (object_info_hash — "and this is what I have"). The app waits on the former,
+    so this beat must go out even when the latter did not move.
 
     Deliberately NOT a new endpoint or a second long-poll: the heartbeat is
     already the channel through which this plugin reports its own state, and it
-    already carries object_info_hash — so "notify" is just "beat now".
+    already carries both fields — so "notify" is just "beat now".
 
     Best-effort, and BOUNDED BY DESIGN:
 
@@ -1350,7 +1371,8 @@ async def _announce_object_info(relay: RelayClient, pairing) -> None:
         extended and its cadence is exactly what it would have been.
     """
     try:
-        await relay.heartbeat(pairing.backend_id, pairing.object_info_hash)
+        await relay.heartbeat(pairing.backend_id, pairing.object_info_hash,
+                              pairing.object_info_synced_at)
     except Exception as e:  # noqa: BLE001 - the next regular beat carries it anyway
         log.debug("immediate beat after object_info upload failed "
                   "(the next regular beat will carry it): %s", e)

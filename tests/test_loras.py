@@ -1083,10 +1083,13 @@ class TestNothingScansWithoutTheSignal(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(beats.wait(), 1)
             raise worker._Revoked()
 
-        async def counting_heartbeat(bid, object_info_hash=""):
-            # This pairing has never captured a snapshot, so the beat must carry
-            # no fingerprint at all (see RelayClient.heartbeat).
+        async def counting_heartbeat(bid, object_info_hash="",
+                                     object_info_synced_at=0.0):
+            # This pairing has never captured a snapshot nor served a refresh
+            # request, so the beat must carry neither receipt field at all (see
+            # RelayClient.heartbeat: empty/0 means "keep what you have").
             self.assertEqual(object_info_hash, "")
+            self.assertEqual(object_info_synced_at, 0.0)
             beats.set()
             return {}
 

@@ -645,6 +645,41 @@ class TestHeartbeatCarriesTheFingerprint(unittest.IsolatedAsyncioTestCase):
         await relay.heartbeat("b1", "")
         self.assertNotIn("object_info_hash", sent[0][2])
 
+    # ── the OTHER half of the receipt: which refresh request we have served ──
+    #
+    # The fingerprint alone cannot say "your refresh is done": an unchanged
+    # ComfyUI keeps the same fingerprint forever, so an app waiting on it waits
+    # for a change that is never coming. The watermark is the completion signal.
+
+    async def test_served_request_watermark_is_sent(self):
+        relay, sent = self._client()
+        await relay.heartbeat("b1", "abc", 1754000000.0)
+        _method, _path, body = sent[0]
+        self.assertEqual(body["object_info_synced_at"], 1754000000.0)
+        self.assertEqual(body["object_info_hash"], "abc")     # both, independently
+
+    async def test_never_served_sends_no_fake_value(self):
+        # ⛔ Same "empty = keep what you have" rule as the fingerprint: a backend
+        # that has never served a refresh request must not write a 0 over
+        # whatever the relay has.
+        relay, sent = self._client()
+        await relay.heartbeat("b1", "abc")                    # default: 0.0
+        self.assertNotIn("object_info_synced_at", sent[0][2])
+        for falsy in (0, 0.0, None):
+            with self.subTest(value=falsy):
+                relay, sent = self._client()
+                await relay.heartbeat("b1", "abc", falsy)
+                self.assertNotIn("object_info_synced_at", sent[0][2])
+
+    async def test_the_watermark_is_sent_even_with_no_fingerprint(self):
+        # The two fields are independent: a refresh can complete (watermark
+        # moves) on a backend whose snapshot upload has never succeeded.
+        relay, sent = self._client()
+        await relay.heartbeat("b1", "", 900.0)
+        _method, _path, body = sent[0]
+        self.assertNotIn("object_info_hash", body)
+        self.assertEqual(body["object_info_synced_at"], 900.0)
+
     async def test_the_loop_reads_the_pairing_fresh_each_beat(self):
         # A refresh that lands between beats must be reported by the NEXT beat,
         # so the value may not be captured once and cached.
@@ -673,9 +708,45 @@ class TestHeartbeatCarriesTheFingerprint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hashes[0], "aaa")
         self.assertIn("bbb", hashes)                      # picked up, not cached
 
+    async def test_the_loop_reports_the_served_request_watermark(self):
+        # Same freshness rule for the watermark: a refresh that advances it
+        # between beats must be reported by the NEXT beat, not one interval later.
+        relay = mock.AsyncMock()
+        pairing = _RefreshPairing(object_info_hash="aaa")
+        state = _FakeState()
+        state.get_pairing = lambda bid: pairing
+
+        async def bump(*_a, **_kw):
+            if relay.heartbeat.await_count == 2:
+                pairing.object_info_synced_at = 900.0
+            return {"ok": True}
+
+        relay.heartbeat.side_effect = bump
+        with mock.patch.object(worker, "STATE", state), \
+                mock.patch.object(worker, "HEARTBEAT_INTERVAL", 0.001):
+            hb = asyncio.create_task(worker._heartbeat_loop(relay, pairing, None))
+            await asyncio.sleep(0.05)
+            hb.cancel()
+            try:
+                await hb
+            except asyncio.CancelledError:
+                pass
+        marks = [c.args[2] for c in relay.heartbeat.await_args_list]
+        self.assertEqual(marks[0], 0.0)                   # never served anything yet
+        self.assertIn(900.0, marks)                       # picked up, not cached
+
 
 class TestImmediateBeatAfterUpload(unittest.IsolatedAsyncioTestCase):
-    """A finished refresh announces itself instead of waiting out the interval."""
+    """A finished refresh announces itself instead of waiting out the interval.
+
+    ⛔ REGRESSION GUARD (user-reported, 2026-08-01): the announcement used to be
+    conditional on `uploaded`. A ComfyUI whose node set had not changed uploads
+    nothing — by design, that optimisation is correct — so it never beat, and the
+    app, which waits for the refresh receipt, waited until it timed out on a
+    refresh that had actually finished in milliseconds. "The refresh is done" and
+    "the content changed" are two different facts carried by two different fields;
+    the beat goes out on BOTH paths.
+    """
 
     def _fixture(self, oi, stored_hash=""):
         relay = mock.AsyncMock()
@@ -691,19 +762,36 @@ class TestImmediateBeatAfterUpload(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(worker, "STATUS"):
             await worker._refresh_object_info(relay, comfy, pairing, 900.0)
         relay.upload_object_info.assert_awaited_once()
-        relay.heartbeat.assert_awaited_once_with("b1", object_info_hash(oi))
+        relay.heartbeat.assert_awaited_once_with("b1", object_info_hash(oi), 900.0)
         # The beat reports the snapshot that is NOW in R2, not the old one.
         self.assertEqual(relay.heartbeat.await_args.args[1], pairing.object_info_hash)
 
-    async def test_unchanged_snapshot_is_not_announced(self):
-        # Same fingerprint the relay already has => an extra beat says nothing.
+    async def test_unchanged_snapshot_is_still_announced(self):
+        # ⛔ THE BUG. Nothing to upload, but the user's refresh WAS served — and
+        # the app is waiting for exactly that. Beat, carrying the watermark that
+        # just advanced and the (unchanged) fingerprint.
         oi = {"A": {}}
         relay, comfy, pairing = self._fixture(oi, stored_hash=object_info_hash(oi))
         with mock.patch.object(worker, "STATE", _FakeState()), \
                 mock.patch.object(worker, "STATUS"):
             await worker._refresh_object_info(relay, comfy, pairing, 900.0)
+        # The R2 optimisation is untouched: an unchanged snapshot is NOT re-sent.
         relay.upload_object_info.assert_not_awaited()
-        relay.heartbeat.assert_not_awaited()
+        # ...but the completion receipt goes out anyway.
+        relay.heartbeat.assert_awaited_once_with("b1", object_info_hash(oi), 900.0)
+
+    async def test_the_announced_watermark_is_the_request_just_served(self):
+        # The beat must carry the watermark AFTER it advanced — announcing the
+        # old value would tell the app "still working" and it would keep waiting.
+        oi = {"A": {}}
+        relay, comfy, pairing = self._fixture(oi, stored_hash=object_info_hash(oi))
+        pairing.object_info_synced_at = 100.0          # served an older request
+        with mock.patch.object(worker, "STATE", _FakeState()), \
+                mock.patch.object(worker, "STATUS"):
+            await worker._refresh_object_info(relay, comfy, pairing, 900.0)
+        self.assertEqual(relay.heartbeat.await_args.args[2], 900.0)
+        self.assertEqual(relay.heartbeat.await_args.args[2],
+                         pairing.object_info_synced_at)
 
     async def test_a_failed_upload_is_not_announced(self):
         relay, comfy, pairing = self._fixture({"A": {}})

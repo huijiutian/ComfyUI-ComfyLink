@@ -268,7 +268,8 @@ class RelayClient:
         return d["key"], d["url"]
 
     async def heartbeat(self, backend_id: str,
-                        object_info_hash: str = "") -> dict:
+                        object_info_hash: str = "",
+                        object_info_synced_at: float = 0.0) -> dict:
         """Mark this backend alive. Returns the relay's response body.
 
         The body is the plugin's ONLY inbound channel while idle, so it doubles
@@ -296,11 +297,27 @@ class RelayClient:
         and omitting the key says exactly that — a backend that has never
         captured a snapshot must not put anything in that column, least of all
         some other identifier that happened to be at hand.
+
+        ``object_info_synced_at`` is the OTHER half of that receipt, and it
+        answers a different question. The fingerprint says WHAT we have; this says
+        WHICH REFRESH REQUEST we have already served (it echoes back the
+        ``object_info_requested_at`` the relay sent us — see
+        worker._refresh_object_info). Both are needed because "the refresh
+        finished" and "the content changed" are NOT the same event: a machine
+        whose node set did not change since the last capture uploads nothing and
+        keeps the very same fingerprint, yet the user's refresh was still served.
+        Reporting only the fingerprint left the app waiting for a change that was
+        never going to come.
+
+        Same "empty = keep what you have" rule as the hash: 0 (never served a
+        request) omits the key rather than writing a zero over the relay's value.
         """
         body = {"backend_id": backend_id,
                 "version": __version__, "commit": __commit__}
         if object_info_hash:
             body["object_info_hash"] = object_info_hash
+        if object_info_synced_at and object_info_synced_at > 0:
+            body["object_info_synced_at"] = object_info_synced_at
         return await self._json("POST", "/v1/backends/heartbeat", body)
 
     async def abandon_jobs(self, backend_id: str) -> int:
