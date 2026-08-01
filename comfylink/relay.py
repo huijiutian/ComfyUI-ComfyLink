@@ -311,13 +311,39 @@ class RelayClient:
 
         Same "empty = keep what you have" rule as the hash: 0 (never served a
         request) omits the key rather than writing a zero over the relay's value.
+
+        ⛔ IT GOES OUT AS AN ``int``, and that is not cosmetic. It is a unix
+        SECOND — an integer by definition — but it is carried in
+        ``Pairing.object_info_synced_at``, which is a Python ``float``, so
+        ``json.dumps`` writes ``1785561497.0``. The relay's field is a Go
+        ``int64``, and Go's json decoder treats a decimal point there as a HARD
+        error for the WHOLE request body — not just that field. The observed
+        production consequence (2026-08-01, on a user's machine):
+
+            {"backend_id": "...", "object_info_synced_at": 1785561497}    -> 200
+            {"backend_id": "...", "object_info_synced_at": 1785561497.0}  -> 400
+                                                  {"error":"backend_id required"}
+
+        i.e. the body failed to parse, every field came back zero-valued, and the
+        relay answered with a message about a field we had in fact sent. The beat
+        then failed FOREVER for that backend — no refresh signals, no last_seen —
+        and only for backends that had ever served one refresh (0 omits the key,
+        so a fresh pairing looked perfectly healthy). See kb 06-pitfalls.
+
+        The relay now also tolerates the float shape, but the conversion stays
+        HERE and is the real fix: the value is an integer, the wire format should
+        say so, and plugins already installed on users' machines are the ones the
+        relay has to be tolerant for.
         """
         body = {"backend_id": backend_id,
                 "version": __version__, "commit": __commit__}
         if object_info_hash:
             body["object_info_hash"] = object_info_hash
         if object_info_synced_at and object_info_synced_at > 0:
-            body["object_info_synced_at"] = object_info_synced_at
+            # int() at the WIRE BOUNDARY, not at the call site: the value can come
+            # straight out of comfylink_state.json, where every existing install
+            # already has a float persisted. Normalising here covers those too.
+            body["object_info_synced_at"] = int(object_info_synced_at)
         return await self._json("POST", "/v1/backends/heartbeat", body)
 
     async def abandon_jobs(self, backend_id: str) -> int:

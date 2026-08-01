@@ -656,6 +656,14 @@ class TestHeartbeatCarriesTheFingerprint(unittest.IsolatedAsyncioTestCase):
         await relay.heartbeat("b1", "abc", 1754000000.0)
         _method, _path, body = sent[0]
         self.assertEqual(body["object_info_synced_at"], 1754000000.0)
+        # ⛔ ...and it goes out as an INT, not the float it is stored as. A
+        # decimal point here makes the relay's int64 field reject the WHOLE body
+        # (it answers "backend_id required", of all things) and this backend's
+        # heartbeat dies permanently. Full story + the rest of the guards:
+        # tests/test_heartbeat_wire.py.
+        v = body["object_info_synced_at"]
+        self.assertTrue(isinstance(v, int) and not isinstance(v, bool),
+                        "watermark must be sent as int, got %r" % (v,))
         self.assertEqual(body["object_info_hash"], "abc")     # both, independently
 
     async def test_never_served_sends_no_fake_value(self):

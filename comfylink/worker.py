@@ -1056,18 +1056,77 @@ async def _report_object_info(relay: RelayClient, comfy: ComfyClient,
     return len(oi), True
 
 
+# ── Making a PERSISTENT heartbeat failure visible ────────────────────────────
+#
+# A single failed beat stays at debug, and that is deliberate: transient network
+# hiccups are the normal case, the next beat is ~25s away, and a WARNING per beat
+# would drown the ComfyUI console (that is exactly why this was pushed down to
+# debug in the first place). But "quiet" swallowed a CONTINUOUS failure too — the
+# relay 400ing every single beat, forever, with zero symptoms anywhere. That cost
+# a long production investigation on 2026-08-01: the only way to see it was to
+# fire a beat by hand from the user's machine.
+#
+# The compromise: speak up only when the failures are CONSECUTIVE, and then shut
+# up again. One WARNING at the threshold, then at most one more per
+# _HEARTBEAT_WARN_EVERY failures, and one INFO when it recovers. So:
+#
+#   * a blip (1-2 beats)      -> nothing above debug, exactly as before;
+#   * a real outage           -> one WARNING within ~75s, naming the last error;
+#   * an outage lasting hours -> a line every ~50 min, not every 25 seconds.
+#
+# The counter is a LOCAL of the loop (one loop per pairing), so two pairings
+# can't mask each other's outage and a reconnect starts from a clean slate.
+_HEARTBEAT_WARN_AFTER = 3    # consecutive failures before the first WARNING (~75s)
+_HEARTBEAT_WARN_EVERY = 120  # ...then one more every this many failures (~50 min)
+
+
+def _note_heartbeat_failure(backend_id: str, fails: int, e: BaseException) -> int:
+    """Count one failed beat; log at WARNING only when it has become persistent.
+
+    Returns the new consecutive-failure count. Pure bookkeeping + logging: it is
+    called from inside the loop's except blocks and must never raise.
+    """
+    fails += 1
+    persistent = fails == _HEARTBEAT_WARN_AFTER or (
+        fails > _HEARTBEAT_WARN_AFTER
+        and (fails - _HEARTBEAT_WARN_AFTER) % _HEARTBEAT_WARN_EVERY == 0
+    )
+    if persistent:
+        log.warning(
+            "heartbeat to the relay has failed %d times in a row for backend %s "
+            "(~%ds); this ComfyUI will look OFFLINE in the app and will not "
+            "receive refresh requests. Last error: %s",
+            fails, backend_id, fails * HEARTBEAT_INTERVAL, e,
+        )
+    else:
+        log.debug("heartbeat error: %s", e)
+    return fails
+
+
+def _note_heartbeat_ok(backend_id: str, fails: int) -> int:
+    """Reset the failure count; announce a recovery we had warned about."""
+    if fails >= _HEARTBEAT_WARN_AFTER:
+        log.info("heartbeat to the relay recovered for backend %s "
+                 "(after %d consecutive failures)", backend_id, fails)
+    return 0
+
+
 async def _heartbeat_loop(relay: RelayClient, pairing,
                           stop: asyncio.Event | None,
                           blocked: Optional[_TooOldLatch] = None,
                           comfy: Optional[ComfyClient] = None) -> None:
-    """Keep this backend marked online. Errors are swallowed — with ONE exception.
+    """Keep this backend marked online. Errors are swallowed — with TWO exceptions.
 
-    Every failure stays a debug-level no-op (the claim loop owns revoke handling
-    and the result path owns job errors) EXCEPT a "plugin_too_old" 403: the relay
-    gates on register + heartbeat but NOT on claim, so for an always-on ComfyUI
-    that already registered before the block was armed, this is the only place
-    the block is ever observed. We arm the latch and stop beating; the claim loop
-    picks it up within one poll and unwinds into the non-destructive handler.
+    Every failure is a no-op for the loop (the claim loop owns revoke handling and
+    the result path owns job errors) EXCEPT:
+
+      * a "plugin_too_old" 403: the relay gates on register + heartbeat but NOT on
+        claim, so for an always-on ComfyUI that already registered before the block
+        was armed, this is the only place the block is ever observed. We arm the
+        latch and stop beating; the claim loop picks it up within one poll and
+        unwinds into the non-destructive handler.
+      * a PERSISTENT failure: still a no-op for the loop, but it stops being
+        silent — see _note_heartbeat_failure for the level/rate reasoning.
 
     The beat is also the plugin's only INBOUND channel while idle, so it is where
     we learn that the user asked the app to refresh something about this machine:
@@ -1081,6 +1140,7 @@ async def _heartbeat_loop(relay: RelayClient, pairing,
     """
     scan: Optional[asyncio.Task] = None
     refresh: Optional[asyncio.Task] = None
+    fails = 0  # CONSECUTIVE failed beats; see _note_heartbeat_failure
     try:
         while not _stopped(stop) and STATE.get_pairing(pairing.backend_id) is not None:
             try:
@@ -1103,11 +1163,13 @@ async def _heartbeat_loop(relay: RelayClient, pairing,
                         too_old.min_version or "?",
                     )
                     return
-                log.debug("heartbeat error: %s", e)
+                fails = _note_heartbeat_failure(pairing.backend_id, fails, e)
                 resp = None
             except Exception as e:  # noqa: BLE001 - claim loop handles revoke
-                log.debug("heartbeat error: %s", e)
+                fails = _note_heartbeat_failure(pairing.backend_id, fails, e)
                 resp = None
+            else:
+                fails = _note_heartbeat_ok(pairing.backend_id, fails)
             if resp is not None:
                 # Pure dispatch: starts a task at most, never awaits the work.
                 scan = _maybe_scan_models(relay, pairing, resp, scan)
