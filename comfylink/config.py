@@ -169,13 +169,13 @@ class State:
     def __init__(self) -> None:
         self.backend_name: str = _default_name()
         self.pairings: list[Pairing] = []
-        # SHA256 cache for the LoRA inventory: {"<path>|<size>|<mtime_ns>": hex}.
-        # MACHINE-level, not per-pairing — the digest of a file on disk does not
-        # depend on which account we report it to, and re-hashing it once per
-        # paired account would multiply a cold run that already reads tens of GB.
-        # Rebuilt (not merged) on every scan, so entries for deleted LoRAs are
-        # pruned rather than accumulating. See loras.build_manifest.
-        self.lora_hashes: dict[str, str] = {}
+        # NOTE: this used to also hold `lora_hashes`, a machine-level SHA256
+        # cache keyed on "<path>|<size>|<mtime_ns>". It existed only so a cold
+        # LoRA scan's tens of GB of reads were not repeated on every ComfyUI
+        # restart. Manifest schema 3 stopped computing digests at all (see
+        # loras.py for why), so the cache has nothing to cache. Old state files
+        # still carrying the key are simply ignored on load and the key is
+        # dropped on the next save.
 
     @classmethod
     def load(cls) -> "State":
@@ -190,11 +190,6 @@ class State:
         if not isinstance(d, dict):
             return st
         st.backend_name = d.get("backend_name") or st.backend_name
-        lh = d.get("lora_hashes")
-        if isinstance(lh, dict):
-            # Values must be strings; a hand-mangled file must not poison the
-            # cache with something that later gets written into a manifest.
-            st.lora_hashes = {str(k): str(v) for k, v in lh.items() if v}
         raw = d.get("pairings")
         if isinstance(raw, list):
             # New multi-pairing format.
@@ -287,10 +282,6 @@ class State:
                     }
                     for pr in self.pairings
                 ],
-                # LoRA digest cache (see State.lora_hashes). Local file paths
-                # only — no account data — but it rides in the same 0600 file as
-                # the device tokens, which is strictly the safer default.
-                "lora_hashes": self.lora_hashes,
             })
             # Create with 0600 atomically (O_CREAT honors the mode only on
             # creation), then chmod to also tighten a pre-existing file that may

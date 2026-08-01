@@ -151,11 +151,6 @@ PLUGIN_TOO_OLD_RETRY = 60  # seconds between re-register attempts while blocked
 # The relay's fixed contract for the "your plugin is too old" refusal.
 PLUGIN_TOO_OLD_CODE = "plugin_too_old"
 
-# How often the model scan logs a progress line (one per N files). A cold scan
-# reads tens of GB and is otherwise completely silent; this makes "still hashing"
-# distinguishable from "wedged" without spamming a line per LoRA.
-_SCAN_LOG_EVERY = 25
-
 
 class _Revoked(Exception):
     """Device token no longer valid (unpaired from the app)."""
@@ -1243,9 +1238,10 @@ def _maybe_scan_models(relay: RelayClient, pairing, resp: dict,
     if requested <= (pairing.loras_synced_at or 0):
         return current                      # already served this exact request
     if current is not None and not current.done():
-        # A scan for an earlier request is still running (a cold first run can
-        # take minutes). Let it finish; its watermark write decides whether this
-        # newer request still needs serving, and the next beat re-offers it.
+        # A scan for an earlier request is still running. It is fast now (stat +
+        # header reads, no digests), but a slow/network disk can still stretch
+        # it across beats. Let it finish; its watermark write decides whether
+        # this newer request still needs serving, and the next beat re-offers it.
         log.debug("model scan already running for backend %s", pairing.backend_id)
         return current
     log.info("app requested a model inventory refresh (backend %s)",
@@ -1262,8 +1258,8 @@ async def _scan_and_report(relay: RelayClient, pairing, requested: float) -> Non
       * collection blew up      → warn, DON'T advance the watermark (retry next beat)
       * nothing to report       → advance (the request WAS served; a machine with
                                   no models must not rescan every 25 seconds)
-      * upload failed           → warn, DON'T advance (retry next beat; the second
-                                  scan is warm-cached, so retrying is cheap)
+      * upload failed           → warn, DON'T advance (retry next beat; a rescan
+                                  is stat + headers only, so retrying is cheap)
       * uploaded / unchanged /
         relay too old (404)     → advance
     """
@@ -1277,7 +1273,7 @@ async def _scan_and_report(relay: RelayClient, pairing, requested: float) -> Non
         return
     started = time.monotonic()
     try:
-        manifest = await loras.collect(_scan_progress(bid))
+        manifest = await loras.collect()
     except Exception as e:  # noqa: BLE001 - a scan must never kill the heartbeat
         log.warning("model scan failed for backend %s: %s", bid, e)
         return
@@ -1299,20 +1295,12 @@ async def _scan_and_report(relay: RelayClient, pairing, requested: float) -> Non
     _remember_scan(pairing, requested)
 
 
-def _scan_progress(backend_id: str):
-    """A throttled progress logger for build_manifest's per-file callback.
-
-    A cold first scan reads tens of GB and says nothing for minutes; without a
-    heartbeat in the ComfyUI console there is no way to tell hashing from a hang.
-    Logged every _SCAN_LOG_EVERY files so a 500-LoRA library produces a handful
-    of lines, not 500. Called from the SCANNING THREAD — it only formats a log
-    record, which is thread-safe.
-    """
-    def _on_progress(phase: str, done: int, total: int, _name: str) -> None:
-        if total and done and done % _SCAN_LOG_EVERY == 0:
-            log.info("model scan (%s): %d/%d %s", phase, done, total, backend_id)
-
-    return _on_progress
+# NOTE: there used to be a per-file progress callback threaded from here into
+# loras.build_manifest, logged every N files. It existed for exactly one reason:
+# a cold scan hashed tens of GB and stayed silent for minutes, so "still working"
+# had to be made distinguishable from "wedged". Schema 3 dropped the digests
+# (loras.py explains why), the scan is now stat + header reads, and the single
+# "model scan finished in %.1fs" line above says everything there is to say.
 
 
 def _remember_scan(pairing, requested: float) -> None:

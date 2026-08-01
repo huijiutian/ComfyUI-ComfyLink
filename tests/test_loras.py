@@ -10,19 +10,21 @@ What these pin, in order of how badly a regression would hurt:
     path instead and nothing errors anywhere — the app just never matches a
     single LoRA and no trigger word ever appears. Nothing else in this feature
     fails this quietly, hence the tests come first.
+  * ⛔ NO MODEL FILE CONTENT IS READ. Schema 3 deleted the whole-file SHA256 (it
+    served only the CivitAI lookup, which the product dropped), so a scan is now
+    one stat per file plus, for safetensors, the 8-byte length and the JSON
+    header. `TestNoModelContentIsEverRead` counts every byte the module reads
+    off disk against files whose payload dwarfs it — that is the regression
+    target for anyone tempted to reintroduce hashing.
   * HEADER-ONLY READS. A LoRA is hundreds of MB; the metadata parser must read
     the 8-byte length and the JSON header and then stop.
-  * THE DIGEST CACHE. CivitAI indexes by whole-file SHA256, so a cold run reads
-    tens of GB. An unchanged file must never be hashed twice; a changed one must
-    be. Without this every ComfyUI restart re-reads the lot.
+  * ONE COLLECTION PATH. LoRAs and checkpoints run through the same
+    `_build_entries` and come out the same shape; only the metadata allowlist
+    differs. Tests assert the entry key sets are identical, because the point of
+    schema 3 is that the two kinds cannot drift apart again.
   * NON-BLOCKING / NON-FATAL. Collection failures, upload failures, and an old
     relay's 404 all leave the worker registering, heart-beating and claiming
     jobs exactly as before.
-  * ⛔ CHECKPOINTS ARE NEVER HASHED. Schema 2 added a `checkpoints` array that is
-    header-only: 2–7 GB per file means a full-hash pass would be hundreds of GB
-    of reads. There is a test asserting no digest is computed for them, and one
-    asserting the `loras` section is byte-identical at schema 2 so the older app
-    that only reads `loras` cannot be affected by any of it.
 
 Run:  python -m unittest discover -s tests
 """
@@ -109,6 +111,57 @@ class _RecordingReader:
         return self._buf.read(n)
 
 
+class _MeteredFile:
+    """Wraps a real file handle and bills every byte handed out to a meter."""
+
+    def __init__(self, f, meter):
+        self._f = f
+        self._meter = meter
+
+    def read(self, n: int = -1) -> bytes:
+        data = self._f.read(n)
+        self._meter.bytes_read += len(data)
+        if n is None or n < 0:
+            self._meter.unbounded_reads += 1
+        return data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._f.close()
+        return False
+
+    def __getattr__(self, item):
+        return getattr(self._f, item)
+
+
+class _ReadMeter:
+    """Drop-in for ``open`` inside comfylink.loras that totals bytes read.
+
+    ⛔ THE REGRESSION GUARD for schema 3. Any attempt to hash a model file — or
+    to read its payload for any other reason — shows up here as a byte count in
+    the same ballpark as the file size, instead of a header's worth.
+    """
+
+    def __init__(self):
+        self.bytes_read = 0
+        self.unbounded_reads = 0
+        self.opened: list[str] = []
+
+    def __call__(self, path, *args, **kwargs):
+        self.opened.append(str(path))
+        return _MeteredFile(open(path, *args, **kwargs), self)
+
+
+@contextmanager
+def _read_meter():
+    """Meter every file ``comfylink.loras`` opens for the duration of the block."""
+    meter = _ReadMeter()
+    with mock.patch.object(loras, "open", meter, create=True):
+        yield meter
+
+
 # ── ⚠️ the name key ───────────────────────────────────────────────────────────
 
 class TestNameKeyMatchesFolderPaths(unittest.TestCase):
@@ -125,7 +178,7 @@ class TestNameKeyMatchesFolderPaths(unittest.TestCase):
             # Exactly the shape folder_paths hands back: relative, subdir-prefixed.
             mapping = {"flat.safetensors": flat, "style/foo.safetensors": nested}
             with _folder_paths(mapping) as fake:
-                manifest, _ = loras.build_manifest(hasher=lambda p: "d" * 64)
+                manifest = loras.build_manifest()
 
         names = [e["name"] for e in manifest["loras"]]
         self.assertEqual(sorted(names), ["flat.safetensors", "style/foo.safetensors"])
@@ -155,9 +208,9 @@ class TestDegradesWithoutComfyUI(unittest.TestCase):
         self.assertFalse(loras.folder_paths_available())
         self.assertEqual(loras.list_lora_names(), [])
         self.assertIsNone(loras.lora_path("x.safetensors"))
-        manifest, cache = loras.build_manifest()
+        manifest = loras.build_manifest()
         self.assertEqual(manifest["loras"], [])
-        self.assertEqual(cache, {})
+        self.assertEqual(manifest["checkpoints"], [])
 
     def test_folder_paths_that_raises_is_silent(self):
         class _Broken:
@@ -173,9 +226,8 @@ class TestDegradesWithoutComfyUI(unittest.TestCase):
     def test_vanished_file_is_skipped_not_fatal(self):
         # Enumerated, then deleted before we stat it (or a broken symlink).
         with _folder_paths({"gone.safetensors": "/definitely/not/here.safetensors"}):
-            manifest, cache = loras.build_manifest(hasher=lambda p: "x" * 64)
+            manifest = loras.build_manifest()
         self.assertEqual(manifest["loras"], [])
-        self.assertEqual(cache, {})
 
 
 # ── safetensors header ────────────────────────────────────────────────────────
@@ -215,17 +267,22 @@ class TestSafetensorsHeader(unittest.TestCase):
         self.assertEqual(loras.read_safetensors_metadata("/no/such/file.safetensors"), {})
 
     def test_non_safetensors_gets_empty_meta_but_is_still_reported(self):
-        # .pt/.ckpt LoRAs have no readable header, but CivitAI indexes by hash
-        # regardless, so they must still appear in the manifest.
+        # .pt/.ckpt LoRAs have no readable header. They are still real files the
+        # user can pick in a workflow, and `name` is the join key, so they must
+        # appear in the manifest — just with nothing to suggest.
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "old.pt")
             with open(p, "wb") as f:
                 f.write(b"not safetensors at all")
-            with _folder_paths({"old.pt": p}):
-                manifest, _ = loras.build_manifest(hasher=lambda _p: "c" * 64)
+            with _folder_paths({"old.pt": p}), _read_meter() as meter:
+                manifest = loras.build_manifest()
         self.assertEqual(len(manifest["loras"]), 1)
         self.assertEqual(manifest["loras"][0]["meta"], {})
-        self.assertEqual(manifest["loras"][0]["sha256"], "c" * 64)
+        self.assertEqual(manifest["loras"][0]["size"], 22)
+        # A non-safetensors file is not even opened — the extension check comes
+        # first, so there is no read to make at all.
+        self.assertEqual(meter.opened, [])
+        self.assertEqual(meter.bytes_read, 0)
 
 
 # ── meta subset ───────────────────────────────────────────────────────────────
@@ -280,76 +337,96 @@ class TestMetaSubset(unittest.TestCase):
         self.assertEqual(loras._top_tags({"d": {"a": "NaN"}}), [])
 
 
-# ── digest cache ──────────────────────────────────────────────────────────────
+# ── ⛔ no model file's content is ever read (schema 3) ────────────────────────
+#
+# HISTORY, so nobody re-derives the deleted code by accident: this section used
+# to be `TestDigestCache`, which pinned "an unchanged file is never re-hashed"
+# and "a changed one is". Those tests are gone because their entire premise is
+# gone — there is no hashing left to cache. LoRA entries carried a whole-file
+# SHA256 for exactly one consumer (CivitAI indexes by it); the product dropped
+# the CivitAI lookup, so the digest, the path|size|mtime cache in the state file
+# and the progress callback that existed to prove the scan had not hung all went
+# with it. What replaces them is the opposite assertion: prove we DON'T read.
 
-class TestDigestCache(unittest.TestCase):
-    def test_unchanged_file_is_not_rehashed(self):
-        calls = []
+class TestNoModelContentIsEverRead(unittest.TestCase):
+    """⛔ THE regression target for "someone added hashing back".
 
-        def counting_hasher(path):
-            calls.append(path)
-            return "a" * 64
+    Every one of these builds a manifest over files whose payload is orders of
+    magnitude bigger than any header, and meters every byte the module reads.
+    A digest pass — or any other full read — fails them loudly instead of
+    quietly costing a user tens of GB and several minutes.
+    """
 
+    PAYLOAD = 4 * 1024 * 1024   # stands in for the tensor data
+
+    def _library(self, d):
+        """A LoRA and a checkpoint, both with a real header and a fat payload."""
+        lora = os.path.join(d, "l.safetensors")
+        ckpt = os.path.join(d, "c.safetensors")
+        header_l = _write_safetensors(lora, {"modelspec.trigger_phrase": "fire"},
+                                      tail=b"\x00" * self.PAYLOAD)
+        header_c = _write_safetensors(ckpt, {"modelspec.architecture": "flux-1-dev"},
+                                      tail=b"\x00" * self.PAYLOAD)
+        return lora, ckpt, header_l + header_c + 16   # + two 8-byte lengths
+
+    def test_scan_reads_only_headers_never_payloads(self):
         with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "a.safetensors")
-            _write_safetensors(p, {"ss_output_name": "a"})
-            with _folder_paths({"a.safetensors": p}):
-                m1, cache = loras.build_manifest({}, hasher=counting_hasher)
-                self.assertEqual(len(calls), 1, "cold run hashes once")
-                # Second pass with the cache from the first: same path, same
-                # size, same mtime => the digest must be reused, not recomputed.
-                m2, cache2 = loras.build_manifest(cache, hasher=counting_hasher)
+            lora, ckpt, header_total = self._library(d)
+            sizes = (os.path.getsize(lora), os.path.getsize(ckpt))
+            with _folder_paths({"l.safetensors": lora}, {"c.safetensors": ckpt}), \
+                    _read_meter() as meter:
+                manifest = loras.build_manifest()
 
-        self.assertEqual(len(calls), 1, "an unchanged file must never be re-hashed")
-        self.assertEqual(m1["loras"][0]["sha256"], m2["loras"][0]["sha256"])
-        self.assertEqual(cache, cache2)
+        # Both files were opened exactly once and read down to the byte we
+        # expected: the 8-byte length plus the JSON header, nothing after it.
+        self.assertEqual(sorted(meter.opened), sorted([lora, ckpt]))
+        self.assertEqual(meter.bytes_read, header_total)
+        self.assertEqual(meter.unbounded_reads, 0, "read() is never called unbounded")
+        # The headline guarantee, stated the way a human would check it: we read
+        # a rounding error of what a hashing pass would have.
+        self.assertLess(meter.bytes_read, self.PAYLOAD // 100)
 
-    def test_changed_mtime_forces_a_rehash(self):
-        calls = []
+        # ...and yet the sizes reported are the FULL file sizes, which is the
+        # proof they came from stat() rather than from anything we read.
+        self.assertEqual(manifest["loras"][0]["size"], sizes[0])
+        self.assertEqual(manifest["checkpoints"][0]["size"], sizes[1])
+        self.assertGreater(sizes[0], self.PAYLOAD)
+        # The header really was parsed — a "cheap because it read nothing at
+        # all" regression would pass everything above and fail here.
+        self.assertEqual(manifest["loras"][0]["meta"]["modelspec.trigger_phrase"],
+                         "fire")
+        self.assertEqual(manifest["checkpoints"][0]["meta"]["modelspec.architecture"],
+                         "flux-1-dev")
 
-        def counting_hasher(path):
-            calls.append(path)
-            return f"{len(calls):064d}"
-
+    def test_no_entry_of_either_kind_carries_a_digest(self):
         with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "a.safetensors")
-            _write_safetensors(p, {})
-            with _folder_paths({"a.safetensors": p}):
-                _m1, cache = loras.build_manifest({}, hasher=counting_hasher)
-                # Same path, new content/mtime — the cache key must miss.
-                _write_safetensors(p, {"ss_output_name": "changed"}, tail=b"\x01" * 32)
-                os.utime(p, (0, 0))
-                m2, _ = loras.build_manifest(cache, hasher=counting_hasher)
+            lora, ckpt, _ = self._library(d)
+            with _folder_paths({"l.safetensors": lora}, {"c.safetensors": ckpt}):
+                manifest = loras.build_manifest()
 
-        self.assertEqual(len(calls), 2, "a modified file must be re-hashed")
-        self.assertEqual(m2["loras"][0]["sha256"], f"{2:064d}")
+        for kind in ("loras", "checkpoints"):
+            entry = manifest[kind][0]
+            # ABSENT, not empty-string — that distinction is the whole
+            # back-compat story for a consumer that still looks for the field.
+            self.assertNotIn("sha256", entry, kind)
+            self.assertEqual(set(entry), {"name", "size", "mtime", "meta"}, kind)
+        # Isomorphic by construction: one code path, so one key set.
+        self.assertEqual(set(manifest["loras"][0]), set(manifest["checkpoints"][0]))
 
-    def test_cache_is_pruned_not_accumulated(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "a.safetensors")
-            _write_safetensors(p, {})
-            stale = {"/deleted/lora.safetensors|1|1": "b" * 64}
-            with _folder_paths({"a.safetensors": p}):
-                _m, new_cache = loras.build_manifest(stale, hasher=lambda _p: "a" * 64)
-        # Rebuilt from what exists now: the deleted LoRA's entry is gone, so the
-        # cache cannot grow without bound across a LoRA collection's lifetime.
-        self.assertNotIn("/deleted/lora.safetensors|1|1", new_cache)
-        self.assertEqual(len(new_cache), 1)
+    def test_the_hashing_helpers_are_gone(self):
+        # Deleting the callers is not enough; leaving `file_sha256` around is an
+        # invitation to wire it back up. Nothing in the module may offer a
+        # whole-file digest or a digest cache key.
+        for name in ("file_sha256", "cache_key", "_HASH_CHUNK"):
+            self.assertFalse(hasattr(loras, name),
+                             f"loras.{name} came back — see the schema 3 note")
 
-    def test_cache_key_includes_size_and_mtime(self):
-        a = loras.cache_key("/p", 1, 2)
-        self.assertNotEqual(a, loras.cache_key("/p", 1, 3))
-        self.assertNotEqual(a, loras.cache_key("/p", 9, 2))
-        self.assertNotEqual(a, loras.cache_key("/q", 1, 2))
-
-    def test_file_sha256_streams_and_is_correct(self):
-        import hashlib
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "blob.bin")
-            data = os.urandom(1024 * 64)
-            with open(p, "wb") as f:
-                f.write(data)
-            self.assertEqual(loras.file_sha256(p), hashlib.sha256(data).hexdigest())
+    def test_build_manifest_takes_no_hasher_or_cache(self):
+        # The old signature was build_manifest(cache, hasher, on_progress). All
+        # three parameters existed only to serve hashing.
+        import inspect
+        self.assertEqual(list(inspect.signature(loras.build_manifest).parameters), [])
+        self.assertEqual(list(inspect.signature(loras.collect).parameters), [])
 
 
 # ── manifest shape ────────────────────────────────────────────────────────────
@@ -360,14 +437,14 @@ class TestManifestShape(unittest.TestCase):
             p = os.path.join(d, "a.safetensors")
             _write_safetensors(p, {"ss_output_name": "a"})
             with _folder_paths({"a.safetensors": p}):
-                manifest, _ = loras.build_manifest(hasher=lambda _p: "a" * 64)
+                manifest = loras.build_manifest()
 
         self.assertEqual(manifest["schema"], loras.MANIFEST_SCHEMA)
         self.assertEqual(manifest["count"], 1)
         self.assertFalse(manifest["truncated"])
         self.assertIsInstance(manifest["generated_at"], int)
         e = manifest["loras"][0]
-        self.assertEqual(set(e), {"name", "size", "mtime", "sha256", "meta"})
+        self.assertEqual(set(e), {"name", "size", "mtime", "meta"})
         self.assertIsInstance(e["size"], int)
         self.assertIsInstance(e["mtime"], int)
         self.assertEqual(e["meta"]["ss_output_name"], "a")
@@ -375,103 +452,81 @@ class TestManifestShape(unittest.TestCase):
         json.loads(json.dumps(manifest))
 
     def test_manifest_hash_ignores_generated_at(self):
-        base = {"schema": 1, "generated_at": 1, "loras": [{"name": "a", "sha256": "x"}]}
-        later = {"schema": 1, "generated_at": 999999, "loras": [{"name": "a", "sha256": "x"}]}
+        base = {"schema": 3, "generated_at": 1, "loras": [{"name": "a", "size": 1}]}
+        later = {"schema": 3, "generated_at": 999999, "loras": [{"name": "a", "size": 1}]}
         self.assertEqual(loras.manifest_hash(base), loras.manifest_hash(later))
 
     def test_manifest_hash_changes_with_entries(self):
-        a = {"schema": 1, "loras": [{"name": "a", "sha256": "x"}]}
-        b = {"schema": 1, "loras": [{"name": "a", "sha256": "y"}]}
+        a = {"schema": 3, "loras": [{"name": "a", "size": 1}]}
+        b = {"schema": 3, "loras": [{"name": "a", "size": 2}]}
         self.assertNotEqual(loras.manifest_hash(a), loras.manifest_hash(b))
+
+    def test_manifest_hash_changes_with_the_schema_bump(self):
+        # The schema is part of the payload on purpose: after the 2 → 3 upgrade
+        # every paired backend must re-upload once, or R2 keeps serving a stale
+        # manifest whose entries still carry `sha256`.
+        old = {"schema": 2, "loras": [{"name": "a", "size": 1}], "checkpoints": []}
+        new = {"schema": 3, "loras": [{"name": "a", "size": 1}], "checkpoints": []}
+        self.assertNotEqual(loras.manifest_hash(old), loras.manifest_hash(new))
 
 
 class TestCollectOffThread(unittest.IsolatedAsyncioTestCase):
-    async def test_build_runs_in_a_thread_and_persists_the_cache(self):
-        state = mock.Mock()
-        state.lora_hashes = {}
-
+    async def test_build_runs_in_a_thread(self):
         seen_threads = []
         real_build = loras.build_manifest
 
-        def spy_build(cache, hasher=loras.file_sha256, on_progress=None):
+        def spy_build():
             import threading
             seen_threads.append(threading.current_thread().name)
-            return real_build(cache, hasher=hasher, on_progress=on_progress)
+            return real_build()
 
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "a.safetensors")
             _write_safetensors(p, {})
             with _folder_paths({"a.safetensors": p}), \
-                    mock.patch.object(loras, "build_manifest", spy_build), \
-                    mock.patch("comfylink.config.STATE", state):
+                    mock.patch.object(loras, "build_manifest", spy_build):
                 m = await loras.collect()
 
         self.assertEqual(m["count"], 1)
-        # The hashing pass must NOT run on the event loop thread — a cold run is
-        # tens of GB of reads and would stall the heartbeat, the cancel long-poll
-        # and the claim loop, which all share that loop.
+        # Still off the event loop even though there is no hashing left: the
+        # loop is shared with the heartbeat, the cancel long-poll and the claim
+        # loop, and a models directory on a network mount stats slowly.
         import threading
         self.assertNotIn(threading.current_thread().name, seen_threads)
-        # New digests were persisted for the next process start.
-        self.assertTrue(state.lora_hashes)
-        state.save.assert_called()
 
-    async def test_progress_callback_reaches_the_caller(self):
-        # The scan is the only multi-minute thing this plugin does; without
-        # per-file progress there is no way to tell hashing from a hang.
+    async def test_collect_touches_no_persistent_state(self):
+        # There is nothing left to persist (the digest cache is gone), so a scan
+        # must not write the 0600 state file at all.
         state = mock.Mock()
-        state.lora_hashes = {}
-        seen = []
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "a.safetensors")
             _write_safetensors(p, {})
             with _folder_paths({"a.safetensors": p}), \
                     mock.patch("comfylink.config.STATE", state):
-                await loras.collect(lambda *a: seen.append(a))
-        phases = {a[0] for a in seen}
-        self.assertIn("loras", phases)
-        self.assertIn("checkpoints", phases)
-        self.assertIn(("loras", 0, 1, "a.safetensors"), seen)
-
-    async def test_a_raising_progress_callback_cannot_break_the_scan(self):
-        state = mock.Mock()
-        state.lora_hashes = {}
-
-        def boom(*_a):
-            raise RuntimeError("display blew up")
-
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "a.safetensors")
-            _write_safetensors(p, {})
-            with _folder_paths({"a.safetensors": p}), \
-                    mock.patch("comfylink.config.STATE", state):
-                m = await loras.collect(boom)
+                m = await loras.collect()
         self.assertEqual(m["count"], 1)
+        state.save.assert_not_called()
 
     async def test_concurrent_collects_are_serialised(self):
         # A machine paired to several accounts gets one request per account.
-        # Hashing tens of GB once per account would be absurd, so builds must
-        # never overlap; the second one finds a warm cache and is cheap.
-        state = mock.Mock()
-        state.lora_hashes = {}
+        # They queue instead of contending for the same disk.
         overlap = {"now": 0, "max": 0}
 
-        def spy_build(cache, hasher=loras.file_sha256, on_progress=None):
+        def spy_build():
             overlap["now"] += 1
             overlap["max"] = max(overlap["max"], overlap["now"])
             time.sleep(0.02)  # real thread work, so an overlap would be visible
             overlap["now"] -= 1
-            return {"schema": 2, "generated_at": 0, "count": 0, "truncated": False,
+            return {"schema": 3, "generated_at": 0, "count": 0, "truncated": False,
                     "loras": [], "checkpoints": [], "checkpoints_count": 0,
-                    "checkpoints_truncated": False}, {}
+                    "checkpoints_truncated": False}
 
-        with mock.patch.object(loras, "build_manifest", spy_build), \
-                mock.patch("comfylink.config.STATE", state):
+        with mock.patch.object(loras, "build_manifest", spy_build):
             await asyncio.gather(loras.collect(), loras.collect())
         self.assertEqual(overlap["max"], 1, "builds must not run concurrently")
 
 
-# ── checkpoints (schema 2): header-only, NEVER hashed ─────────────────────────
+# ── checkpoints: same code path, different metadata allowlist ────────────────
 
 class TestCheckpointNameKey(unittest.TestCase):
     """Same silent-failure guard as the LoRA one — the app joins on this string."""
@@ -486,7 +541,7 @@ class TestCheckpointNameKey(unittest.TestCase):
             _write_safetensors(nested, {})
             mapping = {"base.safetensors": flat, "sdxl/anime.safetensors": nested}
             with _folder_paths({}, mapping) as fake:
-                manifest, _ = loras.build_manifest(hasher=lambda p: "d" * 64)
+                manifest = loras.build_manifest()
 
         names = [e["name"] for e in manifest["checkpoints"]]
         self.assertEqual(sorted(names), ["base.safetensors", "sdxl/anime.safetensors"])
@@ -507,39 +562,18 @@ class TestCheckpointNameKey(unittest.TestCase):
             self.assertIsNone(loras.lora_path("b.safetensors"))
 
 
-class TestCheckpointsAreNeverHashed(unittest.TestCase):
-    """⛔ The whole point of the checkpoint path: 2–7 GB files stay unread."""
-
-    def test_no_sha256_field_and_no_hasher_call(self):
-        hashed = []
-
-        with tempfile.TemporaryDirectory() as d:
-            lora = os.path.join(d, "l.safetensors")
-            ckpt = os.path.join(d, "c.safetensors")
-            _write_safetensors(lora, {})
-            _write_safetensors(ckpt, {"modelspec.architecture": "flux-1-dev"})
-            with _folder_paths({"l.safetensors": lora}, {"c.safetensors": ckpt}):
-                manifest, cache = loras.build_manifest(
-                    hasher=lambda p: hashed.append(p) or ("a" * 64))
-
-        # The LoRA was hashed; the checkpoint was not — not once, not ever.
-        self.assertEqual(hashed, [lora])
-        self.assertNotIn(ckpt, hashed)
-        entry = manifest["checkpoints"][0]
-        self.assertNotIn("sha256", entry)
-        self.assertEqual(set(entry), {"name", "size", "mtime", "meta"})
-        # And nothing about a checkpoint entered the digest cache either.
-        self.assertEqual(len(cache), 1)
-        self.assertNotIn(ckpt, next(iter(cache)))
-
-    def test_reported_digest_in_the_header_is_not_promoted(self):
-        # Some writers embed modelspec.hash_sha256. It is self-reported and not
-        # necessarily the file's digest, so it must never surface where a
-        # consumer could mistake it for the LoRA entries' verified `sha256`.
-        md = {"modelspec.architecture": "x", "modelspec.hash_sha256": "0" * 64}
-        meta = loras.extract_checkpoint_meta(md)
-        self.assertNotIn("modelspec.hash_sha256", meta)
-        self.assertNotIn("sha256", meta)
+class TestNoDigestLeaksInFromTheHeader(unittest.TestCase):
+    def test_self_reported_digest_in_the_header_is_not_promoted(self):
+        # Some writers embed modelspec.hash_sha256. It is self-reported and (per
+        # spec) not necessarily the digest of the file. Nothing consumes a digest
+        # any more, so publishing an unverified one would only invite someone to
+        # build on it — it stays out of both allowlists.
+        md = {"modelspec.architecture": "x", "modelspec.trigger_phrase": "t",
+              "modelspec.hash_sha256": "0" * 64}
+        for extract in (loras.extract_checkpoint_meta, loras.extract_meta):
+            meta = extract(md)
+            self.assertNotIn("modelspec.hash_sha256", meta)
+            self.assertNotIn("sha256", meta)
 
 
 class TestCheckpointMeta(unittest.TestCase):
@@ -584,15 +618,15 @@ class TestCheckpointMeta(unittest.TestCase):
             with open(p, "wb") as f:
                 f.write(b"pickle junk")
             with _folder_paths({}, {"old.ckpt": p}):
-                manifest, _ = loras.build_manifest()
+                manifest = loras.build_manifest()
         self.assertEqual(manifest["checkpoints"][0]["name"], "old.ckpt")
         self.assertEqual(manifest["checkpoints"][0]["meta"], {})
 
 
-class TestSchema2DoesNotDisturbSchema1Consumers(unittest.TestCase):
-    """An app that only reads `loras` must not be able to tell schema 2 happened."""
+class TestSchema3ManifestEnvelope(unittest.TestCase):
+    """The envelope every consumer reads before it reads anything else."""
 
-    def test_loras_section_is_byte_identical_with_and_without_checkpoints(self):
+    def test_the_two_halves_are_independent_and_lora_scoped_counts_survive(self):
         with tempfile.TemporaryDirectory() as d:
             lora = os.path.join(d, "style", "l.safetensors")
             os.makedirs(os.path.dirname(lora))
@@ -602,35 +636,38 @@ class TestSchema2DoesNotDisturbSchema1Consumers(unittest.TestCase):
             lora_map = {"style/l.safetensors": lora}
 
             with _folder_paths(lora_map, {}):
-                without, _ = loras.build_manifest(hasher=lambda p: "a" * 64)
+                without = loras.build_manifest()
             with _folder_paths(lora_map, {"c.safetensors": ckpt}):
-                with_ckpt, _ = loras.build_manifest(hasher=lambda p: "a" * 64)
+                with_ckpt = loras.build_manifest()
 
-        # Byte-for-byte: same entries, same key order, same values.
+        # Byte-for-byte: same entries, same key order, same values. Installing a
+        # checkpoint must not perturb a single LoRA entry.
         self.assertEqual(json.dumps(without["loras"]), json.dumps(with_ckpt["loras"]))
-        # ...and the top-level fields an old app reads keep their LoRA-scoped
-        # meaning rather than silently becoming totals.
+        # `count`/`truncated` stay LoRA-scoped rather than silently becoming
+        # totals — they have meant that since schema 1.
         self.assertEqual(without["count"], with_ckpt["count"])
         self.assertEqual(without["truncated"], with_ckpt["truncated"])
         self.assertEqual(with_ckpt["count"], 1)
         self.assertEqual(with_ckpt["checkpoints_count"], 1)
 
-    def test_schema_is_2_and_checkpoints_key_always_present(self):
+    def test_schema_is_3_and_both_arrays_always_present(self):
         with _folder_paths({}, {}):
-            manifest, _ = loras.build_manifest()
-        self.assertEqual(manifest["schema"], 2)
-        self.assertEqual(loras.MANIFEST_SCHEMA, 2)
-        # Always an array, never absent — "no checkpoints" and "old plugin" must
-        # stay distinguishable for the app (absent key ⇒ schema 1 ⇒ stay silent).
+            manifest = loras.build_manifest()
+        self.assertEqual(manifest["schema"], 3)
+        self.assertEqual(loras.MANIFEST_SCHEMA, 3)
+        # Always arrays, never absent — "no models" and "old plugin" must stay
+        # distinguishable for the app (absent key ⇒ schema 1 ⇒ stay silent).
+        self.assertEqual(manifest["loras"], [])
         self.assertEqual(manifest["checkpoints"], [])
+        self.assertFalse(manifest["truncated"])
         self.assertFalse(manifest["checkpoints_truncated"])
 
     def test_manifest_hash_covers_checkpoints(self):
-        a = {"schema": 2, "loras": [], "checkpoints": [{"name": "a", "meta": {}}]}
-        b = {"schema": 2, "loras": [], "checkpoints": [{"name": "b", "meta": {}}]}
+        a = {"schema": 3, "loras": [], "checkpoints": [{"name": "a", "meta": {}}]}
+        b = {"schema": 3, "loras": [], "checkpoints": [{"name": "b", "meta": {}}]}
         # A new checkpoint with no LoRA change must still trigger a re-upload.
         self.assertNotEqual(loras.manifest_hash(a), loras.manifest_hash(b))
-        # And a schema-1-shaped dict (no checkpoints key) must not explode.
+        # And an older-shaped dict (no checkpoints key) must not explode.
         loras.manifest_hash({"schema": 1, "loras": []})
 
 
@@ -647,7 +684,7 @@ class TestCheckpointFailuresDoNotCostTheLoras(unittest.TestCase):
 
         sys.modules["folder_paths"] = _LorasOnly()
         try:
-            manifest, _ = loras.build_manifest()
+            manifest = loras.build_manifest()
         finally:
             sys.modules.pop("folder_paths", None)
         self.assertEqual(manifest["checkpoints"], [])
@@ -660,7 +697,7 @@ class TestCheckpointFailuresDoNotCostTheLoras(unittest.TestCase):
             with _folder_paths({"l.safetensors": lora}), \
                     mock.patch.object(loras, "build_checkpoints",
                                       side_effect=RuntimeError("boom")):
-                manifest, _ = loras.build_manifest(hasher=lambda p: "a" * 64)
+                manifest = loras.build_manifest()
         # The older, load-bearing half survives a failure in the newer half.
         self.assertEqual(len(manifest["loras"]), 1)
         self.assertEqual(manifest["checkpoints"], [])
@@ -701,15 +738,15 @@ class _FakeState:
         self.save_calls += 1
 
 
-_MANIFEST = {"schema": 2, "generated_at": 1, "count": 1, "truncated": False,
+_MANIFEST = {"schema": 3, "generated_at": 1, "count": 1, "truncated": False,
              "loras": [{"name": "a.safetensors", "size": 1, "mtime": 1,
-                        "sha256": "a" * 64, "meta": {}}],
+                        "meta": {}}],
              "checkpoints": [], "checkpoints_count": 0,
              "checkpoints_truncated": False}
 
 # A machine with checkpoints but zero LoRAs still has something worth reporting
 # (the app's model-family check), so this must NOT be treated as "empty".
-_MANIFEST_CKPT_ONLY = {"schema": 2, "generated_at": 1, "count": 0,
+_MANIFEST_CKPT_ONLY = {"schema": 3, "generated_at": 1, "count": 0,
                        "truncated": False, "loras": [],
                        "checkpoints": [{"name": "c.safetensors", "size": 1,
                                         "mtime": 1, "meta": {}}],
@@ -964,7 +1001,7 @@ class TestScanAndReport(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pairing.loras_synced_at, 900.0)
 
     async def test_empty_inventory_advances_without_uploading(self):
-        empty = {"schema": 2, "generated_at": 1, "count": 0, "truncated": False,
+        empty = {"schema": 3, "generated_at": 1, "count": 0, "truncated": False,
                  "loras": [], "checkpoints": [], "checkpoints_count": 0,
                  "checkpoints_truncated": False}
         pairing = _FakePairing()
