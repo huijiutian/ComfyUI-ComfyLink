@@ -967,7 +967,12 @@ async def _heartbeat_loop(relay: RelayClient, pairing,
     try:
         while not _stopped(stop) and STATE.get_pairing(pairing.backend_id) is not None:
             try:
-                resp = await relay.heartbeat(pairing.backend_id)
+                # The hash is read FRESH on every beat: a refresh that finished
+                # since the last one updated it in place, so the very next beat
+                # is the receipt the app is waiting for. "" until we have ever
+                # captured a snapshot (see RelayClient.heartbeat).
+                resp = await relay.heartbeat(pairing.backend_id,
+                                             pairing.object_info_hash)
             except RelayError as e:
                 too_old = _as_plugin_too_old(e)
                 if too_old is not None:
@@ -1208,6 +1213,40 @@ async def _refresh_object_info(relay: RelayClient, comfy: ComfyClient,
     pairing.object_info_synced_at = max(
         pairing.object_info_synced_at or 0, requested)
     STATE.save()
+    if uploaded:
+        # A NEW snapshot is in R2 and nobody knows yet: it went there over a
+        # presigned PUT, so the relay never saw it land. Beat once right now
+        # rather than letting the app wait out the rest of the heartbeat
+        # interval to learn the refresh finished.
+        #
+        # Only when we actually uploaded: an unchanged snapshot carries the same
+        # fingerprint the relay already has, so an extra beat would say nothing.
+        await _announce_object_info(relay, pairing)
+
+
+async def _announce_object_info(relay: RelayClient, pairing) -> None:
+    """Beat once, immediately, so the relay learns the new snapshot fingerprint.
+
+    Deliberately NOT a new endpoint or a second long-poll: the heartbeat is
+    already the channel through which this plugin reports its own state, and it
+    already carries object_info_hash — so "notify" is just "beat now".
+
+    Best-effort, and BOUNDED BY DESIGN:
+
+      * no retry — the regular beat (≤ HEARTBEAT_INTERVAL away) carries the very
+        same fingerprint, so a failure here costs latency, never correctness. A
+        retry would only add load exactly when the relay is already unhappy;
+      * failures are swallowed at debug level — this runs in the refresh task,
+        and an escaping error would surface as an unhandled task exception;
+      * it does NOT touch the heartbeat loop's own rhythm: this call is made
+        from the refresh task, so the loop's sleep is neither cut short nor
+        extended and its cadence is exactly what it would have been.
+    """
+    try:
+        await relay.heartbeat(pairing.backend_id, pairing.object_info_hash)
+    except Exception as e:  # noqa: BLE001 - the next regular beat carries it anyway
+        log.debug("immediate beat after object_info upload failed "
+                  "(the next regular beat will carry it): %s", e)
 
 
 async def _claim_loop(relay: RelayClient, worker: Worker, pairing,

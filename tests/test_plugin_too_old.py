@@ -384,7 +384,7 @@ class TestHeartbeatBlockStopsClaiming(_ServeHarness,
 
         beat = asyncio.Event()
 
-        def heartbeat(backend_id):
+        def heartbeat(backend_id, object_info_hash=""):
             # Sync side_effect on an AsyncMock: raising here drives the awaited
             # call deterministically. The loop's except arms the latch and
             # returns with no await in between, so once the claim task is
@@ -443,7 +443,7 @@ class TestHeartbeatBlockStopsClaiming(_ServeHarness,
 
         beats = {"n": 0}
 
-        async def heartbeat(backend_id):
+        async def heartbeat(backend_id, object_info_hash=""):
             beats["n"] += 1
             await _real_sleep(0)  # yield so the claim loop makes progress
             raise RelayError("relay hiccup", 500)
@@ -483,7 +483,7 @@ class TestHeartbeatBlockStopsClaiming(_ServeHarness,
         beat = asyncio.Event()
         beats = {"n": 0}
 
-        async def heartbeat(backend_id):
+        async def heartbeat(backend_id, object_info_hash=""):
             beats["n"] += 1
             if beats["n"] == 1:
                 beat.set()

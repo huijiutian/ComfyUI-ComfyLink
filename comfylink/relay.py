@@ -267,7 +267,8 @@ class RelayClient:
         d = await self._json("POST", "/v1/backends/workflows/sign-put", body)
         return d["key"], d["url"]
 
-    async def heartbeat(self, backend_id: str) -> dict:
+    async def heartbeat(self, backend_id: str,
+                        object_info_hash: str = "") -> dict:
         """Mark this backend alive. Returns the relay's response body.
 
         The body is the plugin's ONLY inbound channel while idle, so it doubles
@@ -280,10 +281,27 @@ class RelayClient:
 
         Version/commit go out on every beat so a `git pull` + ComfyUI restart
         refreshes what the relay/app see without waiting for a re-register.
+
+        RECEIPT for the snapshot upload. The snapshot itself goes straight to R2
+        over a presigned PUT, so the relay never sees it land and cannot tell the
+        app "the new one is up". The beat carries the CONTENT fingerprint of
+        whatever we last shipped (Pairing.object_info_hash) and the relay stores
+        it, which is what lets the app wait for a refresh to actually complete.
+
+        A FINGERPRINT, not a timestamp, on purpose: re-uploading a byte-identical
+        snapshot leaves it unchanged, so the app can never be fooled into
+        reporting "refreshed" for a beat that moved nothing.
+
+        Sent only when we HAVE one. Empty means "keep what you have" relay-side,
+        and omitting the key says exactly that — a backend that has never
+        captured a snapshot must not put anything in that column, least of all
+        some other identifier that happened to be at hand.
         """
-        return await self._json("POST", "/v1/backends/heartbeat",
-                                {"backend_id": backend_id,
-                                 "version": __version__, "commit": __commit__})
+        body = {"backend_id": backend_id,
+                "version": __version__, "commit": __commit__}
+        if object_info_hash:
+            body["object_info_hash"] = object_info_hash
+        return await self._json("POST", "/v1/backends/heartbeat", body)
 
     async def abandon_jobs(self, backend_id: str) -> int:
         """Fail every still-claimed/running job left on this backend.

@@ -597,3 +597,155 @@ class TestTheTwoWatermarksAreIndependent(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.scans, self.refreshes), ([], []))
         self.assertEqual(pairing.loras_synced_at, 0.0)
         self.assertEqual(pairing.object_info_synced_at, 0.0)
+
+
+# ── the receipt: the beat carries the snapshot fingerprint ──────────────────
+
+class TestHeartbeatCarriesTheFingerprint(unittest.IsolatedAsyncioTestCase):
+    """The relay never sees the snapshot land (presigned PUT straight to R2),
+    so the beat is how it learns which snapshot this backend is actually on."""
+
+    def _client(self):
+        relay = RelayClient.__new__(RelayClient)
+        sent = []
+
+        async def fake_json(method, path, body, timeout=None):
+            sent.append((method, path, body))
+            return {"ok": True}
+
+        relay._json = fake_json
+        return relay, sent
+
+    async def test_current_fingerprint_is_sent(self):
+        relay, sent = self._client()
+        await relay.heartbeat("b1", "0123456789abcdef0123456789abcdef")
+        _method, path, body = sent[0]
+        self.assertEqual(path, "/v1/backends/heartbeat")
+        self.assertEqual(body["backend_id"], "b1")
+        self.assertEqual(body["object_info_hash"],
+                         "0123456789abcdef0123456789abcdef")
+
+    async def test_nothing_captured_yet_sends_no_fake_value(self):
+        # ⛔ "" means "keep what you have" relay-side. A backend that has never
+        # captured a snapshot must contribute NOTHING to that column — and in
+        # particular must never pad it with some other identifier that happened
+        # to be at hand (commit sha, version, backend_id).
+        relay, sent = self._client()
+        await relay.heartbeat("b1")                       # default: never captured
+        _method, _path, body = sent[0]
+        self.assertNotIn("object_info_hash", body)
+        for stray in (body.get("commit"), body.get("version"), body["backend_id"]):
+            self.assertNotIn(str(stray), str(body.get("object_info_hash", "")))
+        # The rest of the body is untouched.
+        self.assertIn("version", body)
+        self.assertIn("commit", body)
+
+    async def test_empty_string_is_omitted_not_sent_blank(self):
+        relay, sent = self._client()
+        await relay.heartbeat("b1", "")
+        self.assertNotIn("object_info_hash", sent[0][2])
+
+    async def test_the_loop_reads_the_pairing_fresh_each_beat(self):
+        # A refresh that lands between beats must be reported by the NEXT beat,
+        # so the value may not be captured once and cached.
+        relay = mock.AsyncMock()
+        relay.heartbeat.return_value = {"ok": True}
+        pairing = _RefreshPairing(object_info_hash="aaa")
+        state = _FakeState()
+        state.get_pairing = lambda bid: pairing
+
+        async def bump(*_a, **_kw):
+            if relay.heartbeat.await_count == 2:
+                pairing.object_info_hash = "bbb"
+            return {"ok": True}
+
+        relay.heartbeat.side_effect = bump
+        with mock.patch.object(worker, "STATE", state), \
+                mock.patch.object(worker, "HEARTBEAT_INTERVAL", 0.001):
+            hb = asyncio.create_task(worker._heartbeat_loop(relay, pairing, None))
+            await asyncio.sleep(0.05)
+            hb.cancel()
+            try:
+                await hb
+            except asyncio.CancelledError:
+                pass
+        hashes = [c.args[1] for c in relay.heartbeat.await_args_list]
+        self.assertEqual(hashes[0], "aaa")
+        self.assertIn("bbb", hashes)                      # picked up, not cached
+
+
+class TestImmediateBeatAfterUpload(unittest.IsolatedAsyncioTestCase):
+    """A finished refresh announces itself instead of waiting out the interval."""
+
+    def _fixture(self, oi, stored_hash=""):
+        relay = mock.AsyncMock()
+        relay.heartbeat.return_value = {"ok": True}
+        comfy = mock.AsyncMock()
+        comfy.object_info.return_value = oi
+        return relay, comfy, _RefreshPairing(object_info_hash=stored_hash)
+
+    async def test_upload_is_announced_at_once(self):
+        oi = {"A": {}, "B": {}}
+        relay, comfy, pairing = self._fixture(oi)
+        with mock.patch.object(worker, "STATE", _FakeState()), \
+                mock.patch.object(worker, "STATUS"):
+            await worker._refresh_object_info(relay, comfy, pairing, 900.0)
+        relay.upload_object_info.assert_awaited_once()
+        relay.heartbeat.assert_awaited_once_with("b1", object_info_hash(oi))
+        # The beat reports the snapshot that is NOW in R2, not the old one.
+        self.assertEqual(relay.heartbeat.await_args.args[1], pairing.object_info_hash)
+
+    async def test_unchanged_snapshot_is_not_announced(self):
+        # Same fingerprint the relay already has => an extra beat says nothing.
+        oi = {"A": {}}
+        relay, comfy, pairing = self._fixture(oi, stored_hash=object_info_hash(oi))
+        with mock.patch.object(worker, "STATE", _FakeState()), \
+                mock.patch.object(worker, "STATUS"):
+            await worker._refresh_object_info(relay, comfy, pairing, 900.0)
+        relay.upload_object_info.assert_not_awaited()
+        relay.heartbeat.assert_not_awaited()
+
+    async def test_a_failed_upload_is_not_announced(self):
+        relay, comfy, pairing = self._fixture({"A": {}})
+        relay.upload_object_info.side_effect = RuntimeError("R2 unconfigured")
+        with mock.patch.object(worker, "STATE", _FakeState()), \
+                mock.patch.object(worker, "STATUS"):
+            await worker._refresh_object_info(relay, comfy, pairing, 900.0)
+        relay.heartbeat.assert_not_awaited()
+
+    async def test_a_failed_announcement_is_swallowed_and_not_retried(self):
+        # The next regular beat carries the same fingerprint, so this costs
+        # latency and nothing else — retrying here would only pile on a relay
+        # that is already struggling.
+        oi = {"A": {}}
+        relay, comfy, pairing = self._fixture(oi)
+        relay.heartbeat.side_effect = RuntimeError("relay redeploying")
+        with mock.patch.object(worker, "STATE", _FakeState()), \
+                mock.patch.object(worker, "STATUS"):
+            await worker._refresh_object_info(relay, comfy, pairing, 900.0)   # no raise
+        self.assertEqual(relay.heartbeat.await_count, 1)     # exactly once
+        # The refresh still counts as served — the watermark advanced.
+        self.assertEqual(pairing.object_info_synced_at, 900.0)
+
+    async def test_the_regular_rhythm_is_untouched(self):
+        # The announcement is issued from the REFRESH task, so the heartbeat
+        # loop's own sleep is neither cut short nor extended.
+        relay = mock.AsyncMock()
+        relay.heartbeat.return_value = {"ok": True}
+        pairing = _RefreshPairing()
+        state = _FakeState()
+        state.get_pairing = lambda bid: pairing
+        with mock.patch.object(worker, "STATE", state), \
+                mock.patch.object(worker, "HEARTBEAT_INTERVAL", 0.02), \
+                mock.patch.object(worker, "_maybe_refresh_object_info",
+                                  lambda *a, **kw: None):
+            hb = asyncio.create_task(worker._heartbeat_loop(relay, pairing, None))
+            await asyncio.sleep(0.11)
+            hb.cancel()
+            try:
+                await hb
+            except asyncio.CancelledError:
+                pass
+        # ~0.11s at a 0.02s cadence: a handful of beats, not a burst.
+        self.assertLessEqual(relay.heartbeat.await_count, 8)
+        self.assertGreaterEqual(relay.heartbeat.await_count, 3)

@@ -675,6 +675,12 @@ class _FakePairing:
         # Watermark of the last app refresh request this pairing has served.
         self.loras_synced_at = loras_synced_at
         self.account = ""
+        # Fingerprint of the last object_info snapshot shipped for this pairing.
+        # Every beat carries it (see RelayClient.heartbeat), so a fake that
+        # lacks it makes the heartbeat loop swallow an AttributeError and go
+        # silent — model the real Pairing.
+        self.object_info_hash = ""
+        self.object_info_synced_at = 0.0
 
 
 class _FakeState:
@@ -1077,7 +1083,10 @@ class TestNothingScansWithoutTheSignal(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(beats.wait(), 1)
             raise worker._Revoked()
 
-        async def counting_heartbeat(bid):
+        async def counting_heartbeat(bid, object_info_hash=""):
+            # This pairing has never captured a snapshot, so the beat must carry
+            # no fingerprint at all (see RelayClient.heartbeat).
+            self.assertEqual(object_info_hash, "")
             beats.set()
             return {}
 
