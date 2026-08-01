@@ -749,3 +749,235 @@ class TestImmediateBeatAfterUpload(unittest.IsolatedAsyncioTestCase):
         # ~0.11s at a 0.02s cadence: a handful of beats, not a burst.
         self.assertLessEqual(relay.heartbeat.await_count, 8)
         self.assertGreaterEqual(relay.heartbeat.await_count, 3)
+
+
+# ── the fingerprint must track REAL changes, and only real ones ─────────────
+#
+# Shapes below mirror what PM pulled off a real user's ComfyUI (2808 node types,
+# two reads one second apart): three nodes rebuild an input `default` on every
+# call, which made the fingerprint useless. See worker._VOLATILE_INPUT_OPTS.
+
+def _checkpoint_loader(models):
+    """A loader node — the candidate list is spec[0], NOT a `default`."""
+    return {
+        "input": {"required": {
+            "ckpt_name": [list(models),
+                          {"default": models[0] if models else None,
+                           "tooltip": "The name of the checkpoint to load."}],
+        }},
+        "output": ["MODEL", "CLIP", "VAE"],
+        "name": "CheckpointLoaderSimple",
+        "category": "loaders",
+    }
+
+
+def _text_image(seed):
+    """LayerUtility: TextImage — variation_seed.default IS the wall clock."""
+    return {
+        "input": {
+            "required": {"text": ["STRING", {"default": "", "multiline": True}]},
+            "optional": {"variation_seed": ["INT", {"default": seed, "min": 0,
+                                                    "max": 99999999, "step": 1}]},
+        },
+        "name": "LayerUtility: TextImage",
+    }
+
+
+def _cache_node(suffix):
+    """Cache Node — both suffixes are re-randomised on every call."""
+    return {
+        "input": {"required": {
+            "conditioning_suffix": ["STRING", {"default": f"{suffix}_cache"}],
+            "image_suffix": ["STRING", {"default": f"{suffix}_cache"}],
+        }},
+        "name": "Cache Node",
+    }
+
+
+def _snapshot(models=("checkpoints/a.safetensors", "checkpoints/b.safetensors"),
+              seed=1785556904, suffix="3474403"):
+    return {
+        "CheckpointLoaderSimple": _checkpoint_loader(models),
+        "LayerUtility: TextImage": _text_image(seed),
+        "Cache Node": _cache_node(suffix),
+    }
+
+
+class TestVolatileDefaultsAreIgnored(unittest.TestCase):
+    """① The bug: a snapshot that only ticked its clocks is NOT a new snapshot."""
+
+    def test_two_reads_one_second_apart_hash_the_same(self):
+        # Exactly the observed drift: variation_seed +1 (unix time), Cache Node
+        # re-randomised. Same machine, same 3 nodes, nothing installed/removed.
+        first = _snapshot(seed=1785556904, suffix="3474403")
+        second = _snapshot(seed=1785556905, suffix="96440706")
+        self.assertNotEqual(first, second)                 # the blobs DO differ
+        self.assertEqual(object_info_hash(first), object_info_hash(second))
+
+    def test_defaults_are_ignored_in_every_input_section(self):
+        for section in ("required", "optional", "hidden"):
+            with self.subTest(section=section):
+                a = {"N": {"input": {section: {"x": ["INT", {"default": 1}]}}}}
+                b = {"N": {"input": {section: {"x": ["INT", {"default": 2}]}}}}
+                self.assertEqual(object_info_hash(a), object_info_hash(b))
+
+    def test_hashing_does_not_mutate_the_snapshot_we_upload(self):
+        # The upload must stay COMPLETE — the app renders form initial values
+        # from `default`. Only the fingerprint's input is narrowed.
+        oi = _snapshot()
+        before = json.dumps(oi, sort_keys=True)
+        object_info_hash(oi)
+        self.assertEqual(json.dumps(oi, sort_keys=True), before)
+        self.assertEqual(
+            oi["LayerUtility: TextImage"]["input"]["optional"]["variation_seed"][1]
+            ["default"], 1785556904)
+
+
+class TestModelListChangesAreAlwaysDetected(unittest.TestCase):
+    """⛔ THE GUARD RAIL. Widening the filter to spec[0] would blind us to the
+    exact thing R-1.0.6-14 exists to detect — with no symptom at all."""
+
+    def test_installing_a_model_changes_the_hash(self):
+        before = _snapshot(models=("checkpoints/a.safetensors",))
+        after = _snapshot(models=("checkpoints/a.safetensors",
+                                  "checkpoints/new.safetensors"))
+        self.assertNotEqual(object_info_hash(before), object_info_hash(after))
+
+    def test_deleting_a_model_changes_the_hash(self):
+        before = _snapshot(models=("checkpoints/a.safetensors",
+                                   "checkpoints/b.safetensors"))
+        after = _snapshot(models=("checkpoints/a.safetensors",))
+        self.assertNotEqual(object_info_hash(before), object_info_hash(after))
+
+    def test_renaming_a_model_changes_the_hash(self):
+        before = _snapshot(models=("checkpoints/a.safetensors",))
+        after = _snapshot(models=("checkpoints/renamed.safetensors",))
+        self.assertNotEqual(object_info_hash(before), object_info_hash(after))
+
+    def test_reordering_the_candidates_changes_the_hash(self):
+        # The candidate list is ordered data (it drives the app's picker), not a
+        # set — sort_keys must never be allowed to flatten it away.
+        before = _snapshot(models=("a.safetensors", "b.safetensors"))
+        after = _snapshot(models=("b.safetensors", "a.safetensors"))
+        self.assertNotEqual(object_info_hash(before), object_info_hash(after))
+
+    def test_a_model_change_wins_even_while_the_clocks_tick(self):
+        # The realistic case: the user installed a model AND a second passed.
+        before = _snapshot(models=("a.safetensors",), seed=1785556904)
+        after = _snapshot(models=("a.safetensors", "new.safetensors"),
+                          seed=1785556905, suffix="96440706")
+        self.assertNotEqual(object_info_hash(before), object_info_hash(after))
+
+    def test_lora_candidates_are_covered_too(self):
+        before = {"LoraLoader": {"input": {"required": {
+            "lora_name": [["style/x.safetensors"], {"default": None}]}}}}
+        after = {"LoraLoader": {"input": {"required": {
+            "lora_name": [["style/x.safetensors", "style/y.safetensors"],
+                          {"default": None}]}}}}
+        self.assertNotEqual(object_info_hash(before), object_info_hash(after))
+
+
+class TestRealChangesStillMoveTheHash(unittest.TestCase):
+    """③④ Everything else that genuinely describes this ComfyUI."""
+
+    def test_installing_or_removing_a_node_changes_the_hash(self):
+        base = _snapshot()
+        added = dict(base, NewCustomNode={"input": {"required": {}}})
+        removed = {k: v for k, v in base.items() if k != "Cache Node"}
+        self.assertNotEqual(object_info_hash(base), object_info_hash(added))
+        self.assertNotEqual(object_info_hash(base), object_info_hash(removed))
+
+    def test_an_input_name_change_moves_the_hash(self):
+        a = {"N": {"input": {"required": {"steps": ["INT", {"default": 20}]}}}}
+        b = {"N": {"input": {"required": {"stepz": ["INT", {"default": 20}]}}}}
+        self.assertNotEqual(object_info_hash(a), object_info_hash(b))
+
+    def test_an_input_type_change_moves_the_hash(self):
+        a = {"N": {"input": {"required": {"seed": ["INT", {"default": 0}]}}}}
+        b = {"N": {"input": {"required": {"seed": ["FLOAT", {"default": 0}]}}}}
+        self.assertNotEqual(object_info_hash(a), object_info_hash(b))
+
+    def test_an_input_appearing_or_vanishing_moves_the_hash(self):
+        a = {"N": {"input": {"required": {"seed": ["INT", {"default": 0}]}}}}
+        b = {"N": {"input": {"required": {"seed": ["INT", {"default": 0}],
+                                          "steps": ["INT", {"default": 20}]}}}}
+        self.assertNotEqual(object_info_hash(a), object_info_hash(b))
+
+    def test_other_options_are_still_hashed(self):
+        # Only `default` is volatile. min/max/step/tooltip describe the node and
+        # a node update that changes them IS a change worth re-uploading.
+        base = {"N": {"input": {"required": {
+            "steps": ["INT", {"default": 20, "min": 1, "max": 100,
+                              "step": 1, "tooltip": "steps"}]}}}}
+        for key, value in (("min", 2), ("max", 150), ("step", 2),
+                           ("tooltip", "how many steps")):
+            with self.subTest(key=key):
+                other = json.loads(json.dumps(base))
+                other["N"]["input"]["required"]["steps"][1][key] = value
+                self.assertNotEqual(object_info_hash(base), object_info_hash(other))
+
+    def test_every_input_section_keeps_contributing(self):
+        # Guards against a filter that DROPS a section instead of filtering it.
+        # `required` comes first, so such a bug would keep working there and go
+        # silent on optional/hidden — where `variation_seed` actually lives.
+        for section in ("optional", "hidden"):
+            for a_spec, b_spec in (
+                (["INT", {"min": 1}], ["INT", {"min": 2}]),          # constraint
+                (["INT", {"default": 0}], ["FLOAT", {"default": 0}]),  # type
+                ([["a.safetensors"], {}],
+                 [["a.safetensors", "b.safetensors"], {}]),          # candidates
+            ):
+                with self.subTest(section=section, spec=a_spec):
+                    a = {"N": {"input": {"required": {"seed": ["INT", {"default": 0}]},
+                                         section: {"x": a_spec}}}}
+                    b = {"N": {"input": {"required": {"seed": ["INT", {"default": 0}]},
+                                         section: {"x": b_spec}}}}
+                    self.assertNotEqual(object_info_hash(a), object_info_hash(b))
+
+    def test_a_whole_input_section_appearing_moves_the_hash(self):
+        a = {"N": {"input": {"required": {"seed": ["INT", {"default": 0}]}}}}
+        b = {"N": {"input": {"required": {"seed": ["INT", {"default": 0}]},
+                             "optional": {"mask": ["MASK", {}]}}}}
+        self.assertNotEqual(object_info_hash(a), object_info_hash(b))
+
+    def test_node_metadata_outside_input_is_still_hashed(self):
+        a = _snapshot()
+        b = json.loads(json.dumps(a))
+        b["CheckpointLoaderSimple"]["category"] = "loaders/advanced"
+        self.assertNotEqual(object_info_hash(a), object_info_hash(b))
+
+
+class TestStableViewIsDefensive(unittest.TestCase):
+    """Third-party node definitions are not a shape we control."""
+
+    def test_odd_shapes_pass_through_instead_of_raising(self):
+        for oi in (
+            {},
+            {"N": None},
+            {"N": "not a dict"},
+            {"N": {"input": None}},
+            {"N": {"input": "boom"}},
+            {"N": {"input": {"required": None}}},
+            {"N": {"input": {"required": "boom"}}},
+            {"N": {"input": {"required": {"x": None}}}},
+            {"N": {"input": {"required": {"x": "INT"}}}},      # spec not a list
+            {"N": {"input": {"required": {"x": []}}}},         # empty spec
+            {"N": {"input": {"required": {"x": ["INT"]}}}},    # no options dict
+            {"N": {"input": {"required": {"x": [{"default": 1}]}}}},
+        ):
+            with self.subTest(oi=oi):
+                h = object_info_hash(oi)
+                self.assertEqual(len(h), 32)
+                int(h, 16)
+
+    def test_an_unparseable_snapshot_is_hashed_whole_not_dropped(self):
+        # Better to hash something we didn't understand (worst case: a needless
+        # re-upload) than to ignore it (worst case: a change we never notice).
+        a = {"N": {"input": {"weird_section": [1, 2, 3]}}}
+        b = {"N": {"input": {"weird_section": [1, 2, 4]}}}
+        self.assertNotEqual(object_info_hash(a), object_info_hash(b))
+
+    def test_a_non_dict_snapshot_does_not_explode(self):
+        for junk in ([], "nope", None, 7):
+            with self.subTest(junk=junk):
+                self.assertEqual(len(object_info_hash(junk)), 32)

@@ -869,15 +869,122 @@ async def _abandon_orphans(relay: RelayClient, pairing, swept: set) -> None:
                  n, pairing.backend_id)
 
 
+# Input options that some nodes REGENERATE on every /object_info call, so they
+# say nothing about whether this ComfyUI actually changed. Measured on a real
+# user's install (2808 node types, two reads one second apart): three nodes made
+# the whole snapshot look new every single time —
+#
+#   LayerUtility: TextImage / TextImage V2 -> variation_seed.default is the
+#       current Unix timestamp, so it ticks once a second;
+#   Cache Node -> conditioning_suffix.default / image_suffix.default are freshly
+#       randomised per call ("3474403_cache" -> "96440706_cache").
+#
+# The fingerprint therefore ALWAYS said "changed": the skip-the-4MB-re-upload
+# check never once skipped, and (since R-1.0.6-14) the app's "has the new
+# snapshot landed?" test lost its meaning too. Neither has any symptom beyond
+# quiet waste, which is why it survived this long.
+#
+# BLACKLIST, not whitelist — deliberately. The volatile fields are identified,
+# and a whitelist would have to enumerate everything worth keeping, where an
+# omission is the same class of silent failure we are fixing (we would stop
+# noticing real changes). Adding a newly-discovered volatile option here is a
+# one-line change; a whitelist that quietly drops something is not.
+#
+# ⛔ NEVER add the candidate list to this set, and never widen the filter to
+# spec[0]. In /object_info an input is ``[<type or candidates>, {<options>}]``:
+#
+#     "ckpt_name": [["checkpoints/a.safetensors", "checkpoints/b.safetensors"],
+#                   {"default": "...", "tooltip": "..."}]
+#
+# The installed models ARE spec[0]. Filtering them out would mean we could no
+# longer tell that a user added or deleted a model — the exact problem
+# R-1.0.6-14 exists to solve, and just as symptom-free as this bug was.
+# TestModelListChangesAreAlwaysDetected guards that.
+_VOLATILE_INPUT_OPTS = frozenset({"default"})
+
+
+def _stable_view(oi: dict) -> dict:
+    """``oi`` with the volatile input options dropped — for HASHING ONLY.
+
+    The uploaded snapshot stays complete: the app renders parameter forms from
+    ``default``, so it must keep receiving it. Only the fingerprint's input is
+    narrowed.
+
+    Returns a new structure that SHARES every untouched subtree with the
+    original (no deep copy of a multi-MB blob) and never mutates it. Anything
+    shaped unexpectedly is passed through untouched rather than dropped: this
+    runs over third-party node definitions, and hashing something we failed to
+    understand is far better than silently ignoring it.
+    """
+    if not isinstance(oi, dict):
+        return oi
+    return {name: _node_view(node) for name, node in oi.items()}
+
+
+def _node_view(node):
+    """One node definition with volatile options stripped from its inputs."""
+    if not isinstance(node, dict):
+        return node
+    inputs = node.get("input")
+    if not isinstance(inputs, dict):
+        return node
+    # Sections are required / optional / hidden — all of them carry input specs,
+    # so all of them get filtered. Iterating whatever is actually there also
+    # covers a section ComfyUI might add later.
+    new_inputs = {}
+    changed = False
+    for section, entries in inputs.items():
+        if not isinstance(entries, dict):
+            new_inputs[section] = entries
+            continue
+        new_entries = {}
+        for input_name, spec in entries.items():
+            stripped = _spec_view(spec)
+            changed = changed or stripped is not spec
+            new_entries[input_name] = stripped
+        new_inputs[section] = new_entries
+    if not changed:
+        return node
+    new_node = dict(node)
+    new_node["input"] = new_inputs
+    return new_node
+
+
+def _spec_view(spec):
+    """One input spec with volatile keys dropped from its options dict.
+
+    Only DIRECT dict elements of the spec are touched — that is where the
+    options live. spec[0] (the type name, or the candidate list) is never a
+    dict, so the installed-model enumeration cannot be reached from here.
+    """
+    if not isinstance(spec, (list, tuple)):
+        return spec
+    out = []
+    changed = False
+    for item in spec:
+        if isinstance(item, dict) and not _VOLATILE_INPUT_OPTS.isdisjoint(item):
+            out.append({k: v for k, v in item.items()
+                        if k not in _VOLATILE_INPUT_OPTS})
+            changed = True
+        else:
+            out.append(item)
+    return out if changed else spec
+
+
 def object_info_hash(oi: dict) -> str:
     """Stable content hash of an object_info snapshot.
 
     sort_keys makes it deterministic regardless of dict ordering, so an
     unchanged ComfyUI node set always hashes identically across restarts. Pure
     and side-effect-free => unit-testable on its own.
+
+    Hashed over _stable_view, not the raw snapshot: a handful of third-party
+    nodes rebuild their input ``default`` on every /object_info call, which used
+    to make every snapshot look different (see _VOLATILE_INPUT_OPTS).
     """
     return hashlib.md5(
-        json.dumps(oi, sort_keys=True, separators=(",", ":")).encode()
+        json.dumps(_stable_view(oi), sort_keys=True,
+                   separators=(",", ":")).encode()
     ).hexdigest()
 
 
