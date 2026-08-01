@@ -75,6 +75,21 @@ def detect_comfy_url() -> str:
         return "http://127.0.0.1:8188"
 
 
+def _as_float(v) -> float:
+    """Best-effort float from a persisted value; 0.0 for anything unusable.
+
+    The watermark gates whether a scan runs, so a hand-edited or corrupt state
+    file must degrade to "never served a request" (=> the next app request is
+    honoured) rather than to a crash or, worse, to a huge value that would
+    silently swallow every future request.
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if f > 0 else 0.0
+
+
 def _default_name() -> str:
     try:
         return socket.gethostname() or "ComfyUI"
@@ -124,6 +139,24 @@ class Pairing:
     # each account has its own R2 key — the same machine may have shipped the
     # manifest to account A but not yet to account B.
     loras_hash: str = ""
+    # WATERMARK for the app-initiated inventory refresh. The user presses refresh
+    # in the app; the relay remembers WHEN and replays that timestamp in every
+    # heartbeat response as `loras_requested_at`. We scan iff the relay's value is
+    # strictly GREATER than this, then store it here.
+    #
+    # A timestamp rather than a boolean, on purpose: it needs no "clear the flag"
+    # write back to the relay, it is idempotent under retries and duplicate
+    # deliveries (the same value can arrive on every one of the ~25s heartbeats
+    # and still produce exactly one scan), and it survives a ComfyUI restart
+    # because it is persisted here. 0 == never served a request.
+    loras_synced_at: float = 0.0
+    # Same watermark, same rules, for the app-initiated object_info refresh
+    # (heartbeat field `object_info_requested_at`). Separate from
+    # loras_synced_at on purpose: the two refreshes answer different questions
+    # ("what LoRA files are on disk" vs "what node types / enum values does this
+    # ComfyUI have"), cost wildly different amounts, and the user triggers them
+    # from different places — one must never serve or suppress the other.
+    object_info_synced_at: float = 0.0
 
 
 class State:
@@ -177,6 +210,9 @@ class State:
                     device_id=item.get("device_id", ""),
                     object_info_hash=item.get("object_info_hash", ""),
                     loras_hash=item.get("loras_hash", ""),
+                    loras_synced_at=_as_float(item.get("loras_synced_at")),
+                    object_info_synced_at=_as_float(
+                        item.get("object_info_synced_at")),
                 ))
         else:
             # Back-compat: old single-pairing top-level format. Convert to a
@@ -246,6 +282,8 @@ class State:
                         "device_id": pr.device_id,
                         "object_info_hash": pr.object_info_hash,
                         "loras_hash": pr.loras_hash,
+                        "loras_synced_at": pr.loras_synced_at,
+                        "object_info_synced_at": pr.object_info_synced_at,
                     }
                     for pr in self.pairings
                 ],

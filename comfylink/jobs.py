@@ -6,7 +6,9 @@ ComfyUI.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from io import BytesIO
 from typing import Any
 from xml.sax.saxutils import escape
@@ -248,3 +250,186 @@ def progress_event(msg: dict) -> dict[str, Any] | None:
         return {"kind": "error", "message": d.get("exception_message") or "execution error",
                 "prompt_id": d.get("prompt_id")}
     return None
+
+
+# ── /prompt rejections: structured diagnosis ────────────────────────────────
+#
+# When ComfyUI refuses a prompt it answers 400 with a STRUCTURED body:
+#
+#   {"error": {"type": "prompt_outputs_failed_validation", "message": "..."},
+#    "node_errors": {"4": {"class_type": "CheckpointLoaderSimple", "errors": [
+#       {"type": "value_not_in_list", "message": "Value not in list",
+#        "details": "ckpt_name: 'x.safetensors' not in [...]",
+#        "extra_info": {"input_name": "ckpt_name", "received_value": "x.safetensors",
+#                       "input_config": ...}}]}}}
+#
+# The one failure users actually hit is "the model this workflow asks for is not
+# on this machine any more" — they added/removed models on the PC while the app
+# still shows the inventory captured earlier. That is `value_not_in_list`, and
+# turning it into a machine-readable code is what lets the app say "model X is
+# gone, refresh" instead of showing the raw JSON above.
+
+# Failure code reported to the relay (and read by the app) when a workflow
+# references a value that is not in this ComfyUI's list for that input.
+MODEL_NOT_FOUND = "model_not_found"
+
+# The only ComfyUI validation type we map to MODEL_NOT_FOUND. Every other type
+# (required_input_missing, value_not_in_range, invalid_prompt, exception_during
+# _validation, bad_linked_input, return_type_mismatch, ...) stays an ordinary
+# failure with NO code — misreporting a missing widget as a missing model would
+# send the user chasing a model that was never the problem.
+_VALUE_NOT_IN_LIST = "value_not_in_list"
+
+# Caps. `details`/`received_value` are attacker-free but not size-bounded (a
+# pathological workflow could carry a huge string), and the message ends up in a
+# DB column and a phone UI, so everything that leaves here is bounded.
+_MAX_ITEM_CHARS = 120   # per extracted field name / value
+_MAX_LISTED = 5         # missing models spelled out before "(+N more)"
+_MAX_BODY_CHARS = 400   # raw body kept in the fallback (unstructured) message
+
+# "ckpt_name: 'x.safetensors' not in [...]" — the human `details` string, used
+# only when `extra_info` is missing (older/forked ComfyUI). Non-greedy so a
+# value containing an apostrophe still resolves against the literal " not in ".
+_DETAILS_RE = re.compile(r"\s*([^:\s]+)\s*:\s*'(.*?)'\s+not in\b", re.DOTALL)
+
+
+def prompt_rejection(status: int, body: str) -> tuple[str, str]:
+    """Turn a non-200 ComfyUI /prompt response into ``(message, error_code)``.
+
+    Returns ``(message, MODEL_NOT_FOUND)`` when the body proves at least one
+    input value is not in ComfyUI's list for that input, else
+    ``(message, "")`` — an ordinary failure, exactly as before this existed.
+
+    DEFENSIVE BY CONSTRUCTION. ComfyUI's response shape is not a contract we
+    control and it has changed before, so every layer degrades instead of
+    raising: a non-JSON body, a JSON non-object, a missing/oddly-typed
+    ``node_errors``, a node entry that isn't a dict, an ``errors`` value that
+    isn't a list, an entry with no usable input name AND no usable value — each
+    of those simply means "no structured diagnosis", and the caller reports the
+    plain failure it would have reported anyway. NEVER raises. Pure => testable
+    without a ComfyUI.
+    """
+    missing = _missing_values(_as_dict(body))
+    if not missing:
+        return _plain(status, body), ""
+    listed = "; ".join(_describe(m) for m in missing[:_MAX_LISTED])
+    extra = len(missing) - _MAX_LISTED
+    if extra > 0:
+        listed += f" (+{extra} more)"
+    return f"model not found: {listed}", MODEL_NOT_FOUND
+
+
+def _as_dict(body: str) -> dict:
+    """Parse a response body into a dict; ``{}`` for anything else. Never raises."""
+    try:
+        data = json.loads(body)
+    except Exception:  # noqa: BLE001 - any parse failure => no structured info
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _plain(status: int, body: str) -> str:
+    """The unstructured fallback message — the historical shape, but BOUNDED.
+
+    The old code inlined the whole body, and for a validation failure that body
+    embeds ComfyUI's candidate list, so the user was shown kilobytes of JSON.
+    Truncating costs nothing diagnostically (the caller logs the full body).
+    """
+    text = (body or "").strip()
+    if len(text) > _MAX_BODY_CHARS:
+        text = text[:_MAX_BODY_CHARS] + "…"
+    return f"/prompt {status}: {text}"
+
+
+def _missing_values(payload: dict) -> list[dict]:
+    """Every ``value_not_in_list`` entry in ``node_errors``, in node-id order.
+
+    Each item is ``{"node", "class_type", "field", "value"}`` with missing parts
+    as "". Sorted so the message is deterministic for a given response (dict
+    order from JSON is insertion order, which we don't want to depend on).
+    """
+    node_errors = payload.get("node_errors")
+    if not isinstance(node_errors, dict):
+        return []
+    found: list[dict] = []
+    for node_id in sorted(node_errors, key=str):
+        node = node_errors[node_id]
+        if not isinstance(node, dict):
+            continue
+        errors = node.get("errors")
+        if not isinstance(errors, list):
+            continue
+        class_type = node.get("class_type")
+        for err in errors:
+            if not isinstance(err, dict) or err.get("type") != _VALUE_NOT_IN_LIST:
+                continue
+            field, value = _field_and_value(err)
+            if not field and not value:
+                # Recognised as the right TYPE but we can name neither the input
+                # nor the value => the app could not tell the user anything
+                # useful. Drop it rather than report an empty "model not found".
+                continue
+            found.append({
+                "node": str(node_id),
+                "class_type": _trim(class_type) if isinstance(class_type, str) else "",
+                "field": field,
+                "value": value,
+            })
+    return found
+
+
+def _field_and_value(err: dict) -> tuple[str, str]:
+    """``(input_name, received_value)`` for one validation error; "" when unknown.
+
+    ``extra_info`` is the authoritative source (ComfyUI puts the raw values
+    there); the human ``details`` string is only a fallback for a ComfyUI that
+    doesn't send it. ``extra_info["input_config"]`` is deliberately never read —
+    it can hold the whole candidate list.
+    """
+    extra = err.get("extra_info")
+    if isinstance(extra, dict):
+        name = extra.get("input_name")
+        got = extra.get("received_value")
+        field = _trim(name) if isinstance(name, str) else ""
+        # A model name is a string. Anything structured is not one, so we don't
+        # spill it into a user-facing message.
+        value = "" if got is None or isinstance(got, (dict, list)) else _trim(str(got))
+        if field or value:
+            return field, value
+    details = err.get("details")
+    if isinstance(details, str):
+        m = _DETAILS_RE.match(details)
+        if m:
+            return _trim(m.group(1)), _trim(m.group(2))
+    return "", ""
+
+
+def _trim(s: str) -> str:
+    """Normalize one extracted token for display.
+
+    Collapses whitespace (a stray newline would break the one-line message),
+    drops double quotes so the app can read every quoted run in the message as
+    exactly one model name, and caps the length.
+    """
+    out = " ".join(s.split()).replace('"', "")
+    return out[:_MAX_ITEM_CHARS]
+
+
+def _describe(item: dict) -> str:
+    '''One missing value as `"<value>" (input <field>, node <id> <class>)`.
+
+    The quoted value comes FIRST and contains no quote character of its own, so
+    the app can localize the copy and still pull the model name(s) out with a
+    trivial scan for quoted runs — while a user (or an older app that just shows
+    the message) reads a sentence.
+    '''
+    bits = []
+    if item["field"]:
+        bits.append(f"input {item['field']}")
+    if item["node"]:
+        node = f"node {item['node']}"
+        if item["class_type"]:
+            node += f" {item['class_type']}"
+        bits.append(node)
+    suffix = f" ({', '.join(bits)})" if bits else ""
+    return f'"{item["value"] or "?"}"{suffix}'

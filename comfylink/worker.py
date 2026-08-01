@@ -32,7 +32,7 @@ import aiohttp
 
 from . import loras
 from .auth import TokenAuth
-from .comfy import ComfyClient
+from .comfy import ComfyClient, PromptRejected
 from .config import RELAY_URL, STATE, detect_comfy_url
 from .jobs import (
     apply_inputs,
@@ -151,27 +151,10 @@ PLUGIN_TOO_OLD_RETRY = 60  # seconds between re-register attempts while blocked
 # The relay's fixed contract for the "your plugin is too old" refusal.
 PLUGIN_TOO_OLD_CODE = "plugin_too_old"
 
-# LORA_REFRESH_INTERVAL is how often the background inventory loop re-checks the
-# loras directory. Unlike object_info (collected once per register, i.e. only on
-# a ComfyUI restart/reconnect), a LoRA is something users add *while ComfyUI is
-# running* — download a file, drop it in the folder, hit refresh in the web UI.
-# Tying the inventory to register alone would mean "install a LoRA, then restart
-# ComfyUI before your phone can show its trigger words", which defeats the point
-# of a remote-control app.
-#
-# A warm refresh is cheap enough to afford on a timer: folder_paths caches its
-# own listing behind a directory-mtime check, every digest is served from the
-# path+size+mtime cache, and an unchanged manifest is dropped by the content-hash
-# compare before any network call. So the steady-state cost is one os.stat per
-# LoRA every 10 minutes and zero requests. Only genuinely new/changed files are
-# ever hashed.
-LORA_REFRESH_INTERVAL = 10 * 60  # seconds between inventory re-checks
-
-# LORA_UNSUPPORTED_RETRY backs the loop right off once the relay has told us it
-# has no inventory endpoint (404 — i.e. an older relay). We keep retrying rather
-# than giving up so a relay deploy is picked up without a ComfyUI restart, but at
-# a cadence that costs nothing.
-LORA_UNSUPPORTED_RETRY = 60 * 60  # seconds between retries against an old relay
+# How often the model scan logs a progress line (one per N files). A cold scan
+# reads tens of GB and is otherwise completely silent; this makes "still hashing"
+# distinguishable from "wedged" without spamming a line per LoRA.
+_SCAN_LOG_EVERY = 25
 
 
 class _Revoked(Exception):
@@ -394,6 +377,10 @@ class Worker:
                           canceled: Optional[asyncio.Event] = None) -> str:
         """Submit the prompt and watch ComfyUI's REST state until it terminates.
 
+        A prompt ComfyUI refuses outright (400 from /prompt — typically a model
+        the workflow names that is no longer installed) never reaches the loop:
+        it becomes a JobFailed carrying the diagnosis, see PromptRejected.
+
         Version-independent: instead of parsing websocket frames (whose format
         drifts across ComfyUI releases) we poll the stable /history and /queue
         endpoints. Each iteration decides the job's fate:
@@ -439,7 +426,16 @@ class Worker:
             # ever sets, so the check below is a cheap no-op.
             canceled = asyncio.Event()
         client_id = str(uuid4())
-        prompt_id = await self.comfy.submit(prompt, client_id)
+        try:
+            prompt_id = await self.comfy.submit(prompt, client_id)
+        except PromptRejected as e:
+            # ComfyUI refused the prompt outright. Carry its diagnosis (today:
+            # error_code "model_not_found" when the workflow names a model this
+            # machine no longer has) through to the relay result so the app can
+            # name the model instead of showing raw JSON. A rejection we could
+            # NOT diagnose arrives with error_code "" and reports exactly as it
+            # always did.
+            raise JobFailed(e.message, error_code=e.error_code) from e
 
         started = time.monotonic()      # submit time; the backstop counts from here
         next_queue = started            # ≤ now → the first "missing" poll reads /queue
@@ -722,7 +718,6 @@ async def _serve_pairing(pairing, job_lock: asyncio.Lock, session, comfy_url,
     blocked = _TooOldLatch()
     while not _stopped(stop) and STATE.get_pairing(bid) is not None:
         hb = None
-        lo = None
         try:
             STATUS.set(state="connecting", error="")
             await _register(relay, comfy, pairing)
@@ -746,11 +741,8 @@ async def _serve_pairing(pairing, job_lock: asyncio.Lock, session, comfy_url,
             # _PluginTooOld if the relay starts blocking mid-loop — either from a
             # claim 403 or from the latch the heartbeat arms — which lands in the
             # handler below and stops claiming.)
-            hb = asyncio.create_task(_heartbeat_loop(relay, pairing, stop, blocked))
-            # LoRA inventory: its own task, so a cold run that spends minutes
-            # hashing hundreds of GB delays neither the heartbeat nor the claim
-            # loop below. Torn down with hb in the finally — never leaked.
-            lo = asyncio.create_task(_loras_loop(relay, pairing, stop))
+            hb = asyncio.create_task(
+                _heartbeat_loop(relay, pairing, stop, blocked, comfy))
             await _claim_loop(relay, worker, pairing, job_lock, stop, blocked)
         except asyncio.CancelledError:
             raise
@@ -828,12 +820,10 @@ async def _serve_pairing(pairing, job_lock: asyncio.Lock, session, comfy_url,
             log.warning("pairing %s connection error: %s; retrying in 5s", bid, e)
             await asyncio.sleep(5)
         finally:
-            for t in (hb, lo):
-                if t is None:
-                    continue
-                t.cancel()
+            if hb is not None:
+                hb.cancel()
                 try:
-                    await t
+                    await hb
                 except asyncio.CancelledError:
                     pass
                 except Exception:  # noqa: BLE001
@@ -915,33 +905,44 @@ async def _register(relay: RelayClient, comfy: ComfyClient, pairing) -> None:
     # Account email for the panel ("paired to <email>"); best-effort, may be "".
     pairing.account = (resp or {}).get("account", "") if isinstance(resp, dict) else ""
     try:
-        oi = await comfy.object_info()
-        new_hash = object_info_hash(oi)
-        if pairing.object_info_hash and pairing.object_info_hash == new_hash:
-            # object_info bucket is non-expiring: a remembered hash means the
-            # snapshot is still in R2, so skip the (multi-MB) re-upload.
-            log.info(
-                "object_info unchanged (hash %s), skipping upload", new_hash[:12]
-            )
-        else:
-            await relay.upload_object_info(pairing.backend_id, oi)
-            # Only remember the hash after a successful upload — on failure the
-            # except below leaves it untouched so the next start retries.
-            pairing.object_info_hash = new_hash
-            STATE.save()
-            log.info(
-                "uploaded object_info (hash %s)", new_hash[:12]
-            )
-        STATUS.set(state="online", node_count=len(oi), error="")
-        log.info("registered backend %s (%d node types)", pairing.backend_id, len(oi))
+        node_count, _uploaded = await _report_object_info(relay, comfy, pairing)
+        STATUS.set(state="online", node_count=node_count, error="")
+        log.info("registered backend %s (%d node types)", pairing.backend_id, node_count)
     except Exception as e:  # noqa: BLE001 - online even if object_info upload failed
         STATUS.set(state="online", error=f"object_info: {e}")
         log.warning("object_info not reported (ComfyUI reachable?): %s", e)
 
 
+async def _report_object_info(relay: RelayClient, comfy: ComfyClient,
+                              pairing) -> tuple[int, bool]:
+    """Capture this ComfyUI's object_info and ship it, unless it hasn't changed.
+
+    Returns ``(node_count, uploaded)``. RAISES on any failure — the two callers
+    (register at startup, the app-initiated refresh) want different handling, so
+    neither gets a swallowed error here.
+
+    The content-hash check is what makes a refresh cheap: object_info is
+    multi-MB and the bucket is non-expiring, so a remembered hash proves the
+    snapshot is still in R2 and re-uploading it would move no information at
+    all. The hash is stored ONLY after a successful upload, so a failed upload
+    always retries.
+    """
+    oi = await comfy.object_info()
+    new_hash = object_info_hash(oi)
+    if pairing.object_info_hash and pairing.object_info_hash == new_hash:
+        log.info("object_info unchanged (hash %s), skipping upload", new_hash[:12])
+        return len(oi), False
+    await relay.upload_object_info(pairing.backend_id, oi)
+    pairing.object_info_hash = new_hash
+    STATE.save()
+    log.info("uploaded object_info (hash %s)", new_hash[:12])
+    return len(oi), True
+
+
 async def _heartbeat_loop(relay: RelayClient, pairing,
                           stop: asyncio.Event | None,
-                          blocked: Optional[_TooOldLatch] = None) -> None:
+                          blocked: Optional[_TooOldLatch] = None,
+                          comfy: Optional[ComfyClient] = None) -> None:
     """Keep this backend marked online. Errors are swallowed — with ONE exception.
 
     Every failure stays a debug-level no-op (the claim loop owns revoke handling
@@ -950,109 +951,263 @@ async def _heartbeat_loop(relay: RelayClient, pairing,
     that already registered before the block was armed, this is the only place
     the block is ever observed. We arm the latch and stop beating; the claim loop
     picks it up within one poll and unwinds into the non-destructive handler.
+
+    The beat is also the plugin's only INBOUND channel while idle, so it is where
+    we learn that the user asked the app to refresh something about this machine:
+    the model-inventory scan (_maybe_scan_models) and the object_info snapshot
+    (_maybe_refresh_object_info). Each is handed to a separate task and this loop
+    carries straight on — a scan can run for minutes and the beat must keep its
+    ~25s rhythm throughout, or the relay's reaper would take us for dead.
+
+    ``comfy`` is optional purely so the loop can be exercised (and run) without a
+    ComfyUI client; without it the object_info refresh is simply never dispatched.
     """
-    while not _stopped(stop) and STATE.get_pairing(pairing.backend_id) is not None:
-        try:
-            await relay.heartbeat(pairing.backend_id)
-        except RelayError as e:
-            too_old = _as_plugin_too_old(e)
-            if too_old is not None:
-                if blocked is not None:
-                    blocked.arm(too_old)
-                log.warning(
-                    "heartbeat refused: plugin too old (min %s) — stopping the "
-                    "heartbeat; this pairing will stop claiming new jobs",
-                    too_old.min_version or "?",
-                )
-                return
-            log.debug("heartbeat error: %s", e)
-        except Exception as e:  # noqa: BLE001 - claim loop handles revoke
-            log.debug("heartbeat error: %s", e)
-        await asyncio.sleep(HEARTBEAT_INTERVAL)
-
-
-async def _report_loras(relay: RelayClient, pairing) -> bool:
-    """Ship this machine's LoRA inventory to R2 if it changed. Never raises.
-
-    Returns True while the relay supports the endpoint, False once it has
-    answered 404 (an older relay) so the caller can back right off.
-
-    Failure is ALWAYS non-fatal here, deliberately unlike _register: the
-    inventory is a convenience (trigger words in the app), so a missing endpoint,
-    an unconfigured R2, or a network blip must leave the backend online and
-    claiming jobs exactly as before. Nothing in this function touches STATUS —
-    the panel has no business showing an error because a nice-to-have did not
-    upload.
-    """
+    scan: Optional[asyncio.Task] = None
+    refresh: Optional[asyncio.Task] = None
     try:
-        manifest = await loras.collect()
-    except Exception as e:  # noqa: BLE001 - inventory must never break the worker
-        log.warning("lora inventory: collection failed: %s", e)
-        return True
-    if not manifest.get("loras") and not manifest.get("checkpoints"):
-        # No models installed (or none readable). Nothing to say; an empty upload
-        # would only overwrite a previously-good manifest with nothing. Note both
-        # arrays are checked: a machine with checkpoints but no LoRAs still has
-        # something the app can use (the family check).
-        return True
-    new_hash = loras.manifest_hash(manifest)
-    if pairing.loras_hash and pairing.loras_hash == new_hash:
-        log.debug("lora inventory unchanged (hash %s), skipping upload", new_hash[:12])
-        return True
-    try:
-        await relay.upload_loras(pairing.backend_id, manifest)
-    except RelayError as e:
-        if e.status == 404:
-            # Old relay, new plugin: the route simply does not exist. Expected
-            # during a staged rollout — a warning, not an error, and everything
-            # else carries on untouched.
-            log.warning(
-                "relay has no LoRA inventory endpoint (404) — skipping upload; "
-                "trigger words will appear once the relay is updated"
-            )
-            return False
-        log.warning("lora inventory upload failed: %s", e)
-        return True
-    except Exception as e:  # noqa: BLE001 - best-effort
-        log.warning("lora inventory upload failed: %s", e)
-        return True
-    # Only remember the hash after a successful upload, so a failure re-uploads
-    # on the next pass (same rule as object_info_hash).
-    pairing.loras_hash = new_hash
-    STATE.save()
-    log.info("uploaded model inventory (%d LoRA(s), %d checkpoint(s), hash %s)",
-             len(manifest.get("loras") or []),
-             len(manifest.get("checkpoints") or []), new_hash[:12])
-    return True
+        while not _stopped(stop) and STATE.get_pairing(pairing.backend_id) is not None:
+            try:
+                resp = await relay.heartbeat(pairing.backend_id)
+            except RelayError as e:
+                too_old = _as_plugin_too_old(e)
+                if too_old is not None:
+                    if blocked is not None:
+                        blocked.arm(too_old)
+                    log.warning(
+                        "heartbeat refused: plugin too old (min %s) — stopping the "
+                        "heartbeat; this pairing will stop claiming new jobs",
+                        too_old.min_version or "?",
+                    )
+                    return
+                log.debug("heartbeat error: %s", e)
+                resp = None
+            except Exception as e:  # noqa: BLE001 - claim loop handles revoke
+                log.debug("heartbeat error: %s", e)
+                resp = None
+            if resp is not None:
+                # Pure dispatch: starts a task at most, never awaits the work.
+                scan = _maybe_scan_models(relay, pairing, resp, scan)
+                refresh = _maybe_refresh_object_info(
+                    relay, comfy, pairing, resp, refresh)
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+    finally:
+        # Both are this loop's children; when the pairing is torn down (unpair,
+        # reconnect, shutdown) they must go with it rather than linger holding the
+        # build lock and a relay client whose session is closing.
+        for child in (scan, refresh):
+            await _cancel_child(child)
 
 
-async def _loras_loop(relay: RelayClient, pairing,
-                      stop: asyncio.Event | None) -> None:
-    """Background LoRA inventory reporter for one pairing.
-
-    Runs as its OWN task next to the heartbeat, never inline in _register: the
-    first pass may spend minutes hashing tens of GB (in a worker thread — see
-    loras.collect), and registration, heartbeats and job claims must not wait a
-    single millisecond for it.
-
-    Exits immediately outside ComfyUI: without folder_paths there is no
-    inventory to build, and that will not change later in this process, so
-    looping would just burn a wakeup every interval forever.
-    """
-    if not loras.folder_paths_available():
-        log.debug("lora inventory: folder_paths unavailable, not collecting")
+async def _cancel_child(task: Optional[asyncio.Task]) -> None:
+    """Cancel and await a heartbeat-owned background task. Never raises."""
+    if task is None or task.done():
         return
-    while not _stopped(stop) and STATE.get_pairing(pairing.backend_id) is not None:
-        try:
-            supported = await _report_loras(relay, pairing)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001 - the loop itself must never die
-            log.warning("lora inventory: %s", e)
-            supported = True
-        await asyncio.sleep(
-            LORA_REFRESH_INTERVAL if supported else LORA_UNSUPPORTED_RETRY
-        )
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # noqa: BLE001 - already logged inside the task
+        pass
+
+
+# Heartbeat-body fields through which the app asks this machine for a refresh.
+# Same semantics, same code path, one per thing that can be refreshed: the relay
+# replays the timestamp of the user's last press on EVERY beat, and the plugin's
+# persisted watermark turns that into exactly one piece of work.
+LORAS_REQUESTED_KEY = "loras_requested_at"
+OBJECT_INFO_REQUESTED_KEY = "object_info_requested_at"
+
+
+def _requested_at(resp: dict, key: str = LORAS_REQUESTED_KEY) -> float:
+    """A ``*_requested_at`` timestamp from a heartbeat body; 0.0 if unusable.
+
+    BACK-COMPAT, both directions. An older relay has no such field and returns
+    ``{}`` => 0.0 => nothing ever happens, which is exactly how this plugin
+    behaved before the feature existed. A relay that sends something unexpected
+    (null, a string, an object) also degrades to 0.0 rather than raising inside
+    the heartbeat loop. Pure + separately testable.
+    """
+    try:
+        return float(resp.get(key) or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+
+
+def _maybe_scan_models(relay: RelayClient, pairing, resp: dict,
+                       current: Optional[asyncio.Task]) -> Optional[asyncio.Task]:
+    """Start a model-inventory scan iff the app asked for a NEW one.
+
+    ⚠️ SYNCHRONOUS AND INSTANT BY CONSTRUCTION — it is called from inside the
+    heartbeat loop, so it must not await anything. All it does is compare two
+    numbers and possibly hand a coroutine to the event loop; the multi-minute
+    work happens in the returned task (and, inside that, in a worker thread).
+
+    Returns the task to track (the existing one when nothing new is due), which
+    the heartbeat loop keeps so it can both dedupe and tear it down.
+
+    The watermark comparison is what makes this idempotent: the relay replays the
+    same ``loras_requested_at`` on EVERY beat until the plugin reports back, so
+    "greater than what we already served" is the only thing separating one user
+    request from ~140 redeliveries an hour.
+    """
+    requested = _requested_at(resp, LORAS_REQUESTED_KEY)
+    if requested <= 0:
+        return current                      # old relay, or nothing pending
+    if requested <= (pairing.loras_synced_at or 0):
+        return current                      # already served this exact request
+    if current is not None and not current.done():
+        # A scan for an earlier request is still running (a cold first run can
+        # take minutes). Let it finish; its watermark write decides whether this
+        # newer request still needs serving, and the next beat re-offers it.
+        log.debug("model scan already running for backend %s", pairing.backend_id)
+        return current
+    log.info("app requested a model inventory refresh (backend %s)",
+             pairing.backend_id)
+    return asyncio.create_task(_scan_and_report(relay, pairing, requested))
+
+
+async def _scan_and_report(relay: RelayClient, pairing, requested: float) -> None:
+    """Scan the local model folders once and ship the manifest. Never raises.
+
+    Failure semantics are chosen so the user can just press refresh again and so
+    a broken relay cannot turn the heartbeat into a scan loop:
+
+      * collection blew up      → warn, DON'T advance the watermark (retry next beat)
+      * nothing to report       → advance (the request WAS served; a machine with
+                                  no models must not rescan every 25 seconds)
+      * upload failed           → warn, DON'T advance (retry next beat; the second
+                                  scan is warm-cached, so retrying is cheap)
+      * uploaded / unchanged /
+        relay too old (404)     → advance
+    """
+    bid = pairing.backend_id
+    if not loras.folder_paths_available():
+        # Not running inside ComfyUI (or a ComfyUI without folder_paths). This
+        # cannot change later in the process, so serve the request with a shrug
+        # rather than retrying it on every beat forever.
+        log.debug("model scan: folder_paths unavailable, nothing to collect")
+        _remember_scan(pairing, requested)
+        return
+    started = time.monotonic()
+    try:
+        manifest = await loras.collect(_scan_progress(bid))
+    except Exception as e:  # noqa: BLE001 - a scan must never kill the heartbeat
+        log.warning("model scan failed for backend %s: %s", bid, e)
+        return
+    n_loras = len(manifest.get("loras") or [])
+    n_ckpts = len(manifest.get("checkpoints") or [])
+    log.info("model scan finished in %.1fs: %d LoRA(s), %d checkpoint(s)",
+             time.monotonic() - started, n_loras, n_ckpts)
+    if not n_loras and not n_ckpts:
+        # No models installed (or none readable). An empty upload would only
+        # overwrite a previously-good manifest with nothing.
+        _remember_scan(pairing, requested)
+        return
+    try:
+        outcome = await loras.upload_for(relay, pairing, manifest)
+    except Exception as e:  # noqa: BLE001 - best-effort; the app can ask again
+        log.warning("model inventory upload failed for backend %s: %s", bid, e)
+        return
+    log.info("model inventory for backend %s: %s", bid, outcome)
+    _remember_scan(pairing, requested)
+
+
+def _scan_progress(backend_id: str):
+    """A throttled progress logger for build_manifest's per-file callback.
+
+    A cold first scan reads tens of GB and says nothing for minutes; without a
+    heartbeat in the ComfyUI console there is no way to tell hashing from a hang.
+    Logged every _SCAN_LOG_EVERY files so a 500-LoRA library produces a handful
+    of lines, not 500. Called from the SCANNING THREAD — it only formats a log
+    record, which is thread-safe.
+    """
+    def _on_progress(phase: str, done: int, total: int, _name: str) -> None:
+        if total and done and done % _SCAN_LOG_EVERY == 0:
+            log.info("model scan (%s): %d/%d %s", phase, done, total, backend_id)
+
+    return _on_progress
+
+
+def _remember_scan(pairing, requested: float) -> None:
+    """Advance the served-request watermark and persist it.
+
+    Monotonic on purpose (``max``): heartbeats to several accounts interleave and
+    a stale in-flight scan must never drag the watermark backwards and cause the
+    same request to be served twice.
+    """
+    pairing.loras_synced_at = max(pairing.loras_synced_at or 0, requested)
+    STATE.save()
+
+
+# ── object_info refresh (same channel, same rules, different payload) ────────
+#
+# WHY IT EXISTS: object_info was captured once, at register. A user who installs
+# or deletes a model on the PC afterwards keeps seeing the OLD list in the app —
+# so they pick a model that is gone and the generation fails. Re-capturing on the
+# user's request closes that loop (the failure itself is now diagnosed too; see
+# jobs.prompt_rejection).
+#
+# WHY IT IS CHEAP, unlike the LoRA scan: this reads ComfyUI's own node metadata
+# over localhost — no walking the user's model folders, no hashing gigabytes —
+# and the content hash means an unchanged ComfyUI uploads nothing at all.
+
+def _maybe_refresh_object_info(relay: RelayClient, comfy: Optional[ComfyClient],
+                               pairing, resp: dict,
+                               current: Optional[asyncio.Task]) -> Optional[asyncio.Task]:
+    """Start an object_info re-capture iff the app asked for a NEW one.
+
+    ⚠️ SYNCHRONOUS AND INSTANT BY CONSTRUCTION, exactly like _maybe_scan_models:
+    it runs inside the heartbeat loop, so it compares two numbers and at most
+    hands a coroutine to the event loop. Returns the task to track.
+
+    Every guard below is the same one the LoRA refresh uses, for the same
+    reason: no signal (old relay, or nothing pending) => nothing happens, ever;
+    a signal we already served => nothing happens; a re-capture still in flight
+    => let it finish, the next beat re-offers the request.
+    """
+    if comfy is None:
+        return current                      # no ComfyUI client wired up
+    requested = _requested_at(resp, OBJECT_INFO_REQUESTED_KEY)
+    if requested <= 0:
+        return current                      # old relay, or nothing pending
+    if requested <= (pairing.object_info_synced_at or 0):
+        return current                      # already served this exact request
+    if current is not None and not current.done():
+        log.debug("object_info refresh already running for backend %s",
+                  pairing.backend_id)
+        return current
+    log.info("app requested an object_info refresh (backend %s)",
+             pairing.backend_id)
+    return asyncio.create_task(
+        _refresh_object_info(relay, comfy, pairing, requested))
+
+
+async def _refresh_object_info(relay: RelayClient, comfy: ComfyClient,
+                               pairing, requested: float) -> None:
+    """Re-capture and report object_info once. Never raises.
+
+    Watermark rules mirror _scan_and_report:
+
+      * capture or upload failed → warn, DON'T advance (the next beat retries;
+        the usual cause is ComfyUI momentarily unreachable, which fixes itself)
+      * uploaded, or unchanged   → advance (the request WAS served — a machine
+        whose node set didn't change must not re-capture every 25 seconds)
+    """
+    bid = pairing.backend_id
+    try:
+        node_count, uploaded = await _report_object_info(relay, comfy, pairing)
+    except Exception as e:  # noqa: BLE001 - a refresh must never kill the heartbeat
+        log.warning("object_info refresh failed for backend %s: %s", bid, e)
+        return
+    # Only node_count is touched: the panel's state/error belong to the
+    # register + job paths and a background refresh must not overwrite them.
+    STATUS.set(node_count=node_count)
+    log.info("object_info refreshed for backend %s (%d node types, %s)",
+             bid, node_count, "uploaded" if uploaded else "unchanged")
+    pairing.object_info_synced_at = max(
+        pairing.object_info_synced_at or 0, requested)
+    STATE.save()
 
 
 async def _claim_loop(relay: RelayClient, worker: Worker, pairing,

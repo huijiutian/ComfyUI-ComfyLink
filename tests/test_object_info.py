@@ -8,10 +8,15 @@ that wiring on both layers:
     Content-Type application/json.
   * worker._register: on upload failure the backend still goes online (params
     are non-critical) and never crashes.
+  * the APP-INITIATED refresh (heartbeat field ``object_info_requested_at``):
+    the snapshot was historically captured once, at register, so a user who
+    installs or deletes a model afterwards kept seeing a stale model list in the
+    app. The refresh re-captures on request — and ONLY on request.
 
 Run:  python -m unittest discover -s tests
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -20,6 +25,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from comfylink import worker  # noqa: E402
 from comfylink.relay import RelayClient  # noqa: E402
 from comfylink.worker import object_info_hash  # noqa: E402
 
@@ -200,3 +206,394 @@ class TestRegisterSkipLogic(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── the app-initiated refresh (heartbeat body → exactly one re-capture) ──────
+
+class _RefreshPairing:
+    """Minimal Pairing stand-in for the refresh path."""
+
+    def __init__(self, object_info_hash="", object_info_synced_at=0.0):
+        self.backend_id = "b1"
+        self.object_info_hash = object_info_hash
+        self.object_info_synced_at = object_info_synced_at
+        # Present so a stray LoRA-path read would be visible, never used here.
+        self.loras_hash = ""
+        self.loras_synced_at = 0.0
+
+
+class TestObjectInfoRequestedAt(unittest.TestCase):
+    """The signal is read defensively, and the two signals never cross wires."""
+
+    def test_old_relay_body_reads_as_no_request(self):
+        # "New plugin, old relay": no such field => 0.0 => nothing ever happens.
+        for body in ({}, {"other": 1}, None, "nope"):
+            with self.subTest(body=body):
+                self.assertEqual(
+                    worker._requested_at(body, worker.OBJECT_INFO_REQUESTED_KEY), 0.0)
+
+    def test_a_timestamp_is_read(self):
+        self.assertEqual(
+            worker._requested_at({"object_info_requested_at": 1754000000},
+                                 worker.OBJECT_INFO_REQUESTED_KEY), 1754000000.0)
+        self.assertEqual(
+            worker._requested_at({"object_info_requested_at": "1754000000"},
+                                 worker.OBJECT_INFO_REQUESTED_KEY), 1754000000.0)
+
+    def test_junk_degrades_to_zero(self):
+        for junk in (None, "", "soon", {}, [], object()):
+            with self.subTest(junk=junk):
+                self.assertEqual(
+                    worker._requested_at({"object_info_requested_at": junk},
+                                         worker.OBJECT_INFO_REQUESTED_KEY), 0.0)
+
+    def test_the_two_signals_are_independent(self):
+        # A LoRA refresh request must not read as an object_info request (they
+        # cost wildly different amounts and the user pressed a different button).
+        body = {"loras_requested_at": 1754000000}
+        self.assertEqual(worker._requested_at(body, worker.OBJECT_INFO_REQUESTED_KEY),
+                         0.0)
+        self.assertEqual(worker._requested_at({"object_info_requested_at": 5},
+                                              worker.LORAS_REQUESTED_KEY), 0.0)
+
+
+class TestMaybeRefreshObjectInfo(unittest.IsolatedAsyncioTestCase):
+    """⛔ The gate: no signal ⇒ no re-capture. And one signal ⇒ one re-capture."""
+
+    def setUp(self):
+        self.calls = []
+
+    def _fake_refresh(self):
+        async def _refresh(relay, comfy, pairing, requested):
+            self.calls.append(requested)
+            pairing.object_info_synced_at = max(
+                pairing.object_info_synced_at or 0, requested)
+        return _refresh
+
+    def _patched(self):
+        return mock.patch.object(worker, "_refresh_object_info", self._fake_refresh())
+
+    async def _drain(self, task):
+        if task is not None:
+            await task
+
+    async def test_no_signal_means_no_refresh(self):
+        pairing = _RefreshPairing()
+        with self._patched():
+            for body in ({},
+                         {"object_info_requested_at": 0},
+                         {"object_info_requested_at": None},
+                         {"other": 5},
+                         # The LoRA signal must NOT trigger an object_info refresh.
+                         {"loras_requested_at": 1754000000}):
+                with self.subTest(body=body):
+                    self.assertIsNone(worker._maybe_refresh_object_info(
+                        mock.AsyncMock(), mock.AsyncMock(), pairing, body, None))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(pairing.object_info_synced_at, 0.0)
+
+    async def test_no_comfy_client_means_no_refresh(self):
+        pairing = _RefreshPairing()
+        with self._patched():
+            self.assertIsNone(worker._maybe_refresh_object_info(
+                mock.AsyncMock(), None, pairing,
+                {"object_info_requested_at": 1754000000}, None))
+        self.assertEqual(self.calls, [])
+
+    async def test_a_signal_starts_exactly_one_refresh(self):
+        pairing = _RefreshPairing()
+        body = {"object_info_requested_at": 1754000000}
+        with self._patched():
+            task = worker._maybe_refresh_object_info(
+                mock.AsyncMock(), mock.AsyncMock(), pairing, body, None)
+            await self._drain(task)
+            # The relay replays the SAME timestamp on every beat until we report
+            # back; the watermark is what keeps that at one re-capture.
+            for _ in range(4):
+                task = worker._maybe_refresh_object_info(
+                    mock.AsyncMock(), mock.AsyncMock(), pairing, body, task)
+                await self._drain(task)
+        self.assertEqual(self.calls, [1754000000.0])
+
+    async def test_a_newer_request_is_served_again(self):
+        pairing = _RefreshPairing()
+        with self._patched():
+            t = worker._maybe_refresh_object_info(
+                mock.AsyncMock(), mock.AsyncMock(), pairing,
+                {"object_info_requested_at": 100}, None)
+            await self._drain(t)
+            t = worker._maybe_refresh_object_info(
+                mock.AsyncMock(), mock.AsyncMock(), pairing,
+                {"object_info_requested_at": 200}, t)
+            await self._drain(t)
+        self.assertEqual(self.calls, [100.0, 200.0])
+
+    async def test_a_stale_request_is_ignored(self):
+        pairing = _RefreshPairing(object_info_synced_at=500.0)
+        with self._patched():
+            self.assertIsNone(worker._maybe_refresh_object_info(
+                mock.AsyncMock(), mock.AsyncMock(), pairing,
+                {"object_info_requested_at": 499}, None))
+        self.assertEqual(self.calls, [])
+
+    async def test_an_in_flight_refresh_is_not_duplicated(self):
+        pairing = _RefreshPairing()
+        gate = asyncio.Event()
+
+        async def slow(relay, comfy, pr, requested):
+            self.calls.append(requested)
+            await gate.wait()
+
+        with mock.patch.object(worker, "_refresh_object_info", slow):
+            task = worker._maybe_refresh_object_info(
+                mock.AsyncMock(), mock.AsyncMock(), pairing,
+                {"object_info_requested_at": 100}, None)
+            await asyncio.sleep(0)
+            for _ in range(3):
+                same = worker._maybe_refresh_object_info(
+                    mock.AsyncMock(), mock.AsyncMock(), pairing,
+                    {"object_info_requested_at": 100}, task)
+                self.assertIs(same, task)
+            gate.set()
+            await task
+        self.assertEqual(self.calls, [100.0])
+
+    def test_dispatch_is_synchronous(self):
+        # ⚠️ It runs INSIDE the heartbeat loop: if it were awaitable it could
+        # stall the beat and the relay's reaper would take this backend for dead.
+        self.assertFalse(asyncio.iscoroutinefunction(worker._maybe_refresh_object_info))
+
+
+class _Boom(Exception):
+    pass
+
+
+class TestRefreshObjectInfo(unittest.IsolatedAsyncioTestCase):
+    """What one re-capture does — and what it refuses to do on failure."""
+
+    async def test_uploads_and_advances_watermark_when_changed(self):
+        oi = {"A": {}, "B": {}}
+        relay = mock.AsyncMock()
+        comfy = mock.AsyncMock()
+        comfy.object_info.return_value = oi
+        pairing = _RefreshPairing()
+        state = _FakeState()
+        with mock.patch.object(worker, "STATE", state), \
+                mock.patch.object(worker, "STATUS") as status:
+            await worker._refresh_object_info(relay, comfy, pairing, 900.0)
+        relay.upload_object_info.assert_awaited_once_with("b1", oi)
+        self.assertEqual(pairing.object_info_hash, object_info_hash(oi))
+        self.assertEqual(pairing.object_info_synced_at, 900.0)
+        # The panel's node count follows; its state/error do NOT (they belong to
+        # the register and job paths — a background refresh must not clobber them).
+        for call in status.set.call_args_list:
+            self.assertNotIn("state", call.kwargs)
+            self.assertNotIn("error", call.kwargs)
+        self.assertIn(len(oi), [c.kwargs.get("node_count")
+                                for c in status.set.call_args_list])
+
+    async def test_unchanged_uploads_nothing_but_still_serves_the_request(self):
+        oi = {"A": {}}
+        relay = mock.AsyncMock()
+        comfy = mock.AsyncMock()
+        comfy.object_info.return_value = oi
+        pairing = _RefreshPairing(object_info_hash=object_info_hash(oi))
+        with mock.patch.object(worker, "STATE", _FakeState()), \
+                mock.patch.object(worker, "STATUS"):
+            await worker._refresh_object_info(relay, comfy, pairing, 900.0)
+        # Content hash says nothing moved => no multi-MB re-upload...
+        relay.upload_object_info.assert_not_awaited()
+        # ...but the request WAS served, so it must not re-run every 25 seconds.
+        self.assertEqual(pairing.object_info_synced_at, 900.0)
+
+    async def test_capture_failure_leaves_the_watermark_alone(self):
+        relay = mock.AsyncMock()
+        comfy = mock.AsyncMock()
+        comfy.object_info.side_effect = RuntimeError("ComfyUI not reachable")
+        pairing = _RefreshPairing()
+        with mock.patch.object(worker, "STATE", _FakeState()), \
+                mock.patch.object(worker, "STATUS"):
+            await worker._refresh_object_info(relay, comfy, pairing, 900.0)
+        relay.upload_object_info.assert_not_awaited()
+        self.assertEqual(pairing.object_info_synced_at, 0.0)   # next beat retries
+
+    async def test_upload_failure_leaves_watermark_and_hash_alone(self):
+        relay = mock.AsyncMock()
+        relay.upload_object_info.side_effect = RuntimeError("R2 unconfigured")
+        comfy = mock.AsyncMock()
+        comfy.object_info.return_value = {"A": {}}
+        pairing = _RefreshPairing()
+        with mock.patch.object(worker, "STATE", _FakeState()), \
+                mock.patch.object(worker, "STATUS"):
+            await worker._refresh_object_info(relay, comfy, pairing, 900.0)
+        self.assertEqual(pairing.object_info_hash, "")
+        self.assertEqual(pairing.object_info_synced_at, 0.0)
+
+    async def test_never_raises(self):
+        # It runs as a bare task off the heartbeat loop; an escaping exception
+        # would surface as an unhandled task error, never as a fixed problem.
+        relay = mock.AsyncMock()
+        comfy = mock.AsyncMock()
+        comfy.object_info.side_effect = _Boom("weird")
+        with mock.patch.object(worker, "STATE", _FakeState()), \
+                mock.patch.object(worker, "STATUS"):
+            await worker._refresh_object_info(relay, comfy, _RefreshPairing(), 1.0)
+
+
+class TestRefreshNeverBlocksTheBeat(unittest.IsolatedAsyncioTestCase):
+    async def test_heartbeat_keeps_beating_while_a_refresh_hangs(self):
+        relay = mock.AsyncMock()
+        relay.heartbeat.return_value = {"object_info_requested_at": 100}
+        pairing = _RefreshPairing()
+        started = asyncio.Event()
+
+        async def stuck(*_a, **_kw):
+            started.set()
+            await asyncio.Event().wait()          # never finishes
+
+        state = _FakeState()
+        state.get_pairing = lambda bid: pairing
+        with mock.patch.object(worker, "STATE", state), \
+                mock.patch.object(worker, "HEARTBEAT_INTERVAL", 0.001), \
+                mock.patch.object(worker, "_refresh_object_info", stuck):
+            hb = asyncio.create_task(worker._heartbeat_loop(
+                relay, pairing, None, None, mock.AsyncMock()))
+            await asyncio.wait_for(started.wait(), 2)
+            await asyncio.sleep(0.05)
+            beats = relay.heartbeat.await_count
+            await asyncio.sleep(0.05)
+            self.assertGreater(relay.heartbeat.await_count, beats)
+            hb.cancel()
+            try:
+                await hb
+            except asyncio.CancelledError:
+                pass
+        # Teardown takes the child with it — no task left holding a closing session.
+        await asyncio.sleep(0)
+
+
+class TestWatermarkPersistence(unittest.TestCase):
+    """The watermark must survive a ComfyUI restart, and tolerate old files."""
+
+    def test_round_trips_through_the_state_file(self):
+        import tempfile
+        from pathlib import Path
+
+        from comfylink import config
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "comfylink_state.json"
+            with mock.patch.object(config, "_state_path", lambda: path):
+                st = config.State()
+                pr = st.add_pairing("tok", "dev1")
+                pr.object_info_synced_at = 1754000000.0
+                st.save()
+                again = config.State.load()
+            self.assertEqual(again.pairings[0].object_info_synced_at, 1754000000.0)
+
+    def test_a_state_file_without_the_field_loads_as_never_served(self):
+        import tempfile
+        from pathlib import Path
+
+        from comfylink import config
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "comfylink_state.json"
+            path.write_text(json.dumps({
+                "backend_name": "dev",
+                "pairings": [{"backend_id": "b1", "device_token": "t"}],
+            }), "utf-8")
+            with mock.patch.object(config, "_state_path", lambda: path):
+                st = config.State.load()
+        self.assertEqual(st.pairings[0].object_info_synced_at, 0.0)
+
+
+class TestTheTwoWatermarksAreIndependent(unittest.IsolatedAsyncioTestCase):
+    """⛔ ONE watermark for both signals would be a silent, unreproducible bug.
+
+    The relay replays BOTH timestamps in every beat. If the plugin remembered a
+    single "handled up to" value, serving the LoRA request would push that value
+    past an object_info request the user made earlier — and their "refresh model
+    list" press would simply never do anything, with no error anywhere. It only
+    misfires once BOTH buttons have been pressed, which is exactly the kind of
+    thing that never shows up in a manual smoke test.
+
+    Hence two fields on the pairing: `loras_synced_at` and
+    `object_info_synced_at`. These tests fail if they are ever merged.
+    """
+
+    def setUp(self):
+        self.scans = []
+        self.refreshes = []
+
+    def _patched(self):
+        async def _scan(relay, pairing, requested):
+            self.scans.append(requested)
+            pairing.loras_synced_at = max(pairing.loras_synced_at or 0, requested)
+
+        async def _refresh(relay, comfy, pairing, requested):
+            self.refreshes.append(requested)
+            pairing.object_info_synced_at = max(
+                pairing.object_info_synced_at or 0, requested)
+
+        return (mock.patch.object(worker, "_scan_and_report", _scan),
+                mock.patch.object(worker, "_refresh_object_info", _refresh))
+
+    async def _beat(self, pairing, body, scan=None, refresh=None):
+        scan = worker._maybe_scan_models(mock.AsyncMock(), pairing, body, scan)
+        refresh = worker._maybe_refresh_object_info(
+            mock.AsyncMock(), mock.AsyncMock(), pairing, body, refresh)
+        for t in (scan, refresh):
+            if t is not None:
+                await t
+        return scan, refresh
+
+    async def test_serving_the_lora_request_does_not_bury_the_other(self):
+        pairing = _RefreshPairing()
+        p1, p2 = self._patched()
+        with p1, p2:
+            # Beat 1: only the LoRA button has been pressed.
+            s, r = await self._beat(pairing, {"ok": True,
+                                              "loras_requested_at": 100,
+                                              "object_info_requested_at": 0})
+            self.assertEqual(self.scans, [100.0])
+            self.assertEqual(self.refreshes, [])
+            # Beat 2: the user now presses "refresh model list" too. Its
+            # timestamp is OLDER than the LoRA one that was already served — a
+            # shared watermark would swallow it here.
+            await self._beat(pairing, {"ok": True,
+                                       "loras_requested_at": 100,
+                                       "object_info_requested_at": 50}, s, r)
+        self.assertEqual(self.scans, [100.0])          # not scanned twice
+        self.assertEqual(self.refreshes, [50.0])       # ...and still refreshed
+
+    async def test_serving_the_object_info_request_does_not_bury_the_other(self):
+        pairing = _RefreshPairing()
+        p1, p2 = self._patched()
+        with p1, p2:
+            s, r = await self._beat(pairing, {"ok": True,
+                                              "loras_requested_at": 0,
+                                              "object_info_requested_at": 100})
+            self.assertEqual(self.refreshes, [100.0])
+            self.assertEqual(self.scans, [])
+            await self._beat(pairing, {"ok": True,
+                                       "loras_requested_at": 50,
+                                       "object_info_requested_at": 100}, s, r)
+        self.assertEqual(self.refreshes, [100.0])
+        self.assertEqual(self.scans, [50.0])
+
+    async def test_the_idle_relay_body_does_nothing_at_all(self):
+        # The relay always serializes both fields; 0 means "nothing pending",
+        # and that is what ~140 beats an hour look like.
+        pairing = _RefreshPairing()
+        p1, p2 = self._patched()
+        with p1, p2:
+            for _ in range(5):
+                s, r = await self._beat(pairing, {"ok": True,
+                                                  "loras_requested_at": 0,
+                                                  "object_info_requested_at": 0})
+                self.assertIsNone(s)
+                self.assertIsNone(r)
+        self.assertEqual((self.scans, self.refreshes), ([], []))
+        self.assertEqual(pairing.loras_synced_at, 0.0)
+        self.assertEqual(pairing.object_info_synced_at, 0.0)

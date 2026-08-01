@@ -267,12 +267,23 @@ class RelayClient:
         d = await self._json("POST", "/v1/backends/workflows/sign-put", body)
         return d["key"], d["url"]
 
-    async def heartbeat(self, backend_id: str) -> None:
-        # Re-sent every beat so a `git pull` + ComfyUI restart refreshes the
-        # version the relay/app sees without waiting for a re-register.
-        await self._json("POST", "/v1/backends/heartbeat",
-                         {"backend_id": backend_id,
-                          "version": __version__, "commit": __commit__})
+    async def heartbeat(self, backend_id: str) -> dict:
+        """Mark this backend alive. Returns the relay's response body.
+
+        The body is the plugin's ONLY inbound channel while idle, so it doubles
+        as the relay's way to ask for something. Today that is
+        ``loras_requested_at`` (worker._maybe_scan_models) and
+        ``object_info_requested_at`` (worker._maybe_refresh_object_info) — both
+        are "the user pressed refresh in the app at this timestamp". An older
+        relay returns ``{}`` and the caller simply finds nothing to do, so
+        reading the body is always safe.
+
+        Version/commit go out on every beat so a `git pull` + ComfyUI restart
+        refreshes what the relay/app see without waiting for a re-register.
+        """
+        return await self._json("POST", "/v1/backends/heartbeat",
+                                {"backend_id": backend_id,
+                                 "version": __version__, "commit": __commit__})
 
     async def abandon_jobs(self, backend_id: str) -> int:
         """Fail every still-claimed/running job left on this backend.

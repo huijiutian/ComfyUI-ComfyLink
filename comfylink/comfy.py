@@ -12,6 +12,25 @@ from __future__ import annotations
 
 import aiohttp
 
+from .jobs import prompt_rejection
+from .log import log
+
+
+class PromptRejected(RuntimeError):
+    """ComfyUI refused to accept the prompt (non-200 from /prompt).
+
+    ``error_code`` carries the machine-readable diagnosis when the rejection
+    body was structured enough to produce one (today: ``model_not_found``); it
+    is "" for every other rejection, which keeps this exception's meaning
+    identical to the plain RuntimeError it replaced. The worker turns it into a
+    JobFailed so the code reaches the relay result and, from there, the app.
+    """
+
+    def __init__(self, message: str, error_code: str = ""):
+        super().__init__(message)
+        self.message = message
+        self.error_code = error_code
+
 
 class ComfyClient:
     def __init__(self, session: aiohttp.ClientSession, base_url: str):
@@ -27,7 +46,14 @@ class ComfyClient:
         body = {"prompt": prompt, "client_id": client_id}
         async with self._session.post(self._base + "/prompt", json=body) as r:
             if r.status != 200:
-                raise RuntimeError(f"/prompt {r.status}: {await r.text()}")
+                # ComfyUI's rejection body is structured — parse the diagnosis
+                # out of it instead of handing the user the raw JSON (which,
+                # for a model mismatch, embeds the whole candidate list). The
+                # FULL body is logged so nothing is lost for debugging.
+                raw = await r.text()
+                message, code = prompt_rejection(r.status, raw)
+                log.warning("/prompt rejected (%s): %s", r.status, raw)
+                raise PromptRejected(message, code)
             data = await r.json()
         pid = data.get("prompt_id")
         if not pid:

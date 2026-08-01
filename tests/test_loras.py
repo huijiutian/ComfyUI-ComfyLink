@@ -34,8 +34,9 @@ import os
 import struct
 import sys
 import tempfile
+import time
 import unittest
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -92,6 +93,10 @@ def _write_safetensors(path: str, metadata: dict, tail: bytes = b"") -> int:
     return len(blob)
 
 
+class _Boom(Exception):
+    """Throwaway failure for "this must never raise" tests."""
+
+
 class _RecordingReader:
     """File-like that remembers every read size (to prove we stop after the header)."""
 
@@ -102,12 +107,6 @@ class _RecordingReader:
     def read(self, n: int = -1) -> bytes:
         self.reads.append(n)
         return self._buf.read(n)
-
-
-def _reset_collect_cache() -> None:
-    """Drop loras.collect's process-wide TTL cache between tests."""
-    loras._cached = None
-    loras._cached_at = 0.0
 
 
 # ── ⚠️ the name key ───────────────────────────────────────────────────────────
@@ -388,17 +387,16 @@ class TestManifestShape(unittest.TestCase):
 
 class TestCollectOffThread(unittest.IsolatedAsyncioTestCase):
     async def test_build_runs_in_a_thread_and_persists_the_cache(self):
-        _reset_collect_cache()
         state = mock.Mock()
         state.lora_hashes = {}
 
         seen_threads = []
         real_build = loras.build_manifest
 
-        def spy_build(cache, hasher=loras.file_sha256):
+        def spy_build(cache, hasher=loras.file_sha256, on_progress=None):
             import threading
             seen_threads.append(threading.current_thread().name)
-            return real_build(cache, hasher=hasher)
+            return real_build(cache, hasher=hasher, on_progress=on_progress)
 
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "a.safetensors")
@@ -410,32 +408,67 @@ class TestCollectOffThread(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(m["count"], 1)
         # The hashing pass must NOT run on the event loop thread — a cold run is
-        # tens of GB of reads and would stall heartbeats and cancel long-polls.
+        # tens of GB of reads and would stall the heartbeat, the cancel long-poll
+        # and the claim loop, which all share that loop.
         import threading
         self.assertNotIn(threading.current_thread().name, seen_threads)
         # New digests were persisted for the next process start.
         self.assertTrue(state.lora_hashes)
         state.save.assert_called()
-        _reset_collect_cache()
 
-    async def test_second_caller_reuses_the_build(self):
-        # Several pairings on one machine must not each hash the same files.
-        _reset_collect_cache()
+    async def test_progress_callback_reaches_the_caller(self):
+        # The scan is the only multi-minute thing this plugin does; without
+        # per-file progress there is no way to tell hashing from a hang.
         state = mock.Mock()
         state.lora_hashes = {}
-        builds = []
+        seen = []
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.safetensors")
+            _write_safetensors(p, {})
+            with _folder_paths({"a.safetensors": p}), \
+                    mock.patch("comfylink.config.STATE", state):
+                await loras.collect(lambda *a: seen.append(a))
+        phases = {a[0] for a in seen}
+        self.assertIn("loras", phases)
+        self.assertIn("checkpoints", phases)
+        self.assertIn(("loras", 0, 1, "a.safetensors"), seen)
 
-        def spy_build(cache, hasher=loras.file_sha256):
-            builds.append(1)
-            return {"schema": 1, "generated_at": 0, "count": 0,
-                    "truncated": False, "loras": []}, {}
+    async def test_a_raising_progress_callback_cannot_break_the_scan(self):
+        state = mock.Mock()
+        state.lora_hashes = {}
+
+        def boom(*_a):
+            raise RuntimeError("display blew up")
+
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.safetensors")
+            _write_safetensors(p, {})
+            with _folder_paths({"a.safetensors": p}), \
+                    mock.patch("comfylink.config.STATE", state):
+                m = await loras.collect(boom)
+        self.assertEqual(m["count"], 1)
+
+    async def test_concurrent_collects_are_serialised(self):
+        # A machine paired to several accounts gets one request per account.
+        # Hashing tens of GB once per account would be absurd, so builds must
+        # never overlap; the second one finds a warm cache and is cheap.
+        state = mock.Mock()
+        state.lora_hashes = {}
+        overlap = {"now": 0, "max": 0}
+
+        def spy_build(cache, hasher=loras.file_sha256, on_progress=None):
+            overlap["now"] += 1
+            overlap["max"] = max(overlap["max"], overlap["now"])
+            time.sleep(0.02)  # real thread work, so an overlap would be visible
+            overlap["now"] -= 1
+            return {"schema": 2, "generated_at": 0, "count": 0, "truncated": False,
+                    "loras": [], "checkpoints": [], "checkpoints_count": 0,
+                    "checkpoints_truncated": False}, {}
 
         with mock.patch.object(loras, "build_manifest", spy_build), \
                 mock.patch("comfylink.config.STATE", state):
-            await loras.collect()
-            await loras.collect()
-        self.assertEqual(len(builds), 1, "a second pairing reuses the fresh build")
-        _reset_collect_cache()
+            await asyncio.gather(loras.collect(), loras.collect())
+        self.assertEqual(overlap["max"], 1, "builds must not run concurrently")
 
 
 # ── checkpoints (schema 2): header-only, NEVER hashed ─────────────────────────
@@ -636,9 +669,11 @@ class TestCheckpointFailuresDoNotCostTheLoras(unittest.TestCase):
 # ── worker wiring: never fatal, never blocking ────────────────────────────────
 
 class _FakePairing:
-    def __init__(self, backend_id="b1", loras_hash=""):
+    def __init__(self, backend_id="b1", loras_hash="", loras_synced_at=0.0):
         self.backend_id = backend_id
         self.loras_hash = loras_hash
+        # Watermark of the last app refresh request this pairing has served.
+        self.loras_synced_at = loras_synced_at
         self.account = ""
 
 
@@ -675,15 +710,16 @@ _MANIFEST_CKPT_ONLY = {"schema": 2, "generated_at": 1, "count": 0,
                        "checkpoints_count": 1, "checkpoints_truncated": False}
 
 
-class TestReportLoras(unittest.IsolatedAsyncioTestCase):
+class TestUploadFor(unittest.IsolatedAsyncioTestCase):
+    """loras.upload_for — one pairing's half of a scan."""
+
     async def test_uploads_and_remembers_the_hash(self):
         relay = mock.AsyncMock()
         pairing = _FakePairing()
         state = _FakeState([pairing])
-        with mock.patch.object(worker.loras, "collect",
-                               mock.AsyncMock(return_value=_MANIFEST)), \
-                mock.patch.object(worker, "STATE", state):
-            self.assertTrue(await worker._report_loras(relay, pairing))
+        with mock.patch("comfylink.config.STATE", state):
+            self.assertEqual(await loras.upload_for(relay, pairing, _MANIFEST),
+                             "uploaded")
         relay.upload_loras.assert_awaited_once_with("b1", _MANIFEST)
         self.assertEqual(pairing.loras_hash, loras.manifest_hash(_MANIFEST))
         self.assertEqual(state.save_calls, 1)
@@ -692,156 +728,365 @@ class TestReportLoras(unittest.IsolatedAsyncioTestCase):
         relay = mock.AsyncMock()
         pairing = _FakePairing(loras_hash=loras.manifest_hash(_MANIFEST))
         state = _FakeState([pairing])
-        with mock.patch.object(worker.loras, "collect",
-                               mock.AsyncMock(return_value=_MANIFEST)), \
-                mock.patch.object(worker, "STATE", state):
-            await worker._report_loras(relay, pairing)
+        with mock.patch("comfylink.config.STATE", state):
+            self.assertEqual(await loras.upload_for(relay, pairing, _MANIFEST),
+                             "unchanged")
         relay.upload_loras.assert_not_awaited()
         self.assertEqual(state.save_calls, 0)
-
-    async def test_old_relay_404_is_a_warning_only(self):
-        # BACK-COMPAT: new plugin, relay without the endpoint. Must not raise,
-        # must not persist a hash, and must tell the caller to back off.
-        relay = mock.AsyncMock()
-        relay.upload_loras.side_effect = worker.RelayError("not found", 404)
-        pairing = _FakePairing()
-        state = _FakeState([pairing])
-        with mock.patch.object(worker.loras, "collect",
-                               mock.AsyncMock(return_value=_MANIFEST)), \
-                mock.patch.object(worker, "STATE", state):
-            supported = await worker._report_loras(relay, pairing)
-        self.assertFalse(supported)
-        self.assertEqual(pairing.loras_hash, "")
-        self.assertEqual(state.save_calls, 0)
-
-    async def test_upload_failure_keeps_the_hash_unset_for_a_retry(self):
-        relay = mock.AsyncMock()
-        relay.upload_loras.side_effect = worker.RelayError("R2 unconfigured", 503)
-        pairing = _FakePairing()
-        state = _FakeState([pairing])
-        with mock.patch.object(worker.loras, "collect",
-                               mock.AsyncMock(return_value=_MANIFEST)), \
-                mock.patch.object(worker, "STATE", state):
-            self.assertTrue(await worker._report_loras(relay, pairing))
-        self.assertEqual(pairing.loras_hash, "")
-        self.assertEqual(state.save_calls, 0)
-
-    async def test_collection_failure_is_swallowed(self):
-        relay = mock.AsyncMock()
-        pairing = _FakePairing()
-        with mock.patch.object(worker.loras, "collect",
-                               mock.AsyncMock(side_effect=OSError("disk on fire"))), \
-                mock.patch.object(worker, "STATE", _FakeState([pairing])):
-            await worker._report_loras(relay, pairing)  # must not raise
-        relay.upload_loras.assert_not_awaited()
-
-    async def test_empty_inventory_uploads_nothing(self):
-        relay = mock.AsyncMock()
-        pairing = _FakePairing()
-        empty = {"schema": 2, "generated_at": 1, "count": 0, "truncated": False,
-                 "loras": [], "checkpoints": [], "checkpoints_count": 0,
-                 "checkpoints_truncated": False}
-        with mock.patch.object(worker.loras, "collect",
-                               mock.AsyncMock(return_value=empty)), \
-                mock.patch.object(worker, "STATE", _FakeState([pairing])):
-            await worker._report_loras(relay, pairing)
-        relay.upload_loras.assert_not_awaited()
 
     async def test_checkpoints_only_machine_still_uploads(self):
         relay = mock.AsyncMock()
         pairing = _FakePairing()
-        state = _FakeState([pairing])
-        with mock.patch.object(worker.loras, "collect",
-                               mock.AsyncMock(return_value=_MANIFEST_CKPT_ONLY)), \
-                mock.patch.object(worker, "STATE", state):
-            await worker._report_loras(relay, pairing)
+        with mock.patch("comfylink.config.STATE", _FakeState([pairing])):
+            self.assertEqual(
+                await loras.upload_for(relay, pairing, _MANIFEST_CKPT_ONLY),
+                "uploaded")
         relay.upload_loras.assert_awaited_once_with("b1", _MANIFEST_CKPT_ONLY)
-        self.assertEqual(pairing.loras_hash,
-                         loras.manifest_hash(_MANIFEST_CKPT_ONLY))
 
-    async def test_never_touches_status(self):
-        # The panel must not show an error because a nice-to-have failed.
+    async def test_old_relay_404_is_reported_not_raised(self):
+        # BACK-COMPAT: new plugin, relay without the endpoint. No exception, no
+        # stored hash (so a later relay upgrade still uploads).
         relay = mock.AsyncMock()
-        relay.upload_loras.side_effect = RuntimeError("boom")
-        pairing = _FakePairing()
-        with mock.patch.object(worker.loras, "collect",
-                               mock.AsyncMock(return_value=_MANIFEST)), \
-                mock.patch.object(worker, "STATE", _FakeState([pairing])), \
-                mock.patch.object(worker, "STATUS") as status:
-            await worker._report_loras(relay, pairing)
-        status.set.assert_not_called()
-
-
-class TestLorasLoop(unittest.IsolatedAsyncioTestCase):
-    async def test_exits_immediately_without_folder_paths(self):
-        # Outside ComfyUI there is no inventory and never will be in this
-        # process — the loop must return, not spin on a timer forever.
-        sys.modules.pop("folder_paths", None)
-        relay = mock.AsyncMock()
-        with mock.patch.object(worker, "_report_loras", mock.AsyncMock()) as rep:
-            await asyncio.wait_for(
-                worker._loras_loop(relay, _FakePairing(), None), 1)
-        rep.assert_not_awaited()
-
-    async def test_backs_off_hard_once_the_relay_says_404(self):
+        relay.upload_loras.side_effect = worker.RelayError("not found", 404)
         pairing = _FakePairing()
         state = _FakeState([pairing])
-        sleeps = []
+        with mock.patch("comfylink.config.STATE", state):
+            self.assertEqual(await loras.upload_for(relay, pairing, _MANIFEST),
+                             "unsupported")
+        self.assertEqual(pairing.loras_hash, "")
+        self.assertEqual(state.save_calls, 0)
 
-        async def fake_sleep(sec):
-            sleeps.append(sec)
-            raise asyncio.CancelledError()  # end the loop after one pass
-
-        with _folder_paths({}), \
-                mock.patch.object(worker, "_report_loras",
-                                  mock.AsyncMock(return_value=False)), \
-                mock.patch.object(worker, "STATE", state), \
-                mock.patch.object(worker.asyncio, "sleep", fake_sleep):
-            with self.assertRaises(asyncio.CancelledError):
-                await worker._loras_loop(mock.AsyncMock(), pairing, None)
-        self.assertEqual(sleeps, [worker.LORA_UNSUPPORTED_RETRY])
-
-    async def test_a_raising_report_does_not_kill_the_loop(self):
+    async def test_other_relay_errors_propagate(self):
+        # A real failure must reach the caller, which decides not to advance the
+        # watermark so the next beat retries.
+        relay = mock.AsyncMock()
+        relay.upload_loras.side_effect = worker.RelayError("R2 unconfigured", 503)
         pairing = _FakePairing()
         state = _FakeState([pairing])
-        sleeps = []
-
-        async def fake_sleep(sec):
-            sleeps.append(sec)
-            raise asyncio.CancelledError()
-
-        with _folder_paths({}), \
-                mock.patch.object(worker, "_report_loras",
-                                  mock.AsyncMock(side_effect=RuntimeError("boom"))), \
-                mock.patch.object(worker, "STATE", state), \
-                mock.patch.object(worker.asyncio, "sleep", fake_sleep):
-            with self.assertRaises(asyncio.CancelledError):
-                await worker._loras_loop(mock.AsyncMock(), pairing, None)
-        # Swallowed, and the loop went on to its normal wait.
-        self.assertEqual(sleeps, [worker.LORA_REFRESH_INTERVAL])
+        with mock.patch("comfylink.config.STATE", state):
+            with self.assertRaises(worker.RelayError):
+                await loras.upload_for(relay, pairing, _MANIFEST)
+        self.assertEqual(pairing.loras_hash, "")
+        self.assertEqual(state.save_calls, 0)
 
 
-class TestInventoryNeverBlocksTheWorker(unittest.IsolatedAsyncioTestCase):
-    """⚠️ The hard requirement: pairing/register/heartbeat/claim never wait on it."""
+# ── the app-initiated signal (heartbeat body → exactly one scan) ─────────────
 
-    async def test_claim_loop_runs_even_when_collection_explodes(self):
+class TestRequestedAt(unittest.TestCase):
+    """_requested_at — back-compat and junk tolerance, in one pure function."""
+
+    def test_old_relay_body_reads_as_no_request(self):
+        # The whole back-compat story for "new plugin, old relay": no field,
+        # nothing happens, no error.
+        self.assertEqual(worker._requested_at({}), 0.0)
+        self.assertEqual(worker._requested_at({"other": 1}), 0.0)
+
+    def test_a_timestamp_is_read(self):
+        self.assertEqual(worker._requested_at({"loras_requested_at": 1753900000}),
+                         1753900000.0)
+        self.assertEqual(worker._requested_at({"loras_requested_at": "1753900000"}),
+                         1753900000.0)
+
+    def test_junk_degrades_to_zero(self):
+        for junk in (None, "", "soon", {}, [], object()):
+            with self.subTest(junk=junk):
+                self.assertEqual(worker._requested_at({"loras_requested_at": junk}),
+                                 0.0)
+
+    def test_non_dict_body_degrades_to_zero(self):
+        self.assertEqual(worker._requested_at(None), 0.0)
+        self.assertEqual(worker._requested_at("nope"), 0.0)
+
+
+class TestMaybeScanModels(unittest.IsolatedAsyncioTestCase):
+    """⛔ The consent gate: no signal ⇒ no scan. And one signal ⇒ one scan."""
+
+    def setUp(self):
+        self.calls = []
+
+    def _fake_scan(self, state):
+        async def _scan(relay, pairing, requested):
+            self.calls.append(requested)
+            worker._remember_scan(pairing, requested)
+        return _scan
+
+    async def _drain(self, task):
+        if task is not None:
+            await task
+
+    async def test_no_signal_means_no_scan(self):
+        pairing = _FakePairing()
+        state = _FakeState([pairing])
+        with mock.patch.object(worker, "STATE", state), \
+                mock.patch.object(worker, "_scan_and_report", self._fake_scan(state)):
+            for body in ({}, {"loras_requested_at": 0}, {"other": 5}):
+                self.assertIsNone(worker._maybe_scan_models(
+                    mock.AsyncMock(), pairing, body, None))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(pairing.loras_synced_at, 0.0)
+
+    async def test_a_signal_starts_exactly_one_scan(self):
+        pairing = _FakePairing()
+        state = _FakeState([pairing])
+        body = {"loras_requested_at": 1753900000}
+        with mock.patch.object(worker, "STATE", state), \
+                mock.patch.object(worker, "_scan_and_report", self._fake_scan(state)):
+            task = worker._maybe_scan_models(mock.AsyncMock(), pairing, body, None)
+            await self._drain(task)
+        self.assertEqual(self.calls, [1753900000.0])
+        self.assertEqual(pairing.loras_synced_at, 1753900000.0)
+
+    async def test_the_same_timestamp_redelivered_scans_only_once(self):
+        # ⚠️ IDEMPOTENCE. The relay replays the same value on EVERY ~25s beat
+        # until we report back — roughly 140 redeliveries an hour. The watermark
+        # is the only thing between that and 140 full rescans.
+        pairing = _FakePairing()
+        state = _FakeState([pairing])
+        body = {"loras_requested_at": 1753900000}
+        with mock.patch.object(worker, "STATE", state), \
+                mock.patch.object(worker, "_scan_and_report", self._fake_scan(state)):
+            task = None
+            for _ in range(10):
+                task = worker._maybe_scan_models(mock.AsyncMock(), pairing, body, task)
+                await self._drain(task)
+        self.assertEqual(self.calls, [1753900000.0], "one request ⇒ one scan")
+
+    async def test_a_newer_timestamp_scans_again(self):
+        pairing = _FakePairing()
+        state = _FakeState([pairing])
+        with mock.patch.object(worker, "STATE", state), \
+                mock.patch.object(worker, "_scan_and_report", self._fake_scan(state)):
+            t = worker._maybe_scan_models(
+                mock.AsyncMock(), pairing, {"loras_requested_at": 100}, None)
+            await self._drain(t)
+            t = worker._maybe_scan_models(
+                mock.AsyncMock(), pairing, {"loras_requested_at": 200}, t)
+            await self._drain(t)
+        self.assertEqual(self.calls, [100.0, 200.0])
+
+    async def test_an_older_timestamp_is_ignored(self):
+        # Clock skew / a relay rollback must not re-trigger an already-served
+        # request, and must not drag the watermark backwards.
+        pairing = _FakePairing(loras_synced_at=500.0)
+        state = _FakeState([pairing])
+        with mock.patch.object(worker, "STATE", state), \
+                mock.patch.object(worker, "_scan_and_report", self._fake_scan(state)):
+            self.assertIsNone(worker._maybe_scan_models(
+                mock.AsyncMock(), pairing, {"loras_requested_at": 499}, None))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(pairing.loras_synced_at, 500.0)
+
+    async def test_a_running_scan_is_never_duplicated(self):
+        # A cold first scan takes minutes, spanning many beats. Those beats must
+        # not each pile on another scan of the same folders.
+        pairing = _FakePairing()
+        state = _FakeState([pairing])
+        release = asyncio.Event()
+        started = []
+
+        async def slow_scan(relay, pairing_, requested):
+            started.append(requested)
+            await release.wait()
+
+        with mock.patch.object(worker, "STATE", state), \
+                mock.patch.object(worker, "_scan_and_report", slow_scan):
+            task = worker._maybe_scan_models(
+                mock.AsyncMock(), pairing, {"loras_requested_at": 100}, None)
+            await asyncio.sleep(0)
+            for _ in range(5):
+                same = worker._maybe_scan_models(
+                    mock.AsyncMock(), pairing, {"loras_requested_at": 100}, task)
+                self.assertIs(same, task, "must return the in-flight task, not a new one")
+            release.set()
+            await task
+        self.assertEqual(started, [100.0])
+
+    def test_dispatch_is_synchronous(self):
+        # It runs INSIDE the heartbeat loop, so it must be a plain function that
+        # cannot await anything — the type system is the guard here.
+        self.assertFalse(asyncio.iscoroutinefunction(worker._maybe_scan_models))
+
+
+class TestScanAndReport(unittest.IsolatedAsyncioTestCase):
+    """Watermark discipline: advance only when the request was actually served."""
+
+    async def _run(self, state, pairing, collect, upload=None):
+        """Drive one scan with the collaborators stubbed. requested = 900.0."""
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(worker, "STATE", state))
+            stack.enter_context(mock.patch.object(worker.loras, "collect", collect))
+            stack.enter_context(mock.patch.object(
+                worker.loras, "folder_paths_available", lambda: True))
+            if upload is not None:
+                stack.enter_context(
+                    mock.patch.object(worker.loras, "upload_for", upload))
+            await worker._scan_and_report(mock.AsyncMock(), pairing, 900.0)
+
+    async def test_success_advances_the_watermark(self):
+        pairing = _FakePairing()
+        state = _FakeState([pairing])
+        await self._run(state, pairing,
+                        mock.AsyncMock(return_value=_MANIFEST),
+                        mock.AsyncMock(return_value="uploaded"))
+        self.assertEqual(pairing.loras_synced_at, 900.0)
+
+    async def test_collection_failure_does_not_advance(self):
+        # The user pressed refresh and got nothing; the next beat must retry.
+        pairing = _FakePairing()
+        state = _FakeState([pairing])
+        await self._run(state, pairing,
+                        mock.AsyncMock(side_effect=OSError("disk on fire")))
+        self.assertEqual(pairing.loras_synced_at, 0.0)
+
+    async def test_upload_failure_does_not_advance(self):
+        pairing = _FakePairing()
+        state = _FakeState([pairing])
+        await self._run(state, pairing,
+                        mock.AsyncMock(return_value=_MANIFEST),
+                        mock.AsyncMock(side_effect=RuntimeError("relay down")))
+        self.assertEqual(pairing.loras_synced_at, 0.0)
+        self.assertEqual(pairing.loras_hash, "")
+
+    async def test_old_relay_404_advances(self):
+        # Nothing more we can do for this request; retrying it every 25s forever
+        # would be pure noise.
+        pairing = _FakePairing()
+        state = _FakeState([pairing])
+        await self._run(state, pairing,
+                        mock.AsyncMock(return_value=_MANIFEST),
+                        mock.AsyncMock(return_value="unsupported"))
+        self.assertEqual(pairing.loras_synced_at, 900.0)
+
+    async def test_empty_inventory_advances_without_uploading(self):
+        empty = {"schema": 2, "generated_at": 1, "count": 0, "truncated": False,
+                 "loras": [], "checkpoints": [], "checkpoints_count": 0,
+                 "checkpoints_truncated": False}
+        pairing = _FakePairing()
+        state = _FakeState([pairing])
+        upload = mock.AsyncMock()
+        await self._run(state, pairing, mock.AsyncMock(return_value=empty), upload)
+        upload.assert_not_awaited()
+        self.assertEqual(pairing.loras_synced_at, 900.0)
+
+    async def test_outside_comfyui_serves_the_request_and_gives_up(self):
+        pairing = _FakePairing()
+        state = _FakeState([pairing])
+        collect = mock.AsyncMock()
+        with mock.patch.object(worker, "STATE", state), \
+                mock.patch.object(worker.loras, "collect", collect), \
+                mock.patch.object(worker.loras, "folder_paths_available",
+                                  lambda: False):
+            await worker._scan_and_report(mock.AsyncMock(), pairing, 900.0)
+        collect.assert_not_awaited()
+        # folder_paths cannot appear later in this process, so retrying forever
+        # would be pointless — the request is served with a shrug.
+        self.assertEqual(pairing.loras_synced_at, 900.0)
+
+    async def test_never_raises(self):
+        pairing = _FakePairing()
+        state = _FakeState([pairing])
+        with mock.patch.object(worker, "STATE", state), \
+                mock.patch.object(worker.loras, "folder_paths_available",
+                                  lambda: True), \
+                mock.patch.object(worker.loras, "collect",
+                                  mock.AsyncMock(side_effect=_Boom)):
+            await worker._scan_and_report(mock.AsyncMock(), pairing, 900.0)
+
+
+# ── ⚠️ the scan must never hold up the heartbeat ─────────────────────────────
+
+class TestHeartbeatIsNeverBlocked(unittest.IsolatedAsyncioTestCase):
+    async def test_beats_keep_flowing_while_a_scan_is_stuck(self):
+        # A cold scan runs for minutes. If the heartbeat waited for it, the
+        # relay's reaper would mark this backend dead and the app would show the
+        # PC as offline — which is exactly the failure this design must avoid.
+        pairing = _FakePairing()
+        state = _FakeState([pairing])
+        relay = mock.AsyncMock()
+        relay.heartbeat.return_value = {"loras_requested_at": 100}
+        release = asyncio.Event()
+        scans = []
+
+        async def stuck_scan(relay_, pairing_, requested):
+            scans.append(requested)
+            await release.wait()          # never finishes during the test
+
+        with mock.patch.object(worker, "STATE", state), \
+                mock.patch.object(worker, "HEARTBEAT_INTERVAL", 0.01), \
+                mock.patch.object(worker, "_scan_and_report", stuck_scan):
+            hb = asyncio.create_task(worker._heartbeat_loop(relay, pairing, None))
+            await asyncio.sleep(0.15)
+            beats = relay.heartbeat.await_count
+            hb.cancel()
+            try:
+                await hb
+            except asyncio.CancelledError:
+                pass
+        release.set()
+        self.assertGreaterEqual(beats, 3,
+                                "the heartbeat must keep its rhythm during a scan")
+        self.assertEqual(scans, [100.0], "and must not pile on more scans")
+
+    async def test_scan_task_is_cancelled_with_the_pairing(self):
+        # Tearing down a pairing (unpair / reconnect) must take its scan with it,
+        # rather than leaving it holding the build lock and a dying session.
+        pairing = _FakePairing()
+        state = _FakeState([pairing])
+        relay = mock.AsyncMock()
+        relay.heartbeat.return_value = {"loras_requested_at": 100}
+        entered = asyncio.Event()
+        cancelled = []
+
+        async def slow_scan(relay_, pairing_, requested):
+            entered.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+        with mock.patch.object(worker, "STATE", state), \
+                mock.patch.object(worker, "HEARTBEAT_INTERVAL", 0.01), \
+                mock.patch.object(worker, "_scan_and_report", slow_scan):
+            hb = asyncio.create_task(worker._heartbeat_loop(relay, pairing, None))
+            await asyncio.wait_for(entered.wait(), 1)
+            hb.cancel()
+            try:
+                await hb
+            except asyncio.CancelledError:
+                pass
+        self.assertEqual(cancelled, [True], "the scan must not outlive its pairing")
+
+
+class TestNothingScansWithoutTheSignal(unittest.IsolatedAsyncioTestCase):
+    """⛔ THE CONSENT GUARD. Regression target for "we scan on a timer again"."""
+
+    async def test_a_full_pairing_lifecycle_scans_nothing(self):
+        # Register → heartbeat → claim, with a relay that never asks for an
+        # inventory (an old relay, or a user who simply never pressed refresh).
+        # Not one file may be read and not one byte uploaded.
         from comfylink.config import Pairing
 
         relay = mock.AsyncMock()
+        relay.heartbeat.return_value = {}          # old relay: no such field
         pairing = Pairing(backend_id="b1", device_token="clr")
         state = _FakeState([pairing])
-        claimed = asyncio.Event()
+        beats = asyncio.Event()
 
         async def fake_claim_loop(relay_, worker_, pairing_, job_lock_, stop_, blocked_):
-            claimed.set()
-            raise worker._Revoked()  # terminate _serve_pairing
+            await asyncio.wait_for(beats.wait(), 1)
+            raise worker._Revoked()
 
-        # Real _loras_loop + real _report_loras, with collection blowing up the
-        # way a broken loras directory would.
-        with _folder_paths({}), \
-                mock.patch.object(worker.loras, "collect",
-                                  mock.AsyncMock(side_effect=OSError("nope"))), \
+        async def counting_heartbeat(bid):
+            beats.set()
+            return {}
+
+        relay.heartbeat.side_effect = counting_heartbeat
+
+        with _folder_paths({"a.safetensors": "/nope"}), \
+                mock.patch.object(worker.loras, "collect", mock.AsyncMock()) as collect, \
                 mock.patch.object(worker, "REVOKED_CONFIRM_STRIKES", 1), \
+                mock.patch.object(worker, "HEARTBEAT_INTERVAL", 0.01), \
                 mock.patch.object(worker, "RelayClient", return_value=relay), \
                 mock.patch.object(worker, "ComfyClient"), \
                 mock.patch.object(worker, "Worker"), \
@@ -849,21 +1094,20 @@ class TestInventoryNeverBlocksTheWorker(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(worker, "STATE", state), \
                 mock.patch.object(worker, "_register", mock.AsyncMock()), \
                 mock.patch.object(worker, "_abandon_orphans", mock.AsyncMock()), \
-                mock.patch.object(worker, "_heartbeat_loop", mock.AsyncMock()), \
-                mock.patch.object(worker, "_claim_loop", fake_claim_loop), \
-                mock.patch.object(worker.asyncio, "sleep", mock.AsyncMock()):
+                mock.patch.object(worker, "_claim_loop", fake_claim_loop):
             await asyncio.wait_for(
                 worker._serve_pairing(pairing, asyncio.Lock(), None,
                                       "http://comfy", None, set()),
                 5,
             )
 
-        self.assertTrue(claimed.is_set(), "the claim loop must run regardless")
-        self.assertIsNone(state.get_pairing("b1"))
+        collect.assert_not_awaited()
+        relay.upload_loras.assert_not_awaited()
+        self.assertEqual(pairing.loras_synced_at, 0.0)
+        self.assertEqual(pairing.loras_hash, "")
 
-    async def test_register_does_not_collect_loras(self):
-        # Registration latency must be independent of the inventory: _register
-        # is the object_info path only, the inventory has its own task.
+    async def test_register_does_not_collect(self):
+        # Registration latency must stay independent of the inventory.
         from comfylink.config import Pairing
 
         relay = mock.AsyncMock()
@@ -875,6 +1119,7 @@ class TestInventoryNeverBlocksTheWorker(unittest.IsolatedAsyncioTestCase):
             await worker._register(relay, comfy,
                                    Pairing(backend_id="b1", device_token="t"))
         collect.assert_not_awaited()
+        relay.upload_loras.assert_not_awaited()
 
 
 # ── relay client ──────────────────────────────────────────────────────────────

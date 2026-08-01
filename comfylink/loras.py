@@ -415,7 +415,23 @@ def cache_key(path: str, size: int, mtime_ns: int) -> str:
     return f"{path}|{size}|{mtime_ns}"
 
 
-def build_checkpoints() -> tuple[list[dict], bool]:
+def _notify(on_progress, phase: str, done: int, total: int, name: str) -> None:
+    """Fire a progress callback without ever letting it break the scan.
+
+    The callback is invoked from the worker THREAD (build_manifest is blocking)
+    while the panel reads the same object from the event loop. Both sides only
+    touch plain attributes, so the GIL is sufficient — but a raising callback
+    must not cost the user a multi-minute scan, hence the guard.
+    """
+    if on_progress is None:
+        return
+    try:
+        on_progress(phase, done, total, name)
+    except Exception:  # noqa: BLE001 - progress display is never worth a failure
+        pass
+
+
+def build_checkpoints(on_progress=None) -> tuple[list[dict], bool]:
     """Header-only checkpoint inventory. Returns ``(entries, truncated)``.
 
     ⛔ NO HASHING HAPPENS HERE, and no code path may add it. Checkpoints are
@@ -432,7 +448,9 @@ def build_checkpoints() -> tuple[list[dict], bool]:
     entries: list[dict] = []
     names = list_checkpoint_names()
     truncated = len(names) > MAX_ENTRIES
-    for name in names[:MAX_ENTRIES]:
+    todo = names[:MAX_ENTRIES]
+    for i, name in enumerate(todo):
+        _notify(on_progress, "checkpoints", i, len(todo), name)
         path = model_path("checkpoints", name)
         if not path:
             continue
@@ -450,12 +468,14 @@ def build_checkpoints() -> tuple[list[dict], bool]:
             "mtime": int(st.st_mtime),
             "meta": meta,
         })
+    _notify(on_progress, "checkpoints", len(todo), len(todo), "")
     return entries, truncated
 
 
 def build_manifest(
     cache: Optional[dict] = None,
     hasher: Callable[[str], str] = file_sha256,
+    on_progress=None,
 ) -> tuple[dict, dict]:
     """Build the inventory. BLOCKING — call via ``asyncio.to_thread``.
 
@@ -465,13 +485,20 @@ def build_manifest(
 
     ``hasher`` is injectable purely so tests can count how often a digest is
     actually computed (the "unchanged file is not re-hashed" guarantee).
+
+    ``on_progress(phase, done, total, name)`` is called per file. The scan is
+    user-initiated and a cold run can take minutes, so the panel needs something
+    truthful to show — a button that looks dead for three minutes is a button
+    users press twice.
     """
     cache = cache or {}
     new_cache: dict = {}
     entries: list[dict] = []
     names = list_lora_names()
     truncated = len(names) > MAX_ENTRIES
-    for name in names[:MAX_ENTRIES]:
+    todo = names[:MAX_ENTRIES]
+    for i, name in enumerate(todo):
+        _notify(on_progress, "loras", i, len(todo), name)
         path = lora_path(name)
         if not path:
             continue
@@ -502,11 +529,12 @@ def build_manifest(
             "sha256": digest,
             "meta": meta,
         })
+    _notify(on_progress, "loras", len(todo), len(todo), "")
     # Checkpoints are collected in a guard of their own so that a surprise on the
     # newer, less-exercised path can never cost us the LoRA inventory — which is
     # the part users already depend on.
     try:
-        checkpoints, ckpt_truncated = build_checkpoints()
+        checkpoints, ckpt_truncated = build_checkpoints(on_progress)
     except Exception as e:  # noqa: BLE001 - LoRAs still ship
         log.warning("model inventory: checkpoint scan failed: %s", e)
         checkpoints, ckpt_truncated = [], False
@@ -547,41 +575,81 @@ def manifest_hash(manifest: dict) -> str:
     ).hexdigest()
 
 
-# ── process-wide collection (shared by every pairing) ─────────────────────────
+# ── on-demand collection ─────────────────────────────────────────────────────
+#
+# ⛔ NOTHING IN THIS MODULE RUNS ON ITS OWN. Reading a user's model folders and
+# fingerprinting their files is not something a plugin should do behind their
+# back on a timer, and this plugin has said so since before the feature existed
+# ("No background auto-sync", web/comfylink.js). An earlier revision ran a
+# 10-minute background refresh; it was removed deliberately.
+#
+# The single trigger is the user pressing refresh IN THE APP: the relay records
+# the request, hands the plugin the request's timestamp on the next heartbeat,
+# and worker._maybe_scan_models turns that into exactly one scan. Consent is
+# explicit and remote — the user does not have to walk over to the PC to give it.
 
-# One ComfyUI can be paired to several accounts, and each pairing uploads the
-# inventory under its own R2 key — but the FILES are the same for all of them, so
-# the expensive part (stat + hash + header read) must happen once, not once per
-# account. The lock serialises builds; the short TTL means pairings that ask
-# within the same refresh round share one result. Fresh-enough is set by the
-# caller's refresh cadence (minutes), not by this TTL (seconds).
-_BUILD_TTL = 60.0
 
+# Only one build at a time in this process. A machine paired to several accounts
+# gets one scan request per account, and hashing tens of GB once per account
+# would be absurd. Serialising is enough on its own: whoever gets the lock second
+# finds every digest already in the cache, so their "rebuild" is a stat per file
+# (milliseconds). No result cache, therefore no staleness question to answer.
 _build_lock = asyncio.Lock()
-_cached_at: float = 0.0
-_cached: Optional[dict] = None
 
 
-async def collect(force: bool = False) -> dict:
-    """Current inventory, built off the event loop and shared across pairings.
+async def collect(on_progress=None) -> dict:
+    """Build the inventory off the event loop. Only ever called on demand.
 
-    The build itself runs in a worker thread: a cold run reads tens of GB and
-    would otherwise stall the single event loop that also drives heartbeats,
-    cancel long-polls and job claims. Digest cache lives in the plugin state
-    file (0600) and is persisted only when it actually changed.
+    ``asyncio.to_thread`` is not optional: a cold run reads tens of GB, and the
+    calling coroutine shares its event loop with the relay heartbeat, the cancel
+    long-poll and the claim loop. Blocking it for minutes would look exactly like
+    a dead backend. The digest cache is read from and written back to the 0600
+    plugin state file, and only persisted when it actually changed.
     """
-    global _cached, _cached_at
     from .config import STATE
 
     async with _build_lock:
-        now = time.monotonic()
-        if not force and _cached is not None and now - _cached_at < _BUILD_TTL:
-            return _cached
         cache = dict(STATE.lora_hashes)
-        manifest, new_cache = await asyncio.to_thread(build_manifest, cache)
+        manifest, new_cache = await asyncio.to_thread(
+            build_manifest, cache, file_sha256, on_progress)
         if new_cache != cache:
             STATE.lora_hashes = new_cache
             STATE.save()
-        _cached = manifest
-        _cached_at = time.monotonic()
         return manifest
+
+
+async def upload_for(relay, pairing, manifest: dict) -> str:
+    """Upload the manifest for ONE pairing. Returns what happened.
+
+    ``"uploaded"`` — shipped and the content hash remembered.
+    ``"unchanged"`` — identical to what this pairing already has; nothing sent.
+    ``"unsupported"`` — the relay has no such endpoint (404). An older relay is
+    an expected state during a staged rollout, not an error: the user gets told
+    plainly and everything else keeps working.
+
+    Anything else propagates so the caller can report a real per-account failure
+    (the same shape /comfylink/sync uses). The content hash is stored ONLY after
+    a successful upload, so a failure re-uploads on the next scan.
+    """
+    from .config import STATE
+    from .relay import RelayError
+
+    new_hash = manifest_hash(manifest)
+    if pairing.loras_hash and pairing.loras_hash == new_hash:
+        return "unchanged"
+    try:
+        await relay.upload_loras(pairing.backend_id, manifest)
+    except RelayError as e:
+        if e.status == 404:
+            log.warning(
+                "relay has no model inventory endpoint (404) — nothing uploaded; "
+                "this works once the relay is updated"
+            )
+            return "unsupported"
+        raise
+    pairing.loras_hash = new_hash
+    STATE.save()
+    log.info("uploaded model inventory (%d LoRA(s), %d checkpoint(s), hash %s)",
+             len(manifest.get("loras") or []),
+             len(manifest.get("checkpoints") or []), new_hash[:12])
+    return "uploaded"
