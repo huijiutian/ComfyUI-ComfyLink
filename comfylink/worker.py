@@ -38,6 +38,7 @@ from .jobs import (
     apply_inputs,
     encode_output,
     extract_outputs,
+    format_prompt_log,
     within_cap,
 )
 from .log import log
@@ -271,6 +272,13 @@ class Worker:
             prompt = dict(job.get("api_prompt") or {})
             inputs = job.get("inputs") or []
             await self._stage_inputs(prompt, inputs)
+            # 提交前把最终提示词原文打进本地日志。排查「提示词管理器输出对不对」时,
+            # 这是唯一能看到终点实际收到了什么的地方 —— 预设树 → token → 触发词 →
+            # 中继 → 这里,中间哪一环出错,用户看到的都只是「图不对」。
+            # ⛔ 只进用户自己机器上的 ComfyUI 控制台,绝不上报中继。
+            # 打在 _stage_inputs 之后:那一步只改图片输入的文件名,不动文本,而这里
+            # 是 prompt 交给 ComfyUI 之前的最后一站。
+            log.info("%s", format_prompt_log(job_id, prompt))
             await self.relay.progress(job_id, "running", 0, 0)
             prompt_id = await self._run_prompt(job_id, prompt, canceled)
             max_bytes = int(job.get("max_output_bytes") or 0)

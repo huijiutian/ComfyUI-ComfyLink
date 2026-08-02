@@ -224,6 +224,245 @@ def apply_inputs(prompt: dict, inputs: list[dict], key_to_name: dict[str, str]) 
     return prompt
 
 
+# ── Final prompt visibility (local log only) ────────────────────────────────
+#
+# A prompt travels a long way before it reaches ComfyUI: the app's preset tree →
+# flattened tokens → LoRA trigger words → one string → relay → this plugin →
+# ComfyUI. When the picture comes back wrong, EVERY one of those hops looks the
+# same from the outside. This is the only place that can say what the far end
+# actually received, so we log it verbatim right before submitting.
+#
+# ⛔ LOCAL ONLY. This goes to the user's own ComfyUI console and is NEVER
+# reported to the relay: a user reading their own log is not the same thing as
+# us holding their content.
+
+# Per-text safety valve. NOT a display cap — a real prompt is a few hundred
+# chars, so this only ever fires on something pathological, and when it does the
+# line SAYS it was truncated instead of silently misrepresenting what we sent.
+# Truncating by default would destroy the entire point of the log.
+_MAX_PROMPT_CHARS = 4000
+
+# Input names that carry prompt text in ComfyUI's API-format JSON. Deliberately
+# an ALLOWLIST of INPUT names, not node types: the node types that hold text are
+# open-ended (CLIPTextEncode is only the most common one), while the input names
+# are conventional — and an allowlist can never mistake `ckpt_name`,
+# `sampler_name` or `filename_prefix` for a prompt. Every hit is additionally
+# required to be a `str`, which is what keeps a wired-up link input named
+# `positive` (a list) or a numeric `value` out.
+_TEXT_INPUTS = frozenset({
+    "text", "text_g", "text_l", "text_positive", "text_negative",
+    "prompt", "positive_prompt", "negative_prompt",
+    "positive", "negative", "string", "value",
+    "wildcard_text", "populated_text",
+    "clip_l", "t5xxl",  # CLIPTextEncodeFlux / CLIPTextEncodeSD3
+})
+
+# Link inputs we follow when walking BACK from a sampler towards the node that
+# holds the text. Conditioning rarely goes straight from the encoder to the
+# sampler — it passes through FluxGuidance / ConditioningCombine /
+# ControlNetApply / … — and these are the names those helpers give the
+# conditioning they wrap. Following ONLY conditioning-ish links is what keeps
+# the walk from wandering into an unrelated branch and mislabeling some other
+# node's text as the prompt.
+_COND_INPUTS = frozenset({"positive", "negative", "cond"})
+
+# Bound on one backwards walk. A real chain is 1-3 hops; this only stops a
+# cyclic or absurd graph from spinning.
+_MAX_TRACE_NODES = 32
+
+# Node class names listed in the "couldn't find anything" line, so a bug report
+# still shows what the workflow was made of.
+_MAX_SUMMARY_CLASSES = 8
+
+
+def format_prompt_log(job_id: str, prompt: dict) -> str:
+    """The one-line-per-text block logged just before a prompt is submitted.
+
+    Shape (one ``log.info`` so the console keeps it together)::
+
+        job <id> final prompt (as submitted to ComfyUI):
+          [positive] node 6 CLIPTextEncode.text (Positive): masterpiece, 1girl
+          [negative] node 7 CLIPTextEncode.text: bad hands
+
+    Roles come from the workflow itself (see :func:`prompt_texts`); a text we
+    cannot tie to a sampler is printed as ``[unlabeled]`` rather than guessed at,
+    and a workflow with no recognisable text input says so — with a summary of
+    the node types it did contain, which is what a bug report needs. Guessing
+    would be worse than admitting we don't know: the whole value of this log is
+    that it is literally true.
+
+    NEVER raises. It runs in the job path purely for observability, and a
+    logging bug must not be able to fail a generation.
+    """
+    header = f"job {job_id} final prompt (as submitted to ComfyUI):"
+    try:
+        texts = prompt_texts(prompt)
+        if not texts:
+            return f"{header} no text input identified — {_node_summary(prompt)}"
+        lines = [header]
+        for t in texts:
+            lines.append(f"  [{t['role'] or 'unlabeled'}] {_where(t)}: {_cap(t['text'])}")
+        return "\n".join(lines)
+    except Exception as e:  # noqa: BLE001 - observability must never fail a job
+        return f"{header} could not be rendered ({e})"
+
+
+def prompt_texts(prompt: dict) -> list[dict]:
+    """Every prompt text in an API-format workflow, with where it is wired.
+
+    Returns ``[{"node", "class_type", "title", "field", "text", "role"}]`` in
+    node order, where ``role`` is ``"positive"``/``"negative"`` when the text
+    can be traced to a sampler input and ``""`` when it cannot.
+
+    HOW THE ROLE IS DECIDED — from the graph, never from the wording. Any node
+    with LINK inputs named ``positive``/``negative`` is treated as a sampler
+    (KSampler, KSamplerAdvanced, SamplerCustom and every fork of them share that
+    convention, and matching on class names would miss all the forks). From each
+    such link we walk backwards along conditioning links until we reach a node
+    that holds text. When a node on the way has an input with the same name as
+    the role being traced (ControlNetApplyAdvanced has both), we follow ONLY
+    that one — otherwise a negative trace could wander into the positive branch
+    and mislabel it.
+
+    Empty texts are kept only when they got a role: "the negative prompt is
+    empty" is a real answer and dropping it would read as "no negative found",
+    but an unrelated empty string somewhere in the graph is just noise.
+
+    Defensive throughout — a workflow is user data, not a contract, so a node
+    that isn't a dict, inputs that aren't a dict, a link that isn't a pair, etc.
+    all just mean "nothing to report here".
+    """
+    nodes = _nodes(prompt)
+    found: list[dict] = []
+    by_node: dict[str, list[int]] = {}
+    for node_id in sorted(nodes, key=_node_order):
+        node = nodes[node_id]
+        class_type = node.get("class_type")
+        meta = node.get("_meta")
+        title = meta.get("title") if isinstance(meta, dict) else None
+        for field, value in _inputs(node).items():
+            if not isinstance(field, str) or field.lower() not in _TEXT_INPUTS:
+                continue
+            if not isinstance(value, str):
+                continue
+            by_node.setdefault(node_id, []).append(len(found))
+            found.append({
+                "node": node_id,
+                "class_type": class_type if isinstance(class_type, str) else "",
+                "title": title if isinstance(title, str) else "",
+                "field": field,
+                "text": value,
+                "role": "",
+            })
+    if not found:
+        return []
+    for node_id in sorted(nodes, key=_node_order):
+        for role in ("positive", "negative"):
+            link = _inputs(nodes[node_id]).get(role)
+            if _link_target(link):
+                _trace(nodes, _link_target(link), role, found, by_node)
+    return [t for t in found if t["role"] or t["text"].strip()]
+
+
+def _trace(nodes: dict, start: str, role: str, found: list[dict],
+           by_node: dict[str, list[int]]) -> None:
+    """Walk back from a sampler input and label the first text nodes reached."""
+    seen: set[str] = set()
+    queue = [start]
+    while queue and len(seen) < _MAX_TRACE_NODES:
+        node_id = queue.pop(0)
+        if node_id in seen or node_id not in nodes:
+            continue
+        seen.add(node_id)
+        hits = by_node.get(node_id)
+        if hits:
+            # This node holds the text for that branch; stop here rather than
+            # keep walking (whatever feeds IT is not the prompt itself).
+            for i in hits:
+                if not found[i]["role"]:
+                    found[i]["role"] = role
+            continue
+        inputs = _inputs(nodes[node_id])
+        same_name = _link_target(inputs.get(role))
+        if same_name:
+            # e.g. ControlNetApplyAdvanced: follow only the branch of our own
+            # role, never its sibling.
+            queue.append(same_name)
+            continue
+        for field, value in inputs.items():
+            if not isinstance(field, str):
+                continue
+            lower = field.lower()
+            if "conditioning" not in lower and lower not in _COND_INPUTS:
+                continue
+            target = _link_target(value)
+            if target:
+                queue.append(target)
+
+
+def _nodes(prompt: dict) -> dict[str, dict]:
+    """The workflow's nodes keyed by string id; ``{}`` for anything unusable."""
+    if not isinstance(prompt, dict):
+        return {}
+    return {str(k): v for k, v in prompt.items() if isinstance(v, dict)}
+
+
+def _node_order(node_id: str) -> tuple[int, int, str]:
+    """Sort node ids numerically when they are numbers (ComfyUI's are), else by
+    name — so the log reads in workflow order (3, 4, 10) rather than (10, 3, 4),
+    and is deterministic whatever order the JSON happened to arrive in."""
+    return (0, int(node_id), "") if node_id.isdigit() else (1, 0, node_id)
+
+
+def _inputs(node: dict) -> dict:
+    inputs = node.get("inputs")
+    return inputs if isinstance(inputs, dict) else {}
+
+
+def _link_target(value: Any) -> str:
+    """The source node id of a ComfyUI link ``["6", 0]``; "" if not a link."""
+    if isinstance(value, list) and len(value) == 2 and isinstance(value[0], (str, int)):
+        return str(value[0])
+    return ""
+
+
+def _where(item: dict) -> str:
+    """``node 6 CLIPTextEncode.text (Positive)`` — which box this text is in.
+
+    A workflow can have several text inputs; without the node id and input name
+    there is no way to tell which one on screen a line corresponds to.
+    """
+    out = f"node {item['node']}"
+    if item["class_type"]:
+        out += f" {item['class_type']}"
+    out += f".{item['field']}"
+    if item["title"]:
+        out += f" ({item['title']})"
+    return out
+
+
+def _cap(text: str) -> str:
+    """Full text, unless it is absurdly long — and then say so explicitly."""
+    if len(text) <= _MAX_PROMPT_CHARS:
+        return text
+    return f"{text[:_MAX_PROMPT_CHARS]}… [TRUNCATED, {len(text)} chars total]"
+
+
+def _node_summary(prompt: dict) -> str:
+    """What the workflow was made of, for the "identified nothing" line."""
+    nodes = _nodes(prompt)
+    if not nodes:
+        return "empty workflow"
+    classes = sorted({
+        n["class_type"] for n in nodes.values()
+        if isinstance(n.get("class_type"), str) and n.get("class_type")
+    })
+    listed = ", ".join(classes[:_MAX_SUMMARY_CLASSES])
+    if len(classes) > _MAX_SUMMARY_CLASSES:
+        listed += f", +{len(classes) - _MAX_SUMMARY_CLASSES} more"
+    return f"{len(nodes)} node(s){': ' + listed if listed else ''}"
+
+
 def progress_event(msg: dict) -> dict[str, Any] | None:
     """Classify a ComfyUI websocket text message.
 
