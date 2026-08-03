@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
-from .version import __commit__, __version__
+from .version import __caps__, __commit__, __version__
 
 log = logging.getLogger("comfylink.relay")
 
@@ -206,9 +206,13 @@ class RelayClient:
     async def register(self, backend_id: str, name: str) -> dict:
         # version/commit let the app tell the user their plugin is out of date.
         # Optional server-side, so older relays simply ignore them.
+        # caps is the same deal (see version.__caps__): sent on BOTH register and
+        # every heartbeat, unconditionally, so a git-pull + restart updates what
+        # the app is allowed to offer without a re-pairing.
         return await self._json("POST", "/v1/backends/register",
                                 {"backend_id": backend_id, "name": name,
-                                 "version": __version__, "commit": __commit__})
+                                 "version": __version__, "commit": __commit__,
+                                 "caps": __caps__})
 
     async def sign_object_info(self, backend_id: str) -> tuple[str, str]:
         """Request a presigned PUT URL for this backend's object_info snapshot.
@@ -335,8 +339,12 @@ class RelayClient:
         say so, and plugins already installed on users' machines are the ones the
         relay has to be tolerant for.
         """
+        # ⚠️ caps 和 version/commit 同规格:**每一拍都发,无条件**。中继每次心跳都
+        # 用收到的值覆盖(空也写空),这样用户从新插件回退到老插件时能力会立刻消失;
+        # 反过来说,这里一旦写成「有条件才带」,能力就会在 App 里闪断。见 version.__caps__。
         body = {"backend_id": backend_id,
-                "version": __version__, "commit": __commit__}
+                "version": __version__, "commit": __commit__,
+                "caps": __caps__}
         if object_info_hash:
             body["object_info_hash"] = object_info_hash
         if object_info_synced_at and object_info_synced_at > 0:
