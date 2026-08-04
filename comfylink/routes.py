@@ -17,6 +17,7 @@ from aiohttp import web
 
 from .auth import TokenAuth
 from .config import RELAY_IS_DEFAULT, RELAY_URL, STATE
+from .jobs import webp_capability
 from .log import log
 from .relay import RelayClient, redeem_pair_code
 from .status import STATUS
@@ -61,6 +62,13 @@ def register() -> None:
         snap["relay_is_default"] = RELAY_IS_DEFAULT  # panel warns when on test relay
         snap["version"] = __version__
         snap["commit"] = __commit__  # git short commit (panel display; "dev" if unknown)
+        # WebP/XMP 能力(R-1.0.6-26 复诊):pillow_version / webp_ok / webp_xmp_ok。
+        # 面板据此对「出的图不会带 prompt」给软警告;探测有缓存、绝不抛,
+        # 但仍包一层 —— status 永远不许因它变慢或挂掉。
+        try:
+            snap.update(webp_capability())
+        except Exception:  # noqa: BLE001 - status must never break
+            pass
         # Soft "a newer plugin is available" hint for the panel. Best-effort and
         # heavily cached (see version_check); must never break or slow status, so
         # a defensive guard falls back to "no update info" on any surprise.

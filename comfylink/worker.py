@@ -283,7 +283,8 @@ class Worker:
             prompt_id = await self._run_prompt(job_id, prompt, canceled)
             max_bytes = int(job.get("max_output_bytes") or 0)
             output_format = job.get("output_format") or "png"
-            images, total = await self._collect_outputs(prompt_id, output_format)
+            images, total = await self._collect_outputs(
+                prompt_id, output_format, prompt)
             if not within_cap(total, max_bytes):
                 await self.relay.result(
                     job_id, "failed", [], "output exceeds your plan",
@@ -519,7 +520,7 @@ class Worker:
         # else: not pending or running anymore — nothing to cancel.
 
     async def _collect_outputs(
-        self, prompt_id: str, output_format: str
+        self, prompt_id: str, output_format: str, job_prompt: dict | None = None
     ) -> tuple[list[dict], int]:
         """Fetch each output's bytes, optionally convert to WebP, and measure.
 
@@ -534,8 +535,11 @@ class Worker:
         total = 0
         for it in extract_outputs(history, prompt_id):
             raw = await self.comfy.view(it["filename"], it["subfolder"], it["type"])
+            # job_prompt = staged 后的最终 API prompt(R-20 日志同源)——
+            # comfylink XMP(workflow + 直通正负向)的主源;源图元数据只是兜底。
             data, filename, ct = encode_output(
-                raw, it["filename"], output_format, it["media_type"]
+                raw, it["filename"], output_format, it["media_type"],
+                job_prompt=job_prompt,
             )
             total += len(data)
             items.append({"data": data, "filename": filename, "content_type": ct,

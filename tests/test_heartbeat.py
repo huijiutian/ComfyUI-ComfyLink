@@ -59,7 +59,7 @@ class TestJobHeartbeat(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             return "pid-1"
 
-        async def fake_collect(prompt_id, output_format):
+        async def fake_collect(prompt_id, output_format, job_prompt=None):
             return [], 0
 
         async def fake_upload(job_id, items):
@@ -215,7 +215,7 @@ class TestOneBeaterPerJob(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             return "pid-1"
 
-        async def fake_collect(prompt_id, output_format):
+        async def fake_collect(prompt_id, output_format, job_prompt=None):
             return [], 0
 
         async def fake_upload(job_id, items):

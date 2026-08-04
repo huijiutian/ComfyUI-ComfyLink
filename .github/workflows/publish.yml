@@ -11,8 +11,7 @@
 #
 # ⚠️ 一次性配置(没配就永远发不出去,只做一次):
 #     仓库需要一个名为 REGISTRY_ACCESS_TOKEN 的 Actions secret。
-#     完整步骤 + 发版清单(版本号四处同步)见内部发版文档 plugin-releasing.md
-#     (workspace 布局里 = ../../ops/plugin-releasing.md)。
+#     完整步骤 + 发版清单(版本号四处同步)见内部发版文档 plugin-releasing.md。
 #
 # 官方发布方式(2026-07 核对):
 #   https://docs.comfy.org/registry/publishing

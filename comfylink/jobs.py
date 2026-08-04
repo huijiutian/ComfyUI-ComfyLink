@@ -14,6 +14,8 @@ from typing import Any
 from xml.sax.saxutils import escape
 
 from .log import log
+from .status import STATUS  # pure in-memory flags(不引 I/O,单测无碍)
+from .version import __version__
 
 # Quality for PNG->WebP re-encode. 90 is a good size/fidelity tradeoff: it
 # shrinks typical diffusion outputs well below their PNG size while staying
@@ -54,29 +56,75 @@ def content_type_for(filename: str) -> str:
     return "application/octet-stream"
 
 
-def _xmp_with_prompt(prompt: str) -> bytes:
-    """Build a minimal XMP packet carrying only ComfyUI's ``prompt`` string.
+def _xmp_with_prompt(prompt: str, positive: str = "", negative: str = "") -> bytes:
+    """Build a minimal XMP packet carrying ComfyUI's ``prompt`` string, plus —
+    when extractable — the final positive/negative prompt texts verbatim.
 
-    We deliberately embed *just* the prompt (not the much larger ``workflow``
-    blob): users want the generation prompt to round-trip, and keeping the
-    packet tiny keeps the WebP small. The prompt is JSON, so it can contain
+    We deliberately embed the prompt (not the much larger ``workflow`` blob):
+    users want the generation prompt to round-trip, and keeping the packet
+    tiny keeps the WebP small. The prompt is JSON, so it can contain
     ``<``/``&``/``"`` — XML-escape it before placing it in an attribute.
+
+    R-1.0.6-30(直通字段): [positive]/[negative] 是提交时算好的**最终提示词
+    全文**(与 R-20 提交日志同源,见 :func:`prompt_texts`)。写成**元素形式**
+    ``<comfylink:positive>``/``<comfylink:negative>`` —— 提示词里引号/换行是
+    常态,元素内容只需转义 ``&``/``<``/``>``,不用跟属性引号纠缠。空的不写
+    (提不出 = 宁缺毋假);``comfylink:prompt``(workflow JSON)照写不动,
+    读不到直通字段的旧 App 与高级场景仍可整树解析。来源标记
+    ``comfylink:generator`` 恒写,让「这图是 ComfyLink 产的」可辨认。
     """
     esc = escape(prompt, {'"': "&quot;"})
+    fields = ""
+    if positive.strip():
+        fields += "<comfylink:positive>" + escape(positive) + "</comfylink:positive>"
+    if negative.strip():
+        fields += "<comfylink:negative>" + escape(negative) + "</comfylink:negative>"
+    desc_open = (
+        '<rdf:Description xmlns:comfylink="http://comfylink.app/ns/1.0/" '
+        'comfylink:generator="ComfyLink ' + escape(__version__, {'"': "&quot;"}) + '" '
+        'comfylink:prompt="' + esc + '"'
+    )
+    desc = desc_open + (">" + fields + "</rdf:Description>" if fields else "/>")
     packet = (
         '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>'
         '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
         '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
-        '<rdf:Description xmlns:comfylink="http://comfylink.app/ns/1.0/" '
-        'comfylink:prompt="' + esc + '"/>'
+        + desc +
         "</rdf:RDF></x:xmpmeta>"
         '<?xpacket end="w"?>'
     )
     return packet.encode("utf-8")
 
 
+def _role_texts(prompt_json: str) -> tuple[str, str]:
+    """R-1.0.6-30:从 API prompt JSON 提最终正/负向全文(R-20 同源)。
+
+    复用 :func:`prompt_texts` 的连线判角色(不猜节点名);同角色多段按节点序
+    换行拼接;**只收 role 明确的** —— 提不出角色的文本一概不进直通字段
+    (宁缺毋假,workflow JSON 里仍有全量)。任何异常都当「提不出」。
+    """
+    try:
+        d = json.loads(prompt_json)
+        if not isinstance(d, dict):
+            return "", ""
+        texts = prompt_texts(d)
+        pos = "\n".join(
+            t["text"] for t in texts
+            if t["role"] == "positive" and t["text"].strip())
+        neg = "\n".join(
+            t["text"] for t in texts
+            if t["role"] == "negative" and t["text"].strip())
+        return pos, neg
+    except Exception:  # noqa: BLE001 - 直通字段是锦上添花,绝不连累转换
+        return "", ""
+
+
 def encode_output(
-    data: bytes, filename: str, output_format: str, media_type: str = "image"
+    data: bytes,
+    filename: str,
+    output_format: str,
+    media_type: str = "image",
+    job_prompt: dict | None = None,
 ) -> tuple[bytes, str, str]:
     """Optionally re-encode an output to WebP, preserving ComfyUI's prompt.
 
@@ -110,22 +158,44 @@ def encode_output(
         from PIL import Image  # imported lazily — only needed when converting
 
         im = Image.open(BytesIO(data))
-        # Pull ComfyUI's prompt (PNG tEXt or source-WebP XMP land it in .info).
-        prompt = im.info.get("prompt")
+        # ⭐ workflow 主源 = **job 的 prompt**(claim/staged、R-20 日志同源,
+        # R-1.0.6-26):Image Saver 这类保存节点出的图,源字节里
+        # 可能根本没有可读的 prompt(它写 EXIF 272,不写 tEXt/XMP)—— 靠源图
+        # 元数据,直通字段就会静默缺席。源图 tEXt(PNG)只作 job_prompt 缺席时
+        # 的兜底(防御/旧调用路径;worker 正常调用总带 job_prompt)。
+        # 源是 WebP(如 Image Saver lossless 直出)同样走解码→重编:XMP 一并
+        # 附上;代价是 lossless 源经 quality=90 有一次有损重编(与历来行为一致,
+        # 用户要的 output_format=webp 本就是「有损换体积」)。
+        prompt_str: str | None = None
+        if isinstance(job_prompt, dict) and job_prompt:
+            try:
+                prompt_str = json.dumps(job_prompt, ensure_ascii=False)
+            except (TypeError, ValueError):
+                prompt_str = None
+        if prompt_str is None:
+            src = im.info.get("prompt")
+            if isinstance(src, bytes):
+                src = src.decode("utf-8", "replace")
+            if isinstance(src, str):
+                prompt_str = src
         save_kwargs: dict[str, Any] = {"format": "WEBP", "quality": WEBP_QUALITY}
-        if isinstance(prompt, (str, bytes)):
-            if isinstance(prompt, bytes):
-                prompt = prompt.decode("utf-8", "replace")
-            save_kwargs["xmp"] = _xmp_with_prompt(prompt)
+        if prompt_str is not None:
+            # R-1.0.6-30:workflow JSON 照写,另附直通的正/负向全文(提得出才写)。
+            positive, negative = _role_texts(prompt_str)
+            save_kwargs["xmp"] = _xmp_with_prompt(
+                prompt_str, positive=positive, negative=negative)
         buf = BytesIO()
         try:
             im.save(buf, **save_kwargs)
         except TypeError:
             # Old Pillow without xmp= support: re-encode without metadata
             # rather than crash. Better a prompt-less WebP than a failed job.
+            # ⚠️ 不再零症状(R-1.0.6-26 复诊):置 status 标记 → 面板出软警告,
+            # 否则用户直到「从图片建预设/看提示词」失败都不知道 prompt 没进图。
             buf = BytesIO()
             im.save(buf, format="WEBP", quality=WEBP_QUALITY)
             log.info("Pillow too old for xmp=; shipping WebP without prompt for %s", filename)
+            STATUS.set(webp_xmp_degraded=True)
         webp = buf.getvalue()
         new_name = _swap_ext(filename, ".webp")
         return webp, new_name, "image/webp"
@@ -142,6 +212,41 @@ def encode_output(
             filename, e,
         )
         return data, filename, content_type_for(filename)
+
+
+_webp_caps: dict | None = None
+
+
+def webp_capability() -> dict:
+    """This env's WebP capability, for the panel status(R-1.0.6-26 复诊)。
+
+    排查「出的图没带 prompt」一眼定案:Pillow 版本 + 能不能编 WebP + ``xmp=``
+    是否真的写进去(有的 build 会**静默忽略**关键字,也算不行)。首次调用探测
+    一次(内存 1x1 编码,毫秒级)后缓存 —— 环境不会在运行中途自愈。绝不抛。
+    """
+    global _webp_caps
+    if _webp_caps is not None:
+        return _webp_caps
+    caps = {"pillow_version": "", "webp_ok": False, "webp_xmp_ok": False}
+    try:
+        import PIL
+        from PIL import Image
+
+        caps["pillow_version"] = getattr(PIL, "__version__", "")
+        im = Image.new("RGB", (1, 1))
+        buf = BytesIO()
+        im.save(buf, format="WEBP")
+        caps["webp_ok"] = True
+        probe = BytesIO()
+        try:
+            im.save(probe, format="WEBP", xmp=b"<x/>")
+            caps["webp_xmp_ok"] = b"<x/>" in probe.getvalue()
+        except TypeError:
+            pass
+    except Exception:  # noqa: BLE001 - 能力探测绝不连累任何调用方
+        pass
+    _webp_caps = caps
+    return caps
 
 
 def _swap_ext(filename: str, new_ext: str) -> str:
@@ -256,6 +361,10 @@ _TEXT_INPUTS = frozenset({
     "wildcard_text", "populated_text",
     "clip_l", "t5xxl",  # CLIPTextEncodeFlux / CLIPTextEncodeSD3
 })
+
+# 文本拼接节点的编号输入(text1..textN / text_1..text_N,如 CR Text
+# Concatenate)。按键形认、不认类名 —— 各家 concat 变体都长这样。
+_TEXT_N = re.compile(r"^text_?\d+$")
 
 # Link inputs we follow when walking BACK from a sampler towards the node that
 # holds the text. Conditioning rarely goes straight from the encoder to the
@@ -393,7 +502,13 @@ def _trace(nodes: dict, start: str, role: str, found: list[dict],
             if not isinstance(field, str):
                 continue
             lower = field.lower()
-            if "conditioning" not in lower and lower not in _COND_INPUTS:
+            # 顺两类线走:conditioning 类(编码之后的链),以及**文本类**——
+            # 编码节点的 text 本身可以是连线(CR Text Concatenate 的
+            # text1/text2 → CR Prompt Text 等拼接链,R-1.0.6-26:提示词
+            # 常藏在这类拼接链后,不顺 text 线角色就永远定不到)。
+            is_cond = "conditioning" in lower or lower in _COND_INPUTS
+            is_text = lower in _TEXT_INPUTS or _TEXT_N.match(lower)
+            if not (is_cond or is_text):
                 continue
             target = _link_target(value)
             if target:

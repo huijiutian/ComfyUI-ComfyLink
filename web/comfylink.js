@@ -124,6 +124,17 @@ function buildPanel(root) {
       "line-height:1.4;",
   });
 
+  // Soft amber warning: this env's Pillow can't embed the prompt into WebP
+  // (xmp= rejected) — images still convert, but the app can't read a prompt
+  // back out of them ("create preset from this image" will say there's no
+  // generation info). Toggled from s.webp_xmp_degraded; single reused element
+  // like tooOldBar. Missing field (older plugin) reads as false → hidden.
+  const xmpBar = h("div", {
+    style:
+      "display:none;margin-bottom:10px;padding:8px 10px;border-radius:4px;" +
+      "background:#7a5200;color:#fff;font-size:12px;line-height:1.4;",
+  });
+
   const dot = h("span", {
     style:
       "display:inline-block;width:10px;height:10px;border-radius:50%;background:#9e9e9e;margin-right:8px;",
@@ -260,6 +271,7 @@ function buildPanel(root) {
 
   root.append(
     tooOldBar,
+    xmpBar,
     statusRow,
     relayWarn,
     detail,
@@ -425,6 +437,28 @@ function buildPanel(root) {
       tooOldBar.style.display = "block";
     } else {
       tooOldBar.style.display = "none";
+    }
+
+    // Soft warning: WebP outputs will NOT carry prompt metadata. Either the
+    // capability probe says this Pillow can't write xmp= (webp_xmp_ok false
+    // while WebP itself works), or a conversion already had to degrade
+    // (webp_xmp_degraded). webp_ok false is NOT this condition — then the
+    // plugin ships the original PNG whose tEXt prompt is intact. Missing
+    // fields (older plugin) read as false → bar stays hidden.
+    const xmpBroken =
+      s.webp_xmp_degraded === true ||
+      (s.webp_ok === true && s.webp_xmp_ok === false);
+    if (xmpBroken) {
+      const pv = s.pillow_version ? `Pillow ${s.pillow_version}` : "this Pillow";
+      xmpBar.textContent =
+        `⚠️ WebP outputs are shipping WITHOUT prompt metadata — ${pv} ` +
+        `can't embed XMP, so the app cannot read prompts back from these ` +
+        `images ("create preset from this image" will find nothing). ` +
+        `Fix: update Pillow in ComfyUI's Python environment ` +
+        `(pip install -U pillow) and restart ComfyUI.`;
+      xmpBar.style.display = "block";
+    } else {
+      xmpBar.style.display = "none";
     }
 
     const [label, color] = STATE_LABEL[s.state] || ["Unknown", "#9e9e9e"];

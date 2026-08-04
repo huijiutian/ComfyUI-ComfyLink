@@ -74,6 +74,37 @@ class _FailingRelay:
         self.uploaded.append(url)
 
 
+class TestCollectPassesJobPrompt(unittest.IsolatedAsyncioTestCase):
+    """R-1.0.6-26:_collect_outputs 必须把 job 的 prompt 交给
+    encode_output(直通字段/workflow JSON 的主源),不能靠源图元数据。"""
+
+    async def test_job_prompt_reaches_encode_output(self):
+        class _Comfy:
+            async def history(self, pid):
+                return {pid: {"outputs": {"17": {"images": [
+                    {"filename": "a.webp", "subfolder": "", "type": "output"},
+                ]}}}}
+
+            async def view(self, filename, subfolder, typ):
+                return b"raw-bytes"
+
+        w = Worker.__new__(Worker)  # 只测 _collect_outputs,不走完整构造
+        w.comfy = _Comfy()
+        job_prompt = {"3": {"class_type": "KSampler", "inputs": {}}}
+        seen = {}
+
+        def fake_encode(data, filename, output_format, media_type="image",
+                        job_prompt=None):
+            seen["job_prompt"] = job_prompt
+            return data, filename, "image/webp"
+
+        with mock.patch("comfylink.worker.encode_output", fake_encode):
+            items, total = await w._collect_outputs("pid", "webp", job_prompt)
+        self.assertIs(seen["job_prompt"], job_prompt)
+        self.assertEqual(total, len(b"raw-bytes"))
+        self.assertEqual(items[0]["filename"], "a.webp")
+
+
 class TestUploadOutputs(unittest.IsolatedAsyncioTestCase):
     async def test_result_preserves_input_order(self):
         items = [_item(i) for i in range(5)]

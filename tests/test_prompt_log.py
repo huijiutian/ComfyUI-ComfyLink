@@ -71,6 +71,64 @@ def _roles(prompt):
     return {t["role"]: t["text"] for t in prompt_texts(prompt) if t["role"]}
 
 
+def _image_saver_prompt():
+    """Image Saver 类工作流的**合成** fixture(双 KSampler + CR 拼接链形状)。
+
+    正向不在 CLIPTextEncode 里:[6].text 是连线 → [37] CR Text Concatenate
+    (separator "",text1/text2 连线)→ [38][39] CR Prompt Text 的 ``prompt``。
+    负向 [7] 是字面量。两个 KSampler(主采样 + 精修)positive 都连 [6]。
+    """
+    import json
+
+    return json.loads('''{
+      "3": {"inputs": {"seed": 111111, "steps": 30, "cfg": 6.0,
+            "sampler_name": "euler_ancestral", "scheduler": "normal",
+            "denoise": 1.0, "model": ["4", 0], "positive": ["6", 0],
+            "negative": ["7", 0], "latent_image": ["5", 0]},
+            "class_type": "KSampler"},
+      "4": {"inputs": {"ckpt_name": "checkpoints/example/model_a.safetensors"},
+            "class_type": "CheckpointLoaderSimple"},
+      "5": {"inputs": {"width": 1216, "height": 832, "batch_size": 1},
+            "class_type": "EmptyLatentImage"},
+      "6": {"inputs": {"text": ["37", 0], "clip": ["4", 1]},
+            "class_type": "CLIPTextEncode"},
+      "7": {"inputs": {"text": "lowres, worst quality, bad anatomy, watermark, ",
+            "clip": ["4", 1]}, "class_type": "CLIPTextEncode"},
+      "15": {"inputs": {"seed": 222222, "steps": 10, "cfg": 6.0,
+             "sampler_name": "euler_ancestral", "scheduler": "normal",
+             "denoise": 0.25, "model": ["4", 0], "positive": ["6", 0],
+             "negative": ["7", 0], "latent_image": ["14", 0]},
+             "class_type": "KSampler"},
+      "37": {"inputs": {"separator": "", "text1": ["38", 0], "text2": ["39", 0]},
+             "class_type": "CR Text Concatenate"},
+      "38": {"inputs": {"prompt": "masterpiece, best quality, 8K, newest, "},
+             "class_type": "CR Prompt Text"},
+      "39": {"inputs": {"prompt": "landscape,  winter, sky, mountain, "},
+             "class_type": "CR Prompt Text"}
+    }''')
+
+
+class TestConcatChain(unittest.TestCase):
+    """R-1.0.6-26:正向藏在文本拼接链后也必须定得到角色。"""
+
+    def test_concat_chain_roles(self):
+        texts = {t["node"]: t["role"]
+                 for t in prompt_texts(_image_saver_prompt())}
+        self.assertEqual(texts.get("38"), "positive",
+                         "拼接链上游第一段必须追到 positive")
+        self.assertEqual(texts.get("39"), "positive",
+                         "拼接链上游第二段必须追到 positive")
+        self.assertEqual(texts.get("7"), "negative")
+
+    def test_segments_in_node_order(self):
+        pos = [t["text"] for t in prompt_texts(_image_saver_prompt())
+               if t["role"] == "positive"]
+        self.assertEqual(pos, [
+            "masterpiece, best quality, 8K, newest, ",
+            "landscape,  winter, sky, mountain, ",
+        ])
+
+
 class TestTheOrdinaryCase(unittest.TestCase):
     """A stock txt2img workflow: both prompts, in full, correctly labeled."""
 

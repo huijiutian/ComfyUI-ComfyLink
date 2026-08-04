@@ -23,6 +23,14 @@ class Status:
         self.plugin_too_old = False
         self.plugin_min_version = ""
         self.plugin_update_url = ""
+        # WebP conversion had to drop the prompt metadata (this env's Pillow
+        # rejects the ``xmp=`` save argument): images still convert, but the
+        # app can't read a prompt back out of them ("create preset from this
+        # image" reports no generation info). Set by jobs.encode_output's
+        # degrade branch; surfaced as a soft warning in the panel so the
+        # condition is no longer symptomless (R-1.0.6-26 复诊). Sticky until
+        # ComfyUI restarts — the env doesn't fix itself mid-run.
+        self.webp_xmp_degraded = False
 
     def set(self, **kw) -> None:
         with self._lock:
@@ -39,6 +47,7 @@ class Status:
                 "plugin_too_old": self.plugin_too_old,
                 "plugin_min_version": self.plugin_min_version,
                 "plugin_update_url": self.plugin_update_url,
+                "webp_xmp_degraded": self.webp_xmp_degraded,
             }
 
 
