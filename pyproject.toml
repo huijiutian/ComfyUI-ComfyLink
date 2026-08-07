@@ -18,12 +18,32 @@ readme = "README.md"
 # Registry manifest triggering a second, stricter resolve.
 dependencies = []
 
+# OS support is declared through classifiers per the Registry spec
+# (https://docs.comfy.org/registry/specifications) — there is no supported_os
+# key. Pure Python + a browser-side panel, so nothing here is platform-bound.
+# No accelerator classifiers on purpose: this node never touches the GPU, it
+# hands work to the ComfyUI already running on the machine.
+classifiers = ["Operating System :: OS Independent"]
+
 [project.urls]
 Repository = "https://github.com/huijiutian/ComfyUI-ComfyLink"
+Documentation = "https://comfylink.app/guide"
+"Bug Tracker" = "https://github.com/huijiutian/ComfyUI-ComfyLink/issues"
 
 [tool.comfy]
 PublisherId = "comfylink"
 DisplayName = "ComfyLink"
-# Icon: optional URL to a square icon shown on the registry listing. Leave empty
-# until one is hosted.
-Icon = ""
+# Icon shown next to the node in ComfyUI-Manager and on the registry listing.
+# Registry spec: SVG/PNG/JPG/GIF, SQUARE, max 400×400 — the 512×512
+# comfylink.app/appicon.png is over that ceiling, hence a separate asset.
+#
+# ⚠️ The source file lives with the rest of the site in the APP repo
+# (app/docs/store-listing/site/registry-icon-400.png) and only goes live when
+# the site is deployed (ops/scripts/site-deploy-cf.sh). Deploy the site BEFORE
+# publishing a version that carries this URL, or the registry fetches a 404.
+Icon = "https://comfylink.app/registry-icon-400.png"
+
+# NOT set on purpose: `requires-comfyui`. The panel needs a frontend new enough
+# to have extensionManager.registerSidebarTab, but we have never established
+# which ComfyUI release that maps to — pinning a guessed floor would lock out
+# installs that actually work. See README "Requirements" for the prose version.
