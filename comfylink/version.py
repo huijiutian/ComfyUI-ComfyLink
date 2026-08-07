@@ -7,7 +7,7 @@ Registry reads pyproject; this constant feeds the runtime/panel).
 import subprocess
 from pathlib import Path
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 # CAPS —— 插件**自报的能力清单**,随 register 和每一拍心跳无条件上报(见
 # relay.RelayClient)。App 用它决定要不要放出对应的入口。
