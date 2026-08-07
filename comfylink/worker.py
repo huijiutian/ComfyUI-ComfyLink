@@ -390,6 +390,10 @@ class Worker:
         endpoints. Each iteration decides the job's fate:
 
           * /history has our prompt with status_str == "error"  -> JobFailed
+            carrying (message, error_code) from _history_failure — today
+            "execution_error" (a node raised; the message now names the node)
+            or "interrupted" (ComfyUI logged execution_interrupted). If the
+            interrupt was OURS (`canceled` set) it becomes JobCanceled instead.
           * /history has our prompt with outputs                 -> return pid
           * /history says "completed" but outputs are still empty (#11540) ->
             keep polling up to OUTPUTS_GRACE, then return pid anyway (and let
@@ -398,7 +402,8 @@ class Worker:
           * in NEITHER /history NOR /queue -> the prompt was interrupted/deleted
             on ComfyUI (a user hit interrupt in their browser, or an external
             queue clear) -> JobFailed(error_code="interrupted"), reported within
-            seconds instead of waiting out any long timeout
+            seconds instead of waiting out any long timeout — unless `canceled`
+            is set, in which case it was OUR interrupt and this is a JobCanceled
           * still running past EXECUTION_BACKSTOP_TIMEOUT -> JobFailed(
             error_code="execution_stalled") WITHOUT a global interrupt
 
@@ -458,7 +463,21 @@ class Worker:
             if entry is not None:
                 status = entry.get("status") or {}
                 if status.get("status_str") == "error":
-                    raise JobFailed(_history_error(status))
+                    message, code = _history_failure(status)
+                    # Traceback/current_inputs go to the USER'S console only —
+                    # never to the relay (paths + prompt text). See
+                    # _history_failure.
+                    detail = _history_debug(status)
+                    if detail:
+                        log.warning("job %s: ComfyUI traceback:\n%s", job_id, detail)
+                    # ⭐ CANCEL BEATS FAILURE. `canceled` can flip at any await
+                    # above (the heartbeat sets it from its own task), so by the
+                    # time we read this block the interrupt recorded in /history
+                    # may well be the one WE asked for. Reporting that as
+                    # "failed" is how a cancel shows up in the app as an error.
+                    if code == INTERRUPTED and canceled.is_set():
+                        raise JobCanceled()
+                    raise JobFailed(message, error_code=code)
                 if entry.get("outputs"):
                     # Outputs are present — _collect_outputs takes it from here.
                     return prompt_id
@@ -475,8 +494,13 @@ class Worker:
                 if not _in_queue(q, prompt_id):
                     # Neither in history nor queued/running: the prompt was
                     # interrupted or deleted on ComfyUI out from under us.
-                    raise JobFailed("job was interrupted on ComfyUI",
-                                    error_code="interrupted")
+                    # Same race as the history branch above — the /queue read is
+                    # an await, and a cancel that lands during it is precisely
+                    # what makes the prompt disappear.
+                    if canceled.is_set():
+                        raise JobCanceled()
+                    raise JobFailed(_INTERRUPTED_MESSAGE,
+                                    error_code=INTERRUPTED)
 
             if completed_at is not None and now - completed_at >= OUTPUTS_GRACE:
                 # Outputs never materialised; return and let _collect_outputs
@@ -505,19 +529,26 @@ class Worker:
         only issue it once we've confirmed OUR prompt is the running one. A
         still-pending prompt is removed with the targeted POST /queue delete,
         which leaves a running job untouched. If the prompt is in neither list it
-        has already finished/vanished — nothing to do. Best-effort: a failure to
-        read the queue is logged, not raised (the caller is already aborting).
+        has already finished/vanished — nothing to do.
+
+        ⭐ WHOLLY best-effort. The queue READ was already guarded, but the
+        queue_delete / interrupt calls were not: an exception there escaped
+        _run_prompt, skipped the `except JobCanceled` in handle_job and landed
+        in its generic handler, which reports the job FAILED. A cancel the user
+        asked for must never surface as a failure — the worst honest outcome of
+        a cancel we couldn't deliver is a job reported canceled while ComfyUI
+        keeps rendering locally, which is exactly what the user sees today when
+        the prompt has already left the queue.
         """
         try:
             q = await self.comfy.queue()
+            if _queue_has(q, "queue_pending", prompt_id):
+                await self.comfy.queue_delete([prompt_id])
+            elif _queue_has(q, "queue_running", prompt_id):
+                await self.comfy.interrupt()
+            # else: not pending or running anymore — nothing to cancel.
         except Exception as e:  # noqa: BLE001 - cancellation is best-effort
-            log.warning("could not read ComfyUI queue to cancel %s: %s", prompt_id, e)
-            return
-        if _queue_has(q, "queue_pending", prompt_id):
-            await self.comfy.queue_delete([prompt_id])
-        elif _queue_has(q, "queue_running", prompt_id):
-            await self.comfy.interrupt()
-        # else: not pending or running anymore — nothing to cancel.
+            log.warning("could not cancel %s on ComfyUI: %s", prompt_id, e)
 
     async def _collect_outputs(
         self, prompt_id: str, output_format: str, job_prompt: dict | None = None
@@ -597,20 +628,153 @@ def _in_queue(q: dict, prompt_id: str) -> bool:
             or _queue_has(q, "queue_pending", prompt_id))
 
 
-def _history_error(status: dict) -> str:
-    """Pull a human error message out of a /history status block.
+EXECUTION_ERROR = "execution_error"      # a node raised while executing
+INTERRUPTED = "interrupted"              # the run was interrupted, not broken
 
-    ComfyUI records ``status.messages`` as a list of ``[event_name, payload]``
-    pairs; the failure detail lives in the ``execution_error`` payload's
-    ``exception_message``. Falls back to a generic string when absent. Pure.
+# The generic message, kept BYTE-IDENTICAL to what shipped before: it is what
+# users on older plugins are seeing right now, and the app's text-matching
+# fallbacks are calibrated against the strings the plugin actually emits.
+_GENERIC_EXECUTION_ERROR = "ComfyUI reported an execution error"
+_INTERRUPTED_MESSAGE = "job was interrupted on ComfyUI"
+
+_MAX_DETAIL_CHARS = 400  # bound on the exception text we forward (cf. jobs._plain)
+
+
+def _history_messages(status: dict) -> list[tuple[str, dict]]:
+    """Normalise ``status.messages`` into ``[(event_name, payload), ...]``.
+
+    ComfyUI's canonical shape is a list of ``[event_name, payload]`` pairs, but
+    that is NOT a contract we control and it has been observed to vary:
+
+      * the key is missing entirely (older / forked builds only write
+        ``status_str``)                                      -> []
+      * the whole block is serialised as a dict
+        ``{"execution_error": {...}}``                       -> its items
+      * an entry is a bare string, a 1-element list, or has a non-dict payload
+                                                             -> skipped/normalised
+
+    NEVER raises and never returns a non-dict payload, so every caller can read
+    payload keys without guarding. Pure => testable without a ComfyUI.
     """
-    for msg in status.get("messages") or []:
-        if isinstance(msg, (list, tuple)) and len(msg) >= 2 and msg[0] == "execution_error":
-            payload = msg[1] or {}
-            detail = payload.get("exception_message") or payload.get("exception_type")
+    raw = status.get("messages")
+    if isinstance(raw, dict):
+        items = list(raw.items())
+    elif isinstance(raw, (list, tuple)):
+        items = [(m[0], m[1]) for m in raw
+                 if isinstance(m, (list, tuple)) and len(m) >= 2]
+    else:
+        return []
+    out: list[tuple[str, dict]] = []
+    for name, payload in items:
+        if isinstance(name, str):
+            out.append((name, payload if isinstance(payload, dict) else {}))
+    return out
+
+
+def _first_text(payload: dict, *keys: str) -> str:
+    """First key whose value is a non-blank string (after str()/strip()); "" if none.
+
+    ⚠️ Deliberately NOT ``a or b``: ComfyUI does emit ``exception_message: ""``,
+    and an ``or`` chain over the raw values falls all the way through to the
+    generic message even when a perfectly good ``exception_type`` sits right
+    next to it.
+    """
+    for k in keys:
+        v = payload.get(k)
+        if v is None or isinstance(v, (dict, list, tuple)):
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
+
+
+def _node_label(payload: dict) -> str:
+    """"KSampler (#12)" / "KSampler" / "#12" / "" from an execution_error payload.
+
+    ``node_type`` is the single most useful field ComfyUI hands us and it was
+    being thrown away: "which node blew up" turns an opaque Python exception
+    into something a user can act on. ``node_id`` disambiguates when a workflow
+    has several nodes of the same type.
+    """
+    node_type = _first_text(payload, "node_type")
+    node_id = _first_text(payload, "node_id")
+    if node_type and node_id:
+        return f"{node_type} (#{node_id})"
+    if node_type:
+        return node_type
+    return f"#{node_id}" if node_id else ""
+
+
+def _history_failure(status: dict) -> tuple[str, str]:
+    """A /history ``status_str == "error"`` block -> ``(message, error_code)``.
+
+    ⭐ Why this replaced the old ``_history_error`` (2026-08-07, production
+    metrics): 5 failures across 5 users landed on the bare generic string with
+    an EMPTY error_code, so neither the user nor the app learned anything. Two
+    separate causes, both fixed here:
+
+      1. the block's event is ``execution_interrupted``, not
+         ``execution_error`` — a user hitting interrupt in their browser, or
+         our own /interrupt (see Worker._cancel_comfy). That payload has no
+         ``exception_message`` at all, so the old loop matched nothing. It is
+         also NOT a failure: it gets INTERRUPTED, the same code the
+         vanished-from-queue path already reports, and _run_prompt turns it into
+         a cancel outright when the cancel was ours.
+      2. the ``execution_error`` payload's neighbouring fields (``node_type`` /
+         ``node_id``) were discarded, leaving only a raw Python exception.
+
+    ``traceback`` and ``current_inputs`` stay LOCAL on purpose. They are logged
+    to the user's own ComfyUI console (see _run_prompt) but never uploaded: a
+    traceback embeds absolute paths from the user's disk, and current_inputs can
+    embed their prompt text. Neither belongs in a relay row.
+
+    Both codes are new on this path and the app may not know them yet. That is
+    safe by construction: an unrecognised code falls through the app's switch to
+    the same generic display it uses today, showing ``message`` — which is now
+    strictly more informative than the string it replaced.
+
+    Pure. NEVER raises: any unexpected shape degrades to
+    ``(_GENERIC_EXECUTION_ERROR, EXECUTION_ERROR)``.
+    """
+    messages = _history_messages(status)
+    for name, payload in messages:
+        if name == "execution_error":
+            detail = _first_text(payload, "exception_message", "exception_type")
+            if len(detail) > _MAX_DETAIL_CHARS:
+                detail = detail[:_MAX_DETAIL_CHARS] + "…"
+            label = _node_label(payload)
+            if detail and label:
+                return f"{label}: {detail}", EXECUTION_ERROR
             if detail:
-                return str(detail)
-    return "ComfyUI reported an execution error"
+                return detail, EXECUTION_ERROR
+            if label:
+                return f"{_GENERIC_EXECUTION_ERROR} in {label}", EXECUTION_ERROR
+            return _GENERIC_EXECUTION_ERROR, EXECUTION_ERROR
+    # No execution_error anywhere. An interrupt is the one other event that puts
+    # status_str at "error", and it is a different KIND of outcome.
+    for name, _payload in messages:
+        if name == "execution_interrupted":
+            return _INTERRUPTED_MESSAGE, INTERRUPTED
+    # messages missing / unrecognised shape: same string as before, but now with
+    # a code so the app can at least tell "ComfyUI broke" from "we broke".
+    return _GENERIC_EXECUTION_ERROR, EXECUTION_ERROR
+
+
+def _history_debug(status: dict) -> str:
+    """The LOCAL-ONLY detail for the user's ComfyUI console: traceback + inputs.
+
+    Never leaves the machine (see _history_failure). "" when there's nothing to
+    add, so the caller can skip the log line entirely.
+    """
+    for name, payload in _history_messages(status):
+        if name != "execution_error":
+            continue
+        tb = payload.get("traceback")
+        if isinstance(tb, (list, tuple)):
+            tb = "".join(str(x) for x in tb)
+        return str(tb).strip() if tb else ""
+    return ""
 
 
 async def _safe_fail(relay: RelayClient, job_id: str, message: str) -> None:

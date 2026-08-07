@@ -79,6 +79,72 @@ def _insecure_allowed() -> bool:
     return os.environ.get("COMFYLINK_ALLOW_INSECURE", "").strip() in ("1", "true", "yes")
 
 
+# ── Trusted object-storage hosts (see _host_is_trusted) ──────────────────────
+# The relay signs EVERY presigned URL we are ever handed with one S3 client,
+# built from its R2_ENDPOINT env var (relay: cmd/relay/main.go r2.New(...) ->
+# internal/r2/r2.go, UsePathStyle) — so every URL's host is exactly that
+# endpoint's host, which production sets to the account-level R2 endpoint
+# `https://<accountid>.r2.cloudflarestorage.com` (relay deploy/env.example,
+# deploy/DEPLOY.md). Hence the suffix below.
+_TRUSTED_HOST_SUFFIXES = (".r2.cloudflarestorage.com",)
+
+# Escape hatch for the day the relay repoints R2_ENDPOINT at a custom S3 domain:
+# comma-separated host suffixes, e.g. "storage.example.com". Additive only — an
+# unknown/typo'd entry simply doesn't match and the URL falls back to the
+# resolved-IP block below, i.e. exactly today's behaviour. It can never widen
+# anything beyond https URLs pointing at the named hosts.
+_TRUSTED_HOSTS_ENV = "COMFYLINK_TRUSTED_HOSTS"
+
+
+def _trusted_suffixes() -> tuple[str, ...]:
+    """Built-in trusted host suffixes plus any from COMFYLINK_TRUSTED_HOSTS.
+
+    Read per call (not cached at import) so a user can set the env var and
+    restart ComfyUI without any other ceremony. Entries are lower-cased and
+    normalised to a leading dot so "example.com" can never match
+    "notexample.com".
+    """
+    extra = []
+    for raw in os.environ.get(_TRUSTED_HOSTS_ENV, "").split(","):
+        h = raw.strip().lower().strip(".")
+        if h:
+            extra.append("." + h)
+    return _TRUSTED_HOST_SUFFIXES + tuple(extra)
+
+
+def _host_is_trusted(host: str) -> bool:
+    """True if `host` is object storage the RELAY ITSELF signs URLs for.
+
+    ⭐ Why this exists (2026-08-07, from production metrics): the resolved-IP
+    block below rejects a URL when ANY address `getaddrinfo` returns looks
+    non-public, and on a real user's machine that misfires against our own R2:
+
+      * a local proxy/TUN (Clash / mihomo / sing-box) hands back a fake-ip from
+        198.18.0.0/15 -> `is_private`, even though the connection works fine;
+      * poisoned DNS answers 0.0.0.0 / 127.0.0.1;
+      * a NAT64 AAAA record (64:ff9b::/96) -> `is_reserved`, which sinks a
+        dual-stack machine even when its A record is perfectly public;
+      * `::ffff:<public v4>` on a Python without the gh-113171 fix (every
+        ComfyUI_windows_portable embed up to 3.11.8) -> `is_private`.
+        (Neutralised at the root in _ip_is_blocked too, see there.)
+
+    The user's render had already finished on their disk; only the RESULT
+    UPLOAD was refused, so the job was reported failed for nothing.
+
+    ⚠️ This is a NARROWING, not a widening. It only skips the resolved-IP block
+    for https URLs whose host is the relay's own storage endpoint. The metadata
+    endpoint (169.254.169.254), localhost and internal hostnames don't end in
+    this suffix, so their defence is untouched. And a host under this suffix is
+    by construction a public Cloudflare endpoint — it would have passed the IP
+    check anyway on a machine with clean DNS, so nothing newly reachable is
+    exposed here.
+    """
+    h = (host or "").strip().lower().rstrip(".")
+    if not h:
+        return False
+    return any(h.endswith(sfx) for sfx in _trusted_suffixes())
+
+
 def _ip_is_blocked(ip: str) -> bool:
     """True if `ip` is loopback/private/link-local/reserved — i.e. an SSRF
     target we must never fetch from (cloud metadata 169.254.169.254, localhost
@@ -88,6 +154,17 @@ def _ip_is_blocked(ip: str) -> bool:
     except ValueError:
         # Not parseable as an IP -> treat as unsafe rather than fail open.
         return True
+    # IPv4-mapped IPv6 (::ffff:<v4>) — classify by the EMBEDDED v4, and do it
+    # FIRST. This used to sit at the end of the boolean chain below, where it was
+    # dead code (is_private already short-circuited) AND version-dependent:
+    # before gh-113171 / CVE-2024-4032, Python listed the whole ::ffff:0:0/96
+    # block in _private_networks, so ::ffff:<PUBLIC v4> came back is_private=True
+    # and a perfectly good address was refused. ComfyUI_windows_portable ships
+    # 3.10.11 / 3.11.6-3.11.8 — all of them pre-fix. Deciding on the embedded v4
+    # up front makes the verdict identical on every Python version.
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        return _ip_is_blocked(str(mapped))
     return (
         addr.is_private
         or addr.is_loopback
@@ -95,8 +172,6 @@ def _ip_is_blocked(ip: str) -> bool:
         or addr.is_reserved
         or addr.is_multicast
         or addr.is_unspecified
-        # IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1) — classify by the embedded v4.
-        or (getattr(addr, "ipv4_mapped", None) is not None and _ip_is_blocked(str(addr.ipv4_mapped)))
     )
 
 
@@ -108,11 +183,12 @@ def _validate_url(url: str) -> None:
     endpoint. We require https and reject any URL whose host resolves to a
     private/loopback/link-local/reserved address.
 
-    Note on host allowlisting: we deliberately do NOT pin an R2 host suffix.
-    The plugin doesn't know the bucket/account host statically (it's chosen by
-    the relay at sign time), so a static allowlist would be brittle. The
-    resolved-IP block is the must-have defense and is sufficient to stop the
-    metadata endpoint and localhost. Raises RelayError on rejection.
+    TWO gates, and the order matters. https is required ALWAYS — no host is ever
+    trusted enough to send a presigned URL's signature over plaintext. Only then
+    may a host on the relay's own storage endpoint (_host_is_trusted) skip the
+    resolved-IP block, which on real users' machines rejected our own R2 (proxy
+    fake-ip / NAT64 / poisoned DNS — see _host_is_trusted). Every other host is
+    judged exactly as before. Raises RelayError on rejection.
     """
     parts = urlsplit(url)
     scheme = parts.scheme.lower()
@@ -128,6 +204,11 @@ def _validate_url(url: str) -> None:
         raise RelayError(f"refusing non-https URL (scheme {scheme or '<none>'})")
     if not host:
         raise RelayError("refusing URL with no host")
+
+    # https + the relay's own object storage: the IP check can only hurt here
+    # (it has no attack surface left to cover, and it demonstrably misfires).
+    if _host_is_trusted(host):
+        return
 
     # Resolve and check EVERY returned address (defeats DNS that returns both a
     # public and a private record, and IPv6/IPv4 splits).

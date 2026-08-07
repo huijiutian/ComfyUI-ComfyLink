@@ -34,7 +34,12 @@ except ImportError:  # pragma: no cover - env-dependent
     sys.modules["aiohttp"] = _stub
 
 from comfylink import relay  # noqa: E402
-from comfylink.relay import RelayError, _ip_is_blocked, _validate_url  # noqa: E402
+from comfylink.relay import (  # noqa: E402
+    RelayError,
+    _host_is_trusted,
+    _ip_is_blocked,
+    _validate_url,
+)
 
 
 def _fake_getaddrinfo(ip):
@@ -42,6 +47,12 @@ def _fake_getaddrinfo(ip):
     def _inner(host, port, *a, **k):
         return [(0, 0, 0, "", (ip, port or 0))]
     return _inner
+
+
+def _boom_getaddrinfo(host, port, *a, **k):
+    """A getaddrinfo that must never be called (proves the trusted-host
+    short-circuit ran BEFORE any DNS work)."""
+    raise AssertionError(f"getaddrinfo should not have been called for {host}")
 
 
 class TestIpIsBlocked(unittest.TestCase):
@@ -67,27 +78,95 @@ class TestIpIsBlocked(unittest.TestCase):
     def test_ipv4_mapped_loopback_blocked(self):
         self.assertTrue(_ip_is_blocked("::ffff:127.0.0.1"))
 
+    def test_ipv4_mapped_private_and_metadata_blocked(self):
+        for ip in ("::ffff:10.0.0.5", "::ffff:192.168.1.1", "::ffff:169.254.169.254",
+                   "::ffff:0.0.0.0"):
+            self.assertTrue(_ip_is_blocked(ip), ip)
+
+    def test_ipv4_mapped_public_allowed_on_every_python(self):
+        # ⭐ Regression for the pre-gh-113171 Pythons ComfyUI_windows_portable
+        # embeds (3.10.11 / 3.11.6-3.11.8): there, `::ffff:<public v4>` reports
+        # is_private=True because the whole ::ffff:0:0/96 block was listed as
+        # private, so a perfectly public address was refused. We now classify by
+        # the EMBEDDED v4 first, which makes the verdict version-independent.
+        for ip in ("::ffff:8.8.8.8", "::ffff:93.184.216.34", "::ffff:1.1.1.1"):
+            self.assertFalse(_ip_is_blocked(ip), ip)
+
+    def test_proxy_fake_ip_and_nat64_still_blocked_by_ip_rule(self):
+        # These are the ranges that misfired against our own R2 in production.
+        # The IP rule itself does NOT change — they stay blocked; the fix is the
+        # host allowlist below, which never consults this rule for our own host.
+        self.assertTrue(_ip_is_blocked("198.18.0.1"))     # Clash/mihomo fake-ip
+        self.assertTrue(_ip_is_blocked("64:ff9b::808:808"))  # NAT64
+
     def test_garbage_treated_as_blocked(self):
         # Fail closed: anything we can't parse as an IP is unsafe.
         self.assertTrue(_ip_is_blocked("not-an-ip"))
+
+
+class TestHostIsTrusted(unittest.TestCase):
+    def setUp(self):
+        self._prev = os.environ.pop(relay._TRUSTED_HOSTS_ENV, None)
+
+    def tearDown(self):
+        if self._prev is not None:
+            os.environ[relay._TRUSTED_HOSTS_ENV] = self._prev
+        else:
+            os.environ.pop(relay._TRUSTED_HOSTS_ENV, None)
+
+    def test_relay_r2_endpoint_trusted(self):
+        # The shape the relay actually signs: account-level R2 endpoint,
+        # path-style bucket (relay internal/r2/r2.go).
+        self.assertTrue(_host_is_trusted("abc123.r2.cloudflarestorage.com"))
+        self.assertTrue(_host_is_trusted("ABC123.R2.CloudflareStorage.com"))
+        self.assertTrue(_host_is_trusted("abc123.r2.cloudflarestorage.com."))
+
+    def test_lookalike_hosts_not_trusted(self):
+        for host in (
+            "r2.cloudflarestorage.com.attacker.example",   # suffix in the middle
+            "notr2.cloudflarestorage.com.evil.example",
+            "r2.cloudflarestorage.com",                    # apex, never signed
+            "metadata.google.internal",
+            "localhost",
+            "169.254.169.254",
+            "",
+        ):
+            self.assertFalse(_host_is_trusted(host), host)
+
+    def test_env_adds_suffixes(self):
+        os.environ[relay._TRUSTED_HOSTS_ENV] = " storage.example.com , "
+        self.assertTrue(_host_is_trusted("acct.storage.example.com"))
+        # Normalised to a leading dot => can't match a neighbouring domain.
+        self.assertFalse(_host_is_trusted("notstorage.example.com"))
+        self.assertFalse(_host_is_trusted("storage.example.com.evil.test"))
+
+    def test_env_empty_is_a_no_op(self):
+        os.environ[relay._TRUSTED_HOSTS_ENV] = " , ,, "
+        self.assertFalse(_host_is_trusted("cdn.example.com"))
+        self.assertTrue(_host_is_trusted("acct.r2.cloudflarestorage.com"))
 
 
 class TestValidateUrl(unittest.TestCase):
     def setUp(self):
         # Ensure the dev escape hatch is OFF for the secure-path tests.
         self._prev = os.environ.pop("COMFYLINK_ALLOW_INSECURE", None)
+        self._prev_trusted = os.environ.pop(relay._TRUSTED_HOSTS_ENV, None)
 
     def tearDown(self):
         if self._prev is not None:
             os.environ["COMFYLINK_ALLOW_INSECURE"] = self._prev
         else:
             os.environ.pop("COMFYLINK_ALLOW_INSECURE", None)
+        if self._prev_trusted is not None:
+            os.environ[relay._TRUSTED_HOSTS_ENV] = self._prev_trusted
+        else:
+            os.environ.pop(relay._TRUSTED_HOSTS_ENV, None)
 
     def test_https_public_host_allowed(self):
         with mock.patch.object(relay.socket, "getaddrinfo",
                                _fake_getaddrinfo("93.184.216.34")):
             # Should not raise.
-            _validate_url("https://bucket.r2.cloudflarestorage.com/obj?sig=x")
+            _validate_url("https://cdn.example.com/obj?sig=x")
 
     def test_http_denied_by_default(self):
         with self.assertRaises(RelayError):
@@ -140,6 +219,73 @@ class TestValidateUrl(unittest.TestCase):
         os.environ["COMFYLINK_ALLOW_INSECURE"] = "1"
         with self.assertRaises(RelayError):
             _validate_url("file:///etc/passwd")
+
+    # ── The trusted-host bypass (2026-08-07 production fix) ──────────────────
+    #
+    # Each of these resolutions is a REAL failure mode observed on users'
+    # machines: the render finished on disk, but the presigned PUT was refused
+    # locally and the job was reported failed for nothing.
+
+    def test_relay_r2_host_skips_ip_check_entirely(self):
+        # getaddrinfo must not even be reached — no DNS, no verdict to misfire.
+        with mock.patch.object(relay.socket, "getaddrinfo", _boom_getaddrinfo):
+            _validate_url("https://acct.r2.cloudflarestorage.com/bucket/k?sig=x")
+
+    def test_relay_r2_host_allowed_behind_proxy_fake_ip(self):
+        # Clash / mihomo / sing-box fake-ip pool (198.18.0.0/15) — the #1 cause.
+        with mock.patch.object(relay.socket, "getaddrinfo",
+                               _fake_getaddrinfo("198.18.0.42")):
+            _validate_url("https://acct.r2.cloudflarestorage.com/bucket/k?sig=x")
+
+    def test_relay_r2_host_allowed_behind_nat64(self):
+        with mock.patch.object(relay.socket, "getaddrinfo",
+                               _fake_getaddrinfo("64:ff9b::b2b8:d822")):
+            _validate_url("https://acct.r2.cloudflarestorage.com/bucket/k?sig=x")
+
+    def test_relay_r2_host_allowed_with_poisoned_dns(self):
+        with mock.patch.object(relay.socket, "getaddrinfo",
+                               _fake_getaddrinfo("0.0.0.0")):
+            _validate_url("https://acct.r2.cloudflarestorage.com/bucket/k?sig=x")
+
+    def test_relay_r2_host_allowed_when_dns_fails_outright(self):
+        # A proxy that answers nothing locally still lets the connection through.
+        def _gaierror(host, port, *a, **k):
+            raise relay.socket.gaierror("nodename nor servname provided")
+        with mock.patch.object(relay.socket, "getaddrinfo", _gaierror):
+            _validate_url("https://acct.r2.cloudflarestorage.com/bucket/k?sig=x")
+
+    def test_trusted_host_still_requires_https(self):
+        # ⛔ The allowlist NEVER relaxes the scheme — a presigned URL's signature
+        # must not go out in plaintext, whatever the host.
+        with self.assertRaises(RelayError):
+            _validate_url("http://acct.r2.cloudflarestorage.com/bucket/k?sig=x")
+
+    def test_allowlist_does_not_weaken_the_metadata_defence(self):
+        # The whole point: everything NOT on the allowlist is judged exactly as
+        # before, including a host that merely *contains* the trusted suffix.
+        for host in ("169.254.169.254", "metadata.google.internal",
+                     "r2.cloudflarestorage.com.attacker.example"):
+            with mock.patch.object(relay.socket, "getaddrinfo",
+                                   _fake_getaddrinfo("169.254.169.254")):
+                with self.assertRaises(RelayError):
+                    _validate_url(f"https://{host}/latest/meta-data/")
+
+    def test_env_trusted_host_skips_ip_check(self):
+        os.environ[relay._TRUSTED_HOSTS_ENV] = "storage.example.com"
+        with mock.patch.object(relay.socket, "getaddrinfo", _boom_getaddrinfo):
+            _validate_url("https://acct.storage.example.com/bucket/k?sig=x")
+
+    def test_unknown_host_falls_back_to_ip_check(self):
+        # An entry that doesn't match changes nothing — the guard is ADDITIVE,
+        # so a wrong/typo'd suffix can never block an upload that works today.
+        os.environ[relay._TRUSTED_HOSTS_ENV] = "typo.example.net"
+        with mock.patch.object(relay.socket, "getaddrinfo",
+                               _fake_getaddrinfo("93.184.216.34")):
+            _validate_url("https://cdn.example.com/obj")
+        with mock.patch.object(relay.socket, "getaddrinfo",
+                               _fake_getaddrinfo("10.1.2.3")):
+            with self.assertRaises(RelayError):
+                _validate_url("https://cdn.example.com/obj")
 
 
 class TestStatePermissions(unittest.TestCase):

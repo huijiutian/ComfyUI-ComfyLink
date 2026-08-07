@@ -165,7 +165,10 @@ class TestRunPrompt(unittest.IsolatedAsyncioTestCase):
         with _fast(), self.assertRaises(JobFailed) as cm:
             await asyncio.wait_for(w._run_prompt("j", {}, canceled), 3)
         self.assertEqual(cm.exception.message, "CUDA out of memory")
-        self.assertEqual(cm.exception.error_code, "")  # NOT a stall/interrupt
+        # 2026-08-07: this path used to report error_code "" (the app then had no
+        # machine-readable clue at all). It now carries "execution_error" —
+        # NOT a stall and NOT an interrupt. Shapes: tests/test_history_error.py.
+        self.assertEqual(cm.exception.error_code, "execution_error")
         comfy.interrupt.assert_not_awaited()
 
     async def test_interrupted_when_gone(self):
