@@ -75,6 +75,13 @@ class TestRevokeStrikes(unittest.IsolatedAsyncioTestCase):
         loudly instead of hanging.
         """
         comfy = _mock_comfy()
+        # Recorded so a test can assert HOW LONG the confirmation window spans,
+        # not just how many rejections it took (see test_confirmation_window_...).
+        self.sleeps = []
+
+        async def rec_sleep(d):
+            self.sleeps.append(d)
+
         with mock.patch.object(worker, "REVOKED_CONFIRM_STRIKES", strikes), \
                 mock.patch.object(worker, "RelayClient", return_value=relay), \
                 mock.patch.object(worker, "ComfyClient", return_value=comfy), \
@@ -82,7 +89,7 @@ class TestRevokeStrikes(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(worker, "STATUS"), \
                 mock.patch.object(worker, "STATE", state), \
                 mock.patch.object(worker, "_heartbeat_loop", mock.AsyncMock()), \
-                mock.patch.object(worker.asyncio, "sleep", mock.AsyncMock()):
+                mock.patch.object(worker.asyncio, "sleep", rec_sleep):
             await asyncio.wait_for(
                 worker._serve_pairing(
                     pairing, asyncio.Lock(), None, "http://comfy", stop,
@@ -106,6 +113,44 @@ class TestRevokeStrikes(unittest.IsolatedAsyncioTestCase):
         # Removed the instant the 3rd consecutive rejection landed — not before,
         # not after (a 4th register would mean it kept looping past threshold).
         self.assertEqual(relay.register.await_count, 3)
+
+    async def test_confirmation_window_outlasts_a_relay_redeploy(self):
+        """The unpair confirmation must span LONGER than a relay restart.
+
+        The count alone is not the guard — the WALL CLOCK it covers is. With the
+        old flat 5s backoff, REVOKED_CONFIRM_STRIKES=3 meant the device was
+        unpaired for good ~10s after the first rejection, i.e. the confirmation
+        window was SHORTER than the very outage (a Render redeploy, tens of
+        seconds) it exists to absorb. Pin the real constants here so a future
+        re-tune can't silently shrink it back under a deploy window.
+        """
+        # Backoff must escalate, never shrink, and saturate past the last entry.
+        spans = [worker._revoke_backoff(i) for i in range(1, 7)]
+        self.assertEqual(spans, sorted(spans), "backoff must never shrink")
+        self.assertEqual(worker._revoke_backoff(99), worker._REVOKE_STRIKE_BACKOFF[-1])
+
+        # Sleeps happen after strikes 1..N-1 (the Nth unpairs immediately), so
+        # that sum is the minimum real time between the first rejection and the
+        # permanent unpair. A relay redeploy window is "tens of seconds".
+        window = sum(worker._revoke_backoff(i)
+                     for i in range(1, worker.REVOKED_CONFIRM_STRIKES))
+        self.assertGreaterEqual(
+            window, 60,
+            "the confirmation window must outlast a relay redeploy (>=60s); "
+            f"it is only {window}s",
+        )
+
+        # ...and the loop must actually WAIT those amounts, not just define them.
+        pairing = Pairing(backend_id="b1", device_token="t1")
+        state = _SupervisorState([pairing])
+        relay = _mock_relay()
+        relay.register.side_effect = RelayError("device gone", 401)
+
+        await self._serve(relay, state, pairing,
+                          strikes=worker.REVOKED_CONFIRM_STRIKES)
+
+        self.assertEqual(state.remove_calls, 1)
+        self.assertEqual(sum(self.sleeps), window)
 
     async def test_401s_below_threshold_keep_pairing_and_retry(self):
         # Two 401s with a threshold of 3: the device must NOT be unpaired, and

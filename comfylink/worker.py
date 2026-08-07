@@ -136,10 +136,27 @@ EXECUTION_BACKSTOP_TIMEOUT = 30 * 60  # seconds before abandoning a wedged promp
 # single 401 *should* be a real revoke — but a relay redeploy/restart can still
 # briefly surface a stray 401/403. This is the second line of defence: we require
 # this many CONSECUTIVE auth rejections (a successful register in between resets
-# the count) before believing the device was truly unpaired. A real revoke still
-# lands after N tries (~N×5s ≈ 15s here), which is fine for a rare, user-driven
-# action; a lone blip is absorbed.
-REVOKED_CONFIRM_STRIKES = 3
+# the count) before believing the device was truly unpaired.
+#
+# ⭐ 计数 AND 时长,两个都要够。原来是 3 次 × 固定 5s 退避 —— 也就是说从第一次
+# 拒绝到永久解绑只跨了 ~10 秒真实时间,而它要防的那件事(Render 重新部署造成的
+# 不可用)是【几十秒】。确认窗口比故障窗口还短,等于没防。现在退避按 strike 递增
+# (见 _REVOKE_STRIKE_BACKOFF),4 次拒绝跨 ≥65 秒,稳稳盖过一次部署重启;真解绑
+# 也就慢了 ~1 分钟才在面板上消失,而解绑本身是 App 端发起的、罕见的用户动作,
+# 插件这边晚一分钟收摊没有任何代价。
+REVOKED_CONFIRM_STRIKES = 4
+
+# 第 N 次连续拒绝之后等多久再试(秒);超出长度就一直用最后一个值。
+# 前面短、后面长:真解绑的第一拍要快点确认(别让面板一直转),而拖到后面的
+# 那几拍才是用来「熬过部署窗口」的。
+_REVOKE_STRIKE_BACKOFF = (5, 15, 45, 60)
+
+
+def _revoke_backoff(strike: int) -> int:
+    """Seconds to wait after the `strike`-th (1-based) consecutive auth rejection."""
+    if strike < 1:
+        strike = 1
+    return _REVOKE_STRIKE_BACKOFF[min(strike, len(_REVOKE_STRIKE_BACKOFF)) - 1]
 
 # PLUGIN_TOO_OLD_RETRY is the backoff after the relay refuses to serve this
 # plugin version (403 + error_code "plugin_too_old"). Deliberately much longer
@@ -962,11 +979,12 @@ async def _serve_pairing(pairing, job_lock: asyncio.Lock, session, comfy_url,
                 )
                 return
             STATUS.set(error="auth rejected; retrying")
+            wait = _revoke_backoff(revoked_strikes)
             log.warning(
-                "pairing %s auth rejected (strike %d/%d), retrying in 5s",
-                bid, revoked_strikes, REVOKED_CONFIRM_STRIKES,
+                "pairing %s auth rejected (strike %d/%d), retrying in %ds",
+                bid, revoked_strikes, REVOKED_CONFIRM_STRIKES, wait,
             )
-            await asyncio.sleep(5)
+            await asyncio.sleep(wait)
         except TypeError:
             # A TypeError here is a PROGRAMMING error (wrong signature, wrong
             # argument type), never a network blip — and the broad `except

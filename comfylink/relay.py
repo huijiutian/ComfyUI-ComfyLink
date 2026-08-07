@@ -37,10 +37,38 @@ PROGRESS_WAIT_TIMEOUT = aiohttp.ClientTimeout(total=45)
 # relay reaper's 5-minute job-stale threshold, so a late-but-delivered result is
 # never mistaken for a dead job. Permanent errors (4xx auth/revoke, SSRF, R2 4xx)
 # propagate IMMEDIATELY so a real failure or an unpair is never masked as a retry.
+#
+# ⚠️ _RETRY_MAX_ELAPSED counts SLEEP, not wall clock: every attempt can burn up to
+# DEFAULT_TIMEOUT (30s) of its own before failing, so an outage in which requests
+# HANG takes longer in real time than this number suggests. The shapes a Render
+# restart actually produces — connection refused, 502/503 from the edge — fail
+# fast, so in practice the wall clock ≈ this budget.
 _RETRY_MAX_ELAPSED = 90.0   # seconds of cumulative backoff before giving up
 _RETRY_BASE = 1.0           # first backoff
 _RETRY_CAP = 15.0           # per-attempt backoff ceiling
 _RETRY_STATUSES = frozenset({502, 503, 504})  # transient proxy/relay; 4xx never retried
+
+# Exception shapes that mean "the transport broke", i.e. exactly the thing a relay
+# restart does to an in-flight request. Kept as an explicit tuple rather than a
+# broad `aiohttp.ClientError` catch, because ClientError also covers PERMANENT
+# programming/URL faults (InvalidURL, ClientResponseError from raise_for_status)
+# that must never be retried for 90 seconds.
+#
+# ⭐ ClientPayloadError is here for a reason, and it is NOT a ClientConnectionError
+# (verified against aiohttp 3.14: its base is ClientError directly). It is what
+# aiohttp raises when the response BODY is cut short — precisely what happens when
+# the relay accepts a request, starts writing, and then the process goes away
+# mid-deploy. Before it was listed here, that one shape escaped _deliver with zero
+# retries, so a job whose render had already finished lost its result to a restart
+# that every OTHER shape of the same outage rode out fine. A truncated response
+# also means we cannot know whether the write landed — which is safe here for the
+# same reason the rest of _deliver is: result is terminal-guarded server-side and a
+# presigned PUT is idempotent, so re-sending is at worst a no-op.
+_RETRY_EXCEPTIONS = (
+    aiohttp.ClientConnectionError,   # refused / reset / server disconnected / connect timeout
+    aiohttp.ClientPayloadError,      # response body truncated mid-flight (see above)
+    asyncio.TimeoutError,            # our own total timeout elapsed
+)
 
 # Cap on object-storage downloads (input images). Bounds memory so a malicious
 # or buggy relay can't point get_object at a huge/endless body and OOM the host.
@@ -253,8 +281,9 @@ class RelayClient:
         outage. `thunk` is a zero-arg async factory (called fresh each attempt);
         its return value is passed straight back on success.
 
-        Retries ONLY transient infrastructure failures — connection errors,
-        timeouts, and 502/503/504 — with capped exponential backoff, up to
+        Retries ONLY transient infrastructure failures — the transport shapes in
+        _RETRY_EXCEPTIONS (connection errors, truncated response bodies, timeouts)
+        and statuses 502/503/504 — with capped exponential backoff, up to
         _RETRY_MAX_ELAPSED of cumulative sleep. A non-transient RelayError (any
         other status, incl. 4xx auth/revoke and 0 = SSRF/validation) propagates
         immediately. Retrying is safe: the relay's result write is terminal-
@@ -268,7 +297,7 @@ class RelayClient:
             attempt += 1
             try:
                 return await thunk()
-            except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+            except _RETRY_EXCEPTIONS as e:
                 err = e
             except RelayError as e:
                 if e.status not in _RETRY_STATUSES:

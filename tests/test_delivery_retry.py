@@ -80,6 +80,57 @@ class TestDeliverRetry(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await relay._deliver("t", thunk), "done")
 
+    async def test_truncated_response_body_is_retried(self):
+        """A response cut short mid-body is a RESTART, not a failure.
+
+        aiohttp raises ClientPayloadError when the relay accepts a request, starts
+        writing the response, and then goes away — the single most literal shape of
+        "the process was replaced mid-deploy". It is NOT a ClientConnectionError
+        (its base is ClientError directly), so it used to slip past _deliver with
+        ZERO retries: connection-refused and 502 rode the outage out fine while
+        this one lost the finished job's result outright. Pinned here so the base
+        class it happens to have can never quietly drop it again.
+        """
+        self.assertNotIsInstance(
+            aiohttp.ClientPayloadError("x"), aiohttp.ClientConnectionError,
+            "if this ever becomes true, the explicit listing is merely redundant "
+            "— but do not rely on it: pin the behaviour below, not the hierarchy",
+        )
+        relay = _bare_client()
+        calls = {"n": 0}
+
+        async def thunk():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise aiohttp.ClientPayloadError(
+                    "Response payload is not completed")
+            return "ok"
+
+        self.assertEqual(await relay._deliver("t", thunk), "ok")
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(self.sleeps, [1.0, 2.0])
+
+    async def test_permanent_client_errors_are_not_retried(self):
+        """Only the TRANSPORT shapes retry — a ClientError is not a blanket pass.
+
+        The guard against "fix the truncation case by catching aiohttp.ClientError"
+        — that would also swallow permanent faults (bad URL, a raise_for_status
+        response error) into 90 seconds of pointless backoff, hiding a real bug
+        behind what looks like an outage.
+        """
+        relay = _bare_client()
+        for exc in (aiohttp.InvalidURL("http://["),
+                    aiohttp.ClientResponseError(None, (), status=400)):
+            calls = {"n": 0}
+
+            async def thunk(e=exc):
+                calls["n"] += 1
+                raise e
+
+            with self.assertRaises(type(exc)):
+                await relay._deliver("t", thunk)
+            self.assertEqual(calls["n"], 1, f"{type(exc).__name__} must not retry")
+
     async def test_4xx_propagates_immediately(self):
         relay = _bare_client()
         calls = {"n": 0}
