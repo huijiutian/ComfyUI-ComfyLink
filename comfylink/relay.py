@@ -27,6 +27,31 @@ DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=30)
 # 不动 —— 其它调用都是普通的一来一回,给它们放宽只会让真故障拖更久才暴露。
 PROGRESS_WAIT_TIMEOUT = aiohttp.ClientTimeout(total=45)
 
+# FOREIGN_QUEUE_UNKNOWN 是心跳里 `foreign_queue_depth` 的**「读不到」哨兵**。
+#
+# ⛔ 它必须是一个**负数**,不能是 0,也不能是 null:0 是一个完全合法的深度
+# (「这台 ComfyUI 上没有别人的活」),而 null 在中继的整数字段上会静默变成 0。把
+# 「没人占」和「不知道」混成一件事,正是将来写调度时最贵的一种错 —— 它会让一台我们
+# 其实什么都不知道的机器看起来像最闲的那台。
+FOREIGN_QUEUE_UNKNOWN = -1
+
+
+def _wire_queue_depth(v) -> int:
+    """把队列深度归一成上线用的 int(读不到 ⇒ FOREIGN_QUEUE_UNKNOWN)。
+
+    ⛔ 守的是那条血教训的边界(见 heartbeat 的 docstring):一个 float / None /
+    字符串跑到中继的整数字段上,会让**整个请求体**解析失败,这台机器的心跳从此
+    永久死掉。这里宁可把认不出的值降级成「不知道」,也绝不让它出线。
+    """
+    if isinstance(v, bool):      # bool 是 int 的子类,别让 True 变成深度 1
+        return FOREIGN_QUEUE_UNKNOWN
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return FOREIGN_QUEUE_UNKNOWN
+    return n if n >= 0 else FOREIGN_QUEUE_UNKNOWN
+
+
 # ── Delivery retry (ride a short relay/network outage, e.g. a relay redeploy) ──
 # Only the DELIVERY-critical, one-shot calls (result / sign_upload / put_object)
 # use this: a job whose render finishes during the deploy window would otherwise
@@ -383,7 +408,9 @@ class RelayClient:
 
     async def heartbeat(self, backend_id: str,
                         object_info_hash: str = "",
-                        object_info_synced_at: float = 0.0) -> dict:
+                        object_info_synced_at: float = 0.0,
+                        foreign_queue_depth: int = FOREIGN_QUEUE_UNKNOWN,
+                        loaded_checkpoint: str = "") -> dict:
         """Mark this backend alive. Returns the relay's response body.
 
         The body is the plugin's ONLY inbound channel while idle, so it doubles
@@ -448,13 +475,41 @@ class RelayClient:
         HERE and is the real fix: the value is an integer, the wire format should
         say so, and plugins already installed on users' machines are the ones the
         relay has to be tolerant for.
+
+        ``foreign_queue_depth`` / ``loaded_checkpoint`` are this machine's ComfyUI
+        state (worker._ComfyProbe). See the comment on the body below for their
+        wire contract; both are sent on EVERY beat, unconditionally.
         """
         # ⚠️ caps 和 version/commit 同规格:**每一拍都发,无条件**。中继每次心跳都
         # 用收到的值覆盖(空也写空),这样用户从新插件回退到老插件时能力会立刻消失;
         # 反过来说,这里一旦写成「有条件才带」,能力就会在 App 里闪断。见 version.__caps__。
+        #
+        # ⭐ foreign_queue_depth / loaded_checkpoint 走的是**同一条规矩**,而且理由
+        # 更硬:中继每一拍都会用收到的值覆盖(读不到就覆盖成 NULL),所以这两个键必须
+        # **无条件出现**。写成「取到了才带上」会让中继侧的值在两拍之间闪断/残留 ——
+        # 一个残留下来的旧队列深度比没有值更坏,将来的调度会照着它派活。
+        #
+        # wire 契约(中继侧 api/backends.go 的 heartbeatReq 是同一份):
+        #	foreign_queue_depth  int。**「别人占了这台机器多少」** —— 这台 ComfyUI
+        #	                     队列里**不是我们提交的**那些 prompt 的条数。
+        #	                     >=0 是真实条数(0 = 没有别人的活),**-1 = 读不到**。
+        #	                     ⛔ 0 和「不知道」必须分得开:Go 那边 null 落到整数
+        #	                     字段上就是 0,正好把两者混成一件事。
+        #	                     ⚠️ 为什么不是队列**总深度**:中继自己就知道它派了
+        #	                     多少活(它自己的 jobs 表里有),总深度里我们那部分
+        #	                     对它信息量为零。它真正看不见的是用户自己占了多少。
+        #	                     口径与近似程度见 worker._ComfyProbe。
+        #	loaded_checkpoint    str。"" = 读不到 / 这台机器还没跑过东西。近似值,
+        #	                     偏差见 jobs.last_checkpoint 上那段。
+        #
+        # ⛔ foreign_queue_depth 必须以**真正的 int** 出线,理由同上面那段水位线的血
+        # 教训:一个 `3.0` 会让中继的整数字段解析**整个请求体**失败,这台机器的心跳
+        # 从此永久死掉。_wire_queue_depth 就守在这个边界上。
         body = {"backend_id": backend_id,
                 "version": __version__, "commit": __commit__,
-                "caps": __caps__}
+                "caps": __caps__,
+                "foreign_queue_depth": _wire_queue_depth(foreign_queue_depth),
+                "loaded_checkpoint": str(loaded_checkpoint or "")}
         if object_info_hash:
             body["object_info_hash"] = object_info_hash
         if object_info_synced_at and object_info_synced_at > 0:

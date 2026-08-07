@@ -50,7 +50,11 @@ class TestVersionReporting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, [(
             "POST", "/v1/backends/heartbeat",
             {"backend_id": "b1", "version": __version__, "commit": __commit__,
-             "caps": ["models"]},
+             "caps": ["models"],
+             # ⭐ 2026-08-07 起心跳无条件携带本机 ComfyUI 现状(R-1.0.8-21):
+             # -1/"" 是「不知道」哨兵 —— 无 ComfyUI 客户端的测试装配正落在哨兵上。
+             "foreign_queue_depth": -1,
+             "loaded_checkpoint": ""},
         )])
 
     async def test_register_declares_the_models_capability(self):

@@ -1121,7 +1121,9 @@ class TestNothingScansWithoutTheSignal(unittest.IsolatedAsyncioTestCase):
             raise worker._Revoked()
 
         async def counting_heartbeat(bid, object_info_hash="",
-                                     object_info_synced_at=0.0):
+                                     object_info_synced_at=0.0,
+                                     foreign_queue_depth=-1,
+                                     loaded_checkpoint=""):
             # This pairing has never captured a snapshot nor served a refresh
             # request, so the beat must carry neither receipt field at all (see
             # RelayClient.heartbeat: empty/0 means "keep what you have").

@@ -77,6 +77,28 @@ class ComfyClient:
             r.raise_for_status()
             return await r.json()
 
+    async def recent_history(self, max_items: int) -> dict:
+        """The tail of ComfyUI's execution history, newest LAST.
+
+        ``GET /history?max_items=N`` returns ``{prompt_id: {"prompt": [...],
+        "outputs": {...}, "status": {...}}, ...}``. ComfyUI's history is an
+        insertion-ordered dict and ``max_items`` slices the END of it, so the
+        last key is the most recently finished prompt.
+
+        Like ``/queue`` this is INSTANCE-WIDE — a prompt the user ran from their
+        own ComfyUI page is in here too, which is what makes it usable as an
+        approximation of "what is loaded on this machine" rather than only "what
+        WE last ran". It is also in-memory: a ComfyUI restart empties it, which
+        is exactly right (a restarted ComfyUI has nothing loaded).
+
+        ``max_items`` is passed as a query param and kept small on purpose: each
+        entry carries the full prompt graph.
+        """
+        async with self._session.get(self._base + "/history",
+                                     params={"max_items": str(int(max_items))}) as r:
+            r.raise_for_status()
+            return await r.json()
+
     async def queue_delete(self, ids: list[str]) -> None:
         """Remove specific PENDING prompts from the queue (precise, never global).
 

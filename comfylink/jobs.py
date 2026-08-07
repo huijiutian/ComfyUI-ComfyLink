@@ -787,3 +787,106 @@ def _describe(item: dict) -> str:
         bits.append(node)
     suffix = f" ({', '.join(bits)})" if bits else ""
     return f'"{item["value"] or "?"}"{suffix}'
+
+
+# ── 「这台机器上多半已经加载着哪个 checkpoint」──────────────────────────────
+#
+# 中继想知道这个,是为了将来把用到某个模型的任务优先派给**已经加载了它**的机器 ——
+# 换模型是几十秒级的开销。本次只把数据管道打通,中继暂时不拿它做任何决策。
+#
+# ⛔ **这是近似值,而且 ComfyUI 没有给出真值的余地。** 它没有任何 REST 端点报告
+# 「当前显存里加载着什么」:`/system_stats` 只有 OS / RAM / VRAM / 版本号这些,
+# `/models/*` 报的是**磁盘上有哪些**。真值只存在于 ComfyUI 进程内部
+# (`comfy.model_management` 的已加载列表),而去读它就等于把本插件绑死在 ComfyUI
+# 的内部结构上 —— worker 的整个设计前提正好相反(只走多年稳定的 REST 面)。
+#
+# ⇒ 退而求其次:**最近一次成功执行用的那个 checkpoint**。它与真值的偏差:
+#
+#   * 一个 workflow 里挂了两个 checkpoint(base + refiner)时,我们只报一个
+#     (节点号最小的那个),另一个同样在显存里却报不出来;
+#   * ComfyUI 因显存吃紧把模型换出去、或用户点了 /free 之后,我们仍然会报它;
+#   * 最近几次执行**全失败**时我们报空,而上一个成功执行的模型很可能还在显存里;
+#   * 只认 `ckpt_name` —— 走 `UNETLoader`(Flux 那类 unet_name)的 workflow
+#     报不出来,那是另一个模型目录,不该混进同一个字段。
+#
+# 反过来,它比「只记我们自己跑过的任务」准得多:/history 是**整台 ComfyUI 的**,
+# 用户在自己网页里跑的那些也在里面。而且 /history 在内存里,ComfyUI 一重启就空 ——
+# 这恰好对应「刚重启的 ComfyUI 什么都没加载」。
+
+# 认 checkpoint 用的**输入名**而不是节点类名。同 _TEXT_INPUTS 的理由:能加载
+# checkpoint 的节点类是开放集合(CheckpointLoaderSimple 只是最常见的一个,各家还有
+# 一堆变体),而输入名是约定俗成的 —— `ckpt_name` 正是 /object_info 里那个下拉框的
+# 字段名,也是 loras.list_checkpoint_names() 用的那个拼写。
+_CHECKPOINT_INPUT = "ckpt_name"
+
+
+def _node_order(node_id: Any) -> tuple:
+    """节点号的**确定性**排序键(ComfyUI 的节点号是数字字符串,但不保证)。"""
+    s = str(node_id)
+    return (0, int(s), "") if s.isdigit() else (1, 0, s)
+
+
+def checkpoint_of(prompt: Any) -> str:
+    """API 形态 prompt 里用到的 checkpoint 文件名;认不出来就是 ``""``。
+
+    一个 workflow 里有多个 checkpoint 时取**节点号最小**的那个 —— 挑哪个都是猜,
+    所以至少要挑得确定:同一个 workflow 每次都报同一个值,免得这台机器的上报在两
+    个模型之间来回跳。
+    """
+    if not isinstance(prompt, dict):
+        return ""
+    best: tuple | None = None
+    for node_id, node in prompt.items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        name = inputs.get(_CHECKPOINT_INPUT)
+        # 必须是非空 str:连线过来的输入是 ["4", 0] 这样的 list,不是文件名。
+        if not isinstance(name, str) or not name.strip():
+            continue
+        key = _node_order(node_id)
+        if best is None or key < best[0]:
+            best = (key, name.strip())
+    return best[1] if best else ""
+
+
+def _entry_succeeded(entry: dict) -> bool:
+    """这条 /history 记录算不算「成功执行」。
+
+    ⚠️ **``status`` 整个缺失时算成功**,而不是算失败:老 ComfyUI 的 history 条目里
+    没有这个键,一律判失败会让那些用户永远报空。有 ``status`` 就照它说的算。
+    """
+    status = entry.get("status")
+    if not isinstance(status, dict):
+        return True
+    if "status_str" in status:
+        return status.get("status_str") == "success"
+    return bool(status.get("completed", True))
+
+
+def last_checkpoint(history: Any) -> str:
+    """从一段 ``/history`` 返回里取**最近一次成功执行**用的 checkpoint。
+
+    ``history`` 是 ``{prompt_id: {"prompt": [num, pid, prompt, ...], "status":
+    {...}}}``,插入序,**最新的在最后**。所以从后往前找第一条成功的。
+
+    任何认不出的形状(空、不是 dict、条目缺 prompt、prompt 不是 API 形态)都归一成
+    ``""`` = 「不知道」。这个函数是纯的,而且**绝不抛异常** —— 它的调用方在心跳
+    路径上。
+    """
+    if not isinstance(history, dict):
+        return ""
+    for entry in reversed(list(history.values())):
+        if not isinstance(entry, dict) or not _entry_succeeded(entry):
+            continue
+        # entry["prompt"] 是 ComfyUI 的队列元组 [number, prompt_id, prompt, ...],
+        # API 形态的 prompt 在下标 2。
+        raw = entry.get("prompt")
+        if not isinstance(raw, (list, tuple)) or len(raw) < 3:
+            continue
+        name = checkpoint_of(raw[2])
+        if name:
+            return name
+    return ""

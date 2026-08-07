@@ -39,10 +39,11 @@ from .jobs import (
     encode_output,
     extract_outputs,
     format_prompt_log,
+    last_checkpoint,
     within_cap,
 )
 from .log import log
-from .relay import RelayClient, RelayError
+from .relay import FOREIGN_QUEUE_UNKNOWN, RelayClient, RelayError
 from .status import STATUS
 
 HEARTBEAT_INTERVAL = 25  # seconds
@@ -463,6 +464,20 @@ class Worker:
             # always did.
             raise JobFailed(e.message, error_code=e.error_code) from e
 
+        # ⭐ 从这里到本函数返回,正好是「这个 prompt 有可能出现在 ComfyUI 队列里」的
+        # 全部窗口(返回时它已经落进 /history 了)。心跳上报「别人占了多少」时要拿它
+        # 把自己减掉 —— 见 _OUR_PROMPTS 上那段。**必须放在 try/finally 里**:任何
+        # 出口(完成/失败/取消/超时)都得摘掉,否则一个残留的 id 会让后续所有心跳把
+        # 别人的一个任务误当成我们的,把机器说得比实际更闲。
+        _OUR_PROMPTS.add(prompt_id)
+        try:
+            return await self._await_prompt(job_id, prompt_id, canceled)
+        finally:
+            _OUR_PROMPTS.discard(prompt_id)
+
+    async def _await_prompt(self, job_id: str, prompt_id: str,
+                            canceled: asyncio.Event) -> str:
+        """Poll ComfyUI until this prompt finishes/errors/vanishes. See _run_prompt."""
         started = time.monotonic()      # submit time; the backstop counts from here
         next_queue = started            # ≤ now → the first "missing" poll reads /queue
         completed_at: Optional[float] = None  # when ComfyUI said done (outputs lagging)
@@ -1245,6 +1260,171 @@ async def _report_object_info(relay: RelayClient, comfy: ComfyClient,
     return len(oi), True
 
 
+# ── 随心跳上报「本机 ComfyUI 现状」──────────────────────────────────────────
+#
+# 中继今天对用户机器的了解只有一个 backend「在线/离线」。它因此会往一台用户自己已经
+# 排了十个任务的 ComfyUI 上继续派活,也不知道哪台机器已经把某个 checkpoint 加载好了
+# (换模型是几十秒级开销)。这两项就是补这个盲区的。
+#
+# ⭐ **本次只打通管道:插件发、中继存,中继不拿它做任何决策。** 插件更新以月计,中继
+# 随时能改 —— 先把数据管道打通,将来写调度时不必再动插件、不必再等用户升级。
+#
+# ⛔⛔ **采集绝不在心跳的关键路径上。** 心跳每一拍读的是**上一拍采回来的**快照;采集
+# 本身跑在一个独立 task 里,在两拍之间那 25s 里慢慢做完。两条理由,缺一不可:
+#
+#   1. 心跳不能被拖慢。中继的 onlineWindow 是 60s,心跳 25s 一拍,余量只有一拍多一点;
+#      一个 hang 住的本地 HTTP 就足以让这台机器在 App 里闪成离线。
+#   2. ⚠️ **ComfyUI 在它自己的主事件循环上跑推理**,一步推理的间隙里它的 HTTP 就是不
+#      应答的。把采集塞进心跳,恰恰会在「队列很深」这个我们最想知道的时刻超时 ——
+#      也就是这两个值最没用的那种坏法。
+#
+# 代价是这两个值最多**旧一拍(~25s)**。它们本来就是粗粒度的调度提示,不是实时读数。
+COMFY_PROBE_HISTORY_ITEMS = 5   # 往回翻几条 /history 找「最近一次成功执行」
+COMFY_PROBE_TIMEOUT = 20.0      # 一次采集的总预算(秒),必须 < 下一拍(HEARTBEAT_INTERVAL)
+
+
+# ── 「哪些 prompt 是我们自己提交的」──────────────────────────────────────────
+#
+# ⛔ **ComfyUI 的 /queue 里认不出这个**,这一点必须先说清楚,否则下一个人会去翻
+# client_id:`comfy.submit()` 每次都用 `str(uuid4())` 现造一把,插件也不留历史,所以
+# 队列里那些 client_id 对我们全是陌生的。
+#
+# ⛔ **也不要为此把 client_id 改成固定值。** 它在 ComfyUI 侧还参与 websocket 路由等
+# 我们没在用、也没验证过的行为;为了一个统计字段去动它不划算。
+#
+# ⭐ 不需要动它,因为我们**串行**:machine 级的 job_lock(见 _run_locked)保证任何时刻
+# 整台机器上最多只有一个我们自己的 prompt 在 ComfyUI 队列里,而那个 prompt_id 就在手上。
+# 于是「减掉自己」变成一次精确比对,而不是无脑减一。
+#
+# 是 set 而不是单个字符串:多账号配对时每个 pairing 一个 Worker,虽然共用同一把
+# job_lock(所以实际上仍是 ≤1 个),但用集合表达就不必依赖那个前提。
+# 是**模块级**而不是 Worker 的成员:心跳循环是 per-pairing 的,而队列是**整台机器**
+# 共用的 —— 用 A 账号的心跳去看队列时,B 账号正在跑的那个 prompt 同样不是「别人的活」。
+_OUR_PROMPTS: set[str] = set()
+
+
+class _ComfyProbe:
+    """每拍上报的 ComfyUI 现状 + 它的**离线**采集。
+
+    上报两项:
+
+      foreign_queue_depth  这台 ComfyUI 队列里**不是我们提交的**那些 prompt 的条数
+      loaded_checkpoint    多半已经加载在显存里的那个 checkpoint(近似值,偏差见
+                           jobs.last_checkpoint)
+
+    ⭐ **为什么报「别人占了多少」而不是队列总深度**:中继自己就知道它往这台机器派了
+    多少活(它自己的 jobs 表里有),总深度里我们那一部分对它信息量为零。它真正看不见
+    的,是**用户自己在 ComfyUI 网页里排的那些**。
+
+    ⚠️ **这也是个近似值。** 用户刚在网页里点下去、prompt 还没进队列的那一瞬间数不到;
+    反过来,我们自己那个 prompt 处在「已提交但还没出现在 /queue」或「刚跑完已经离开」
+    的窗口里时,比对不上就**不减** —— ⛔ 宁可多算一个,也不要减错:减多了会让中继以为
+    这台机器很闲,那是将来调度最贵的一种错。
+
+    用法(见 _heartbeat_loop):读 snapshot() → 发心跳 → kick() → sleep。
+    kick 只是 create_task,**从不 await**;snapshot 只是读两个字段。
+
+    ⛔ **失败一律归一成「不知道」,而且是覆盖式的**:ComfyUI 挂了/换端口了,下一拍
+    就必须报 -1 和 ""。留着上一次的值不动会让中继拿一个陈旧的深度去派活,那比没有
+    值更坏。
+    """
+
+    def __init__(self, comfy: Optional[ComfyClient]):
+        self._comfy = comfy
+        self.foreign_queue_depth: int = FOREIGN_QUEUE_UNKNOWN
+        self.loaded_checkpoint: str = ""
+        self.task: Optional[asyncio.Task] = None
+
+    def snapshot(self) -> tuple[int, str]:
+        """上一次采集的结果。**同步、瞬时**,给心跳循环直接用。"""
+        return self.foreign_queue_depth, self.loaded_checkpoint
+
+    def kick(self) -> None:
+        """启动一次采集(已有一次在跑就什么都不做)。**同步、瞬时、不 await。**
+
+        「在跑就跳过」既是去重也是背压:一台 ComfyUI 慢到一次采集跨了好几拍时,我们
+        不会堆出一串并发请求去踩它,只是让上报多旧几拍。
+        """
+        if self._comfy is None:
+            return                      # 没接 ComfyUI(可跑的最小配置 / 单测)
+        if self.task is not None and not self.task.done():
+            return
+        self.task = asyncio.create_task(self._refresh())
+
+    async def _refresh(self) -> None:
+        """采一次。**永不抛异常**,任何失败都归一成「不知道」。"""
+        try:
+            await asyncio.wait_for(self._read_all(), COMFY_PROBE_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - 采集失败绝不能影响心跳
+            self.foreign_queue_depth = FOREIGN_QUEUE_UNKNOWN
+            self.loaded_checkpoint = ""
+            log.debug("comfy state probe failed: %s", e)
+
+    async def _read_all(self) -> None:
+        # 两项**分别**兜底:ComfyUI 答得上队列、答不上 history(或反过来)时,
+        # 能拿到的那一项照样上报。
+        self.foreign_queue_depth = await self._read_foreign_queue_depth()
+        self.loaded_checkpoint = await self._read_loaded_checkpoint()
+
+    async def _read_foreign_queue_depth(self) -> int:
+        """队列里**不是我们的**那些 prompt 的条数;读不到就是 FOREIGN_QUEUE_UNKNOWN。
+
+        ⚠️ **用 /queue 而不是那个便宜得多的 `GET /prompt`**(后者只给一个
+        `queue_remaining` 总数):只有 /queue 会把每个条目的 prompt_id 列出来,而
+        「减掉我们自己那一个」必须是一次**精确比对**。用总数去减、靠别的信号猜我们
+        在不在队列里,一旦猜错就是**减多了** —— 中继会以为这台机器很闲。
+
+        代价说清楚:/queue 会序列化每个排队条目(prompt 图在内)。但它跑在心跳的
+        **旁路**上、~25s 一次,而一个正在跑的任务本来就在以 1s 的节奏读同一个端点
+        (见 QUEUE_POLL_INTERVAL),所以这条多出来的读是那个量级的 4%。
+        """
+        try:
+            q = await self._comfy.queue()
+        except Exception as e:  # noqa: BLE001
+            log.debug("foreign queue depth unavailable: %s", e)
+            return FOREIGN_QUEUE_UNKNOWN
+        return _foreign_queue_depth(q, _OUR_PROMPTS)
+
+    async def _read_loaded_checkpoint(self) -> str:
+        try:
+            hist = await self._comfy.recent_history(COMFY_PROBE_HISTORY_ITEMS)
+        except Exception as e:  # noqa: BLE001
+            log.debug("loaded checkpoint unavailable: %s", e)
+            return ""
+        return last_checkpoint(hist)
+
+
+def _queue_prompt_ids(q, key: str) -> list:
+    """一个 /queue 分区里每个条目的 prompt_id(下标 1),形状怪的条目原样留位。
+
+    ⛔ **认不出 id 的条目也要计数**(用 None 占位),不能跳过:它仍然是一个占着这台
+    机器的任务,只是我们认不出它是谁的。跳过 = 少算一个 = 把机器说得比实际更闲。
+    """
+    out = []
+    for entry in (q.get(key) or []):
+        if isinstance(entry, (list, tuple)) and len(entry) > 1:
+            out.append(entry[1])
+        else:
+            out.append(None)
+    return out
+
+
+def _foreign_queue_depth(q, ours: set) -> int:
+    """/queue 里**不是我们提交的**那些 prompt 的条数。纯函数,**绝不抛异常**。
+
+    ``ours`` 是我们手上还在途的 prompt_id 集合(_OUR_PROMPTS)。比对不上就不减 ——
+    我们那个 prompt 处在「刚提交还没进队列」或「刚跑完已经离开」的窗口里时,总数里
+    本来就没有它,再减一次就减错了。
+    """
+    if not isinstance(q, dict):
+        return FOREIGN_QUEUE_UNKNOWN
+    ids = (_queue_prompt_ids(q, "queue_running")
+           + _queue_prompt_ids(q, "queue_pending"))
+    return sum(1 for pid in ids if pid not in ours)
+
+
 # ── Making a PERSISTENT heartbeat failure visible ────────────────────────────
 #
 # A single failed beat stays at debug, and that is deliberate: transient network
@@ -1324,14 +1504,25 @@ async def _heartbeat_loop(relay: RelayClient, pairing,
     carries straight on — a scan can run for minutes and the beat must keep its
     ~25s rhythm throughout, or the relay's reaper would take us for dead.
 
+    The beat also REPORTS this machine's ComfyUI state (how deep the user's OWN
+    queue is + which checkpoint is loaded). ⛔ Those are read from _ComfyProbe's
+    LAST snapshot and the refresh is kicked off AFTER the beat has been sent, so
+    the two values can never delay or break a beat — see _ComfyProbe.
+
     ``comfy`` is optional purely so the loop can be exercised (and run) without a
-    ComfyUI client; without it the object_info refresh is simply never dispatched.
+    ComfyUI client; without it the object_info refresh is simply never dispatched
+    and the ComfyUI state stays at its explicit "unknown".
     """
     scan: Optional[asyncio.Task] = None
     refresh: Optional[asyncio.Task] = None
+    probe = _ComfyProbe(comfy)
     fails = 0  # CONSECUTIVE failed beats; see _note_heartbeat_failure
     try:
         while not _stopped(stop) and STATE.get_pairing(pairing.backend_id) is not None:
+            # ⚠️ 读的是**上一拍**采回来的快照,一次同步的字段读取。第一拍必然是
+            # 「不知道」(-1 / ""),这完全可以接受:两个值都是无条件覆盖语义,
+            # 25s 后的第二拍就带上真值了。
+            foreign_queue_depth, loaded_checkpoint = probe.snapshot()
             try:
                 # Both receipt fields are read FRESH on every beat: a refresh that
                 # finished since the last one updated them in place, so the very
@@ -1340,7 +1531,9 @@ async def _heartbeat_loop(relay: RelayClient, pairing,
                 # (see RelayClient.heartbeat).
                 resp = await relay.heartbeat(pairing.backend_id,
                                              pairing.object_info_hash,
-                                             pairing.object_info_synced_at)
+                                             pairing.object_info_synced_at,
+                                             foreign_queue_depth,
+                                             loaded_checkpoint)
             except RelayError as e:
                 too_old = _as_plugin_too_old(e)
                 if too_old is not None:
@@ -1364,12 +1557,17 @@ async def _heartbeat_loop(relay: RelayClient, pairing,
                 scan = _maybe_scan_models(relay, pairing, resp, scan)
                 refresh = _maybe_refresh_object_info(
                     relay, comfy, pairing, resp, refresh)
+            # ⭐ 采集**排在发送之后**,于是它有整整一个 sleep 周期(~25s)可以慢慢做完,
+            # 而这一拍的耗时一秒都不受它影响。它同样是纯 dispatch:create_task,不 await。
+            # ⛔ 位置很关键:挪到 relay.heartbeat 之前,就等于把一个可能 hang 住的本地
+            # HTTP 请求塞进了心跳的关键路径。
+            probe.kick()
             await asyncio.sleep(HEARTBEAT_INTERVAL)
     finally:
-        # Both are this loop's children; when the pairing is torn down (unpair,
+        # All three are this loop's children; when the pairing is torn down (unpair,
         # reconnect, shutdown) they must go with it rather than linger holding the
         # build lock and a relay client whose session is closing.
-        for child in (scan, refresh):
+        for child in (scan, refresh, probe.task):
             await _cancel_child(child)
 
 
