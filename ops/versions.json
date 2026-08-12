@@ -10,16 +10,16 @@
     "latest": "0.2.3",
     "min": "0.0.0",
     "url": "https://github.com/huijiutian/ComfyUI-ComfyLink",
-    "remind": false
+    "remind": true
   },
   "app": {
     "ios": {
-      "latest": "1.0.7",
+      "latest": "1.0.9",
       "min": "0.0.0",
       "url": "https://apps.apple.com/app/id6783214394"
     },
     "android": {
-      "latest": "1.0.7",
+      "latest": "1.0.9",
       "min": "0.0.0",
       "url": "https://play.google.com/store/apps/details?id=com.huijiutian.comfylink"
     }
