@@ -39,7 +39,7 @@ def _client():
     relay = RelayClient.__new__(RelayClient)
     sent = []
 
-    async def fake_json(method, path, body, timeout=None):
+    async def fake_json(method, path, body, timeout=None, **kw):
         sent.append((method, path, body))
         return {"ok": True}
 

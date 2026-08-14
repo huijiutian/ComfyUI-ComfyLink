@@ -80,7 +80,7 @@ class TestUploadObjectInfo(unittest.IsolatedAsyncioTestCase):
     async def test_sign_uses_json_post_and_returns_key_url(self):
         relay = RelayClient.__new__(RelayClient)
 
-        async def fake_json(method, path, body):
+        async def fake_json(method, path, body, **kw):
             self.assertEqual(method, "POST")
             self.assertEqual(path, "/v1/backends/object-info/sign")
             self.assertEqual(body, {"backend_id": "b9"})
@@ -609,7 +609,7 @@ class TestHeartbeatCarriesTheFingerprint(unittest.IsolatedAsyncioTestCase):
         relay = RelayClient.__new__(RelayClient)
         sent = []
 
-        async def fake_json(method, path, body, timeout=None):
+        async def fake_json(method, path, body, timeout=None, **kw):
             sent.append((method, path, body))
             return {"ok": True}
 

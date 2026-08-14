@@ -30,7 +30,7 @@ class TestVersionReporting(unittest.IsolatedAsyncioTestCase):
         self.relay = RelayClient.__new__(RelayClient)
         self.calls: list[tuple[str, str, dict]] = []
 
-        async def fake_json(method, path, body):
+        async def fake_json(method, path, body, **kw):
             self.calls.append((method, path, body))
             return {}
 

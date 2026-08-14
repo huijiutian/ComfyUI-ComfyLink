@@ -19,6 +19,18 @@ log = logging.getLogger("comfylink.relay")
 
 # Claim is a server-held long-poll (~28s); allow margin over it.
 CLAIM_TIMEOUT = aiohttp.ClientTimeout(total=45)
+
+# ── 空闲退避:中继建议「下次 claim 之前先睡一会儿」 ──────────────────────────
+#
+# 中继在 claim 的 204 响应头里捎带这个建议(只在「这台机器没活儿 + 这个账号的 App
+# 也很久没露面」时才给)。⭐ 之所以让**中继**下发秒数而不是插件自己写死:插件推不
+# 动更新,写死在这里的节奏发出去就再也调不动了;放在中继侧,改个环境变量就生效。
+IDLE_SLEEP_HEADER = "X-ComfyLink-Idle-Sleep"
+
+# ⛔ 本地保险丝。中继侧自己有上界,但那是**另一个进程里的假设**:万一它下发一个
+# 离谱的值,用户的机器就那么久不领任务了。⇒ 上界留一份在自己这边,取「用户点了生成
+# 最坏能忍多久」的量级,而不是去猜中继的配置。
+MAX_IDLE_SLEEP = 120
 DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 # progress(wait=True) 也是服务端持有的长轮询:中继会把请求挂起最多 ~25s 等取消。
@@ -410,8 +422,12 @@ class RelayClient:
                         object_info_hash: str = "",
                         object_info_synced_at: float = 0.0,
                         foreign_queue_depth: int = FOREIGN_QUEUE_UNKNOWN,
-                        loaded_checkpoint: str = "") -> dict:
+                        loaded_checkpoint: str = "",
+                        headers_out: Optional[dict] = None) -> dict:
         """Mark this backend alive. Returns the relay's response body.
+
+        ``headers_out``(可选)收响应头,调用方用它读空闲退避的建议心跳间隔
+        (``X-ComfyLink-Idle-Sleep``,见 _idle_sleep_hint)。不传 = 不关心。
 
         The body is the plugin's ONLY inbound channel while idle, so it doubles
         as the relay's way to ask for something. Today that is
@@ -517,7 +533,8 @@ class RelayClient:
             # straight out of comfylink_state.json, where every existing install
             # already has a float persisted. Normalising here covers those too.
             body["object_info_synced_at"] = int(object_info_synced_at)
-        return await self._json("POST", "/v1/backends/heartbeat", body)
+        return await self._json("POST", "/v1/backends/heartbeat", body,
+                                headers_out=headers_out)
 
     async def abandon_jobs(self, backend_id: str) -> int:
         """Fail every still-claimed/running job left on this backend.
@@ -535,18 +552,42 @@ class RelayClient:
         )
         return int(d.get("abandoned", 0))
 
-    async def claim(self, backend_id: str) -> Optional[dict]:
-        """Long-poll for a job. Returns the job, or None on a 204 timeout."""
+    async def claim(self, backend_id: str,
+                    stop: Optional[asyncio.Event] = None) -> Optional[dict]:
+        """Long-poll for a job. Returns the job, or None on a 204 timeout.
+
+        **空闲退避**:204 的响应头里可能带一个 ``X-ComfyLink-Idle-Sleep`` —— 中继
+        在说「你这台机器没活儿,而且这个账号的 App 也很久没露面了,下一次 claim 之前
+        先睡 N 秒」。没有这个头 = 没有建议 = 照旧立刻重来(老中继就是这样)。
+
+        ⭐ **觉睡在这里,而不是甩给调用方**:claim 本来就是一次「等到有活儿为止」的
+        长轮询,睡一会儿只是把这次等待延长 —— 调用方的循环形状一个字都不用改,也就
+        不会有人漏掉它。
+
+        ⛔ **必须等响应上下文退出之后再睡**:在 ``async with`` 里睡会一直占着这条
+        连接(以及连接池的名额),白白把一次「省流量」变成一次「占资源」。
+
+        ⛔ **中继给的值不无条件相信**:本地还有 ``MAX_IDLE_SLEEP`` 兜底。中继侧自己
+        有上界,但那是**另一个进程里的假设** —— 万一它发疯下发一小时,用户的机器就
+        一小时不领任务了。保险丝要留在自己这边。
+
+        ``stop`` 传进来是为了让这一觉**可以被叫醒**:关插件的时候不该干等它睡完。
+        """
+        hint = 0
         async with self._session.get(
             self._base + "/v1/jobs/claim",
             params={"backend_id": backend_id},
             headers=await self._headers(),
             timeout=CLAIM_TIMEOUT,
         ) as r:
-            if r.status == 204:
-                return None
-            await _check(r)
-            return await r.json()
+            if r.status != 204:
+                await _check(r)
+                return await r.json()
+            hint = _idle_sleep_hint(r.headers)
+        # ↑ 连接已归还,再睡。
+        if hint:
+            await _sleep_or_stop(hint, stop)
+        return None
 
     async def progress(self, job_id: str, status: str, value: int, maximum: int,
                        wait: bool = False) -> dict:
@@ -632,13 +673,22 @@ class RelayClient:
             return bytes(buf)
 
     async def _json(self, method: str, path: str, body: dict,
-                    timeout: Optional[aiohttp.ClientTimeout] = None) -> dict:
+                    timeout: Optional[aiohttp.ClientTimeout] = None,
+                    headers_out: Optional[dict] = None) -> dict:
         """One JSON round-trip. ``timeout`` defaults to DEFAULT_TIMEOUT; only the
-        server-held long-poll (progress wait=True) passes its own, longer one."""
+        server-held long-poll (progress wait=True) passes its own, longer one.
+
+        ``headers_out`` 给调用方一个**显式**的口子去看响应头(心跳用它读空闲退避的
+        建议)。⭐ 之所以是一个传进来的容器,而不是改返回类型、也不是往返回的 dict
+        里塞私货:返回形状是很多调用方(和测试里的 mock)共用的契约,为了一个只有一
+        处需要的东西去动它,代价落在所有人身上。
+        """
         async with self._session.request(
             method, self._base + path, json=body,
             headers=await self._headers(), timeout=timeout or DEFAULT_TIMEOUT,
         ) as r:
+            if headers_out is not None:
+                headers_out.update(r.headers)
             await _check(r)
             if r.content_length == 0:
                 return {}
@@ -659,6 +709,67 @@ def _error_payload(body: str) -> dict:
     except Exception:  # noqa: BLE001 - any parse failure => no structured info
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _idle_sleep_hint(headers) -> int:
+    """从 204 的响应头里读中继的退避建议,返回秒数;**任何说不准的情况一律返回 0**。
+
+    0 = 没有建议 = 照旧立刻重来,也就是这个功能上线之前的行为。⛔ 这条「不确定就
+    回 0」的纪律是整个机制的安全侧:少省一点流量只是钱,睡过头是用户点了生成却干等。
+
+    老中继不发这个头 ⇒ 读不到 ⇒ 0 ⇒ 行为与改造前逐字节一致。
+    """
+    raw = ""
+    try:
+        raw = (headers.get(IDLE_SLEEP_HEADER) or "").strip()
+        if not raw:
+            # ⛔⛔ **HTTP 头名大小写不敏感,而 dict 敏感。** aiohttp 自己的 headers 是
+            # CIMultiDict(不敏感),但心跳那条路把头 update 进了一个**普通 dict**,
+            # 于是大小写就要命了 —— 而 Go 的 `w.Header().Set` 会把名字规范化成
+            # `X-Comfylink-Idle-Sleep`(**`L` 变成小写 `l`**),和这里的常量并不逐字
+            # 相同。⇒ 精确匹配不中时,退回一次大小写无关的扫描。
+            # ⚠️ 这个坑不会有任何症状:退避只是"没生效",一切照常跑,流量一分不省。
+            wanted = IDLE_SLEEP_HEADER.lower()
+            for k, v in headers.items():
+                if str(k).lower() == wanted:
+                    raw = (v or "").strip()
+                    break
+    except Exception:  # noqa: BLE001 — headers 形状异常时不值得让 claim 挂掉
+        return 0
+    if not raw:
+        return 0
+    try:
+        n = int(raw)
+    except ValueError:
+        return 0
+    if n <= 0:
+        return 0
+    return min(n, MAX_IDLE_SLEEP)
+
+
+async def _sleep_or_stop(seconds: int, stop: Optional[asyncio.Event]) -> None:
+    """睡 ``seconds`` 秒,但 ``stop`` 一被置位就立刻醒 —— 关插件时不该干等它睡完。
+
+    ``stop`` 为 None(测试/独立调用)时退化成普通 sleep。
+
+    ⛔ **必须走 asyncio.sleep,不能用 wait_for(stop.wait(), timeout=…)。** 两者行为
+    等价,但测试是靠 patch 掉 ``asyncio.sleep`` 来让这些循环飞转的(见
+    tests/test_plugin_too_old.py 的 `patch.object(worker.asyncio, "sleep", …)`)——
+    wait_for 的超时走的是事件循环的定时器,patch 不到它,于是整套测试会真的按秒睡,
+    挂到超时。⭐ 这不只是测试的方便:**能被换掉的等待**是这类循环可测的前提。
+    """
+    if stop is None:
+        await asyncio.sleep(seconds)
+        return
+    napping = asyncio.ensure_future(asyncio.sleep(seconds))
+    waking = asyncio.ensure_future(stop.wait())
+    try:
+        await asyncio.wait({napping, waking}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        # 谁先醒都要把另一个收掉,否则会留下一个挂着的 task(以及一条
+        # "Task was destroyed but it is pending" 的噪音)。
+        napping.cancel()
+        waking.cancel()
 
 
 async def _check(r: aiohttp.ClientResponse) -> None:

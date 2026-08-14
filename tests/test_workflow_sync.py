@@ -35,7 +35,7 @@ class TestSignPutWorkflow(unittest.IsolatedAsyncioTestCase):
     async def test_blob_posts_contract_body_and_returns_key_url(self):
         relay = RelayClient.__new__(RelayClient)
 
-        async def fake_json(method, path, body):
+        async def fake_json(method, path, body, **kw):
             self.assertEqual(method, "POST")
             self.assertEqual(path, "/v1/backends/workflows/sign-put")
             self.assertEqual(
@@ -50,7 +50,7 @@ class TestSignPutWorkflow(unittest.IsolatedAsyncioTestCase):
     async def test_manifest_omits_workflow_id(self):
         relay = RelayClient.__new__(RelayClient)
 
-        async def fake_json(method, path, body):
+        async def fake_json(method, path, body, **kw):
             self.assertEqual(method, "POST")
             self.assertEqual(path, "/v1/backends/workflows/sign-put")
             # No workflow_id key for the manifest artifact.

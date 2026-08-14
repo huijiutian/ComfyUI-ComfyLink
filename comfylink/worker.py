@@ -43,7 +43,13 @@ from .jobs import (
     within_cap,
 )
 from .log import log
-from .relay import FOREIGN_QUEUE_UNKNOWN, RelayClient, RelayError
+from .relay import (
+    FOREIGN_QUEUE_UNKNOWN,
+    RelayClient,
+    RelayError,
+    _idle_sleep_hint,
+    _sleep_or_stop,
+)
 from .status import STATUS
 
 HEARTBEAT_INTERVAL = 25  # seconds
@@ -1529,11 +1535,16 @@ async def _heartbeat_loop(relay: RelayClient, pairing,
                 # next beat is the receipt the app is waiting for. Empty/0 until
                 # we have ever captured a snapshot / served a refresh request
                 # (see RelayClient.heartbeat).
+                # hdrs 收响应头:中继在**没人用这个账号、且这台机器没在跑活儿**时,
+                # 会在里面捎带一个建议的心跳间隔(空闲退避)。⛔ 每拍新建一个 dict,
+                # 不复用 —— 一次失败的心跳留下的旧建议不该影响下一拍的节奏。
+                hdrs: dict = {}
                 resp = await relay.heartbeat(pairing.backend_id,
                                              pairing.object_info_hash,
                                              pairing.object_info_synced_at,
                                              foreign_queue_depth,
-                                             loaded_checkpoint)
+                                             loaded_checkpoint,
+                                             headers_out=hdrs)
             except RelayError as e:
                 too_old = _as_plugin_too_old(e)
                 if too_old is not None:
@@ -1552,17 +1563,23 @@ async def _heartbeat_loop(relay: RelayClient, pairing,
                 resp = None
             else:
                 fails = _note_heartbeat_ok(pairing.backend_id, fails)
+            # 下一拍隔多久。默认就是原来的节奏;只有**这一拍成功**且中继给了建议时
+            # 才放慢。⛔ 失败路径一律用常态节奏:心跳打不通的时候更该勤快点重试,
+            # 而不是顺着一个可能来自上一拍的旧建议睡过去。
+            beat_after = HEARTBEAT_INTERVAL
             if resp is not None:
                 # Pure dispatch: starts a task at most, never awaits the work.
                 scan = _maybe_scan_models(relay, pairing, resp, scan)
                 refresh = _maybe_refresh_object_info(
                     relay, comfy, pairing, resp, refresh)
+                beat_after = _idle_sleep_hint(hdrs) or HEARTBEAT_INTERVAL
             # ⭐ 采集**排在发送之后**,于是它有整整一个 sleep 周期(~25s)可以慢慢做完,
             # 而这一拍的耗时一秒都不受它影响。它同样是纯 dispatch:create_task,不 await。
             # ⛔ 位置很关键:挪到 relay.heartbeat 之前,就等于把一个可能 hang 住的本地
             # HTTP 请求塞进了心跳的关键路径。
             probe.kick()
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            # ⭐ 可打断的 sleep:退避态下这一觉可能有一分钟,关插件的时候不该干等它睡完。
+            await _sleep_or_stop(beat_after, stop)
     finally:
         # All three are this loop's children; when the pairing is torn down (unpair,
         # reconnect, shutdown) they must go with it rather than linger holding the
@@ -1837,7 +1854,9 @@ async def _claim_loop(relay: RelayClient, worker: Worker, pairing,
         if blocked is not None:
             blocked.check()  # raises _PluginTooOld → _serve_pairing's handler
         try:
-            job = await relay.claim(bid)
+            # stop 传下去有两个作用:claim 自己在拿到退避建议时会睡一会儿(空闲退避),
+            # 而这一觉必须能被停止信号叫醒。
+            job = await relay.claim(bid, stop=stop)
         except RelayError as e:
             # Same discrimination as _register: a "plugin_too_old" 403 is a
             # version block, NOT an auth rejection, so it must never become a

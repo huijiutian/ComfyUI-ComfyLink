@@ -350,7 +350,7 @@ class TestServePairingNeverUnpairs(_ServeHarness, unittest.IsolatedAsyncioTestCa
 
         relay.register.side_effect = register
 
-        def claim(backend_id):
+        def claim(backend_id, stop=None):
             stop.set()
             return None  # 204-style: no job; both loops then exit cleanly
 
@@ -385,7 +385,7 @@ class TestHeartbeatBlockStopsClaiming(_ServeHarness,
         beat = asyncio.Event()
 
         def heartbeat(backend_id, object_info_hash="", object_info_synced_at=0.0,
-                      foreign_queue_depth=-1, loaded_checkpoint=""):
+                      foreign_queue_depth=-1, loaded_checkpoint="", headers_out=None):
             # Sync side_effect on an AsyncMock: raising here drives the awaited
             # call deterministically. The loop's except arms the latch and
             # returns with no await in between, so once the claim task is
@@ -409,7 +409,7 @@ class TestHeartbeatBlockStopsClaiming(_ServeHarness,
 
         relay.register.side_effect = register
 
-        async def claim(backend_id):
+        async def claim(backend_id, stop=None):
             # Stand in for the ~28s long-poll: return only once the heartbeat has
             # been refused, i.e. this is the LAST claim before the latch bites.
             await beat.wait()
@@ -445,7 +445,7 @@ class TestHeartbeatBlockStopsClaiming(_ServeHarness,
         beats = {"n": 0}
 
         async def heartbeat(backend_id, object_info_hash="", object_info_synced_at=0.0,
-                      foreign_queue_depth=-1, loaded_checkpoint=""):
+                      foreign_queue_depth=-1, loaded_checkpoint="", headers_out=None):
             beats["n"] += 1
             await _real_sleep(0)  # yield so the claim loop makes progress
             raise RelayError("relay hiccup", 500)
@@ -455,7 +455,7 @@ class TestHeartbeatBlockStopsClaiming(_ServeHarness,
 
         claims = {"n": 0}
 
-        async def claim(backend_id):
+        async def claim(backend_id, stop=None):
             claims["n"] += 1
             await _real_sleep(0)
             if claims["n"] >= 3:
@@ -486,7 +486,7 @@ class TestHeartbeatBlockStopsClaiming(_ServeHarness,
         beats = {"n": 0}
 
         async def heartbeat(backend_id, object_info_hash="", object_info_synced_at=0.0,
-                      foreign_queue_depth=-1, loaded_checkpoint=""):
+                      foreign_queue_depth=-1, loaded_checkpoint="", headers_out=None):
             beats["n"] += 1
             if beats["n"] == 1:
                 beat.set()
@@ -498,7 +498,7 @@ class TestHeartbeatBlockStopsClaiming(_ServeHarness,
 
         claims = {"n": 0}
 
-        async def claim(backend_id):
+        async def claim(backend_id, stop=None):
             claims["n"] += 1
             if claims["n"] == 1:
                 await beat.wait()  # last claim before the latch bites

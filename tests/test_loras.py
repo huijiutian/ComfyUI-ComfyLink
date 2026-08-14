@@ -1123,7 +1123,7 @@ class TestNothingScansWithoutTheSignal(unittest.IsolatedAsyncioTestCase):
         async def counting_heartbeat(bid, object_info_hash="",
                                      object_info_synced_at=0.0,
                                      foreign_queue_depth=-1,
-                                     loaded_checkpoint=""):
+                                     loaded_checkpoint="", headers_out=None):
             # This pairing has never captured a snapshot nor served a refresh
             # request, so the beat must carry neither receipt field at all (see
             # RelayClient.heartbeat: empty/0 means "keep what you have").
@@ -1181,7 +1181,7 @@ class TestRelayLoraEndpoint(unittest.IsolatedAsyncioTestCase):
 
         relay = RelayClient.__new__(RelayClient)
 
-        async def fake_json(method, path, body):
+        async def fake_json(method, path, body, **kw):
             self.assertEqual(method, "POST")
             self.assertEqual(path, "/v1/backends/loras/sign-put")
             self.assertEqual(body, {"backend_id": "b7"})

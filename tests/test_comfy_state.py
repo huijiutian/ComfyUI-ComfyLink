@@ -167,7 +167,7 @@ def _client():
     relay = RelayClient.__new__(RelayClient)
     sent = []
 
-    async def fake_json(method, path, body, timeout=None):
+    async def fake_json(method, path, body, timeout=None, **kw):
         sent.append((method, path, body))
         return {"ok": True}
 
@@ -376,7 +376,7 @@ class TestHeartbeatLoopIsNeverBlockedByTheProbe(unittest.IsolatedAsyncioTestCase
 
         async def heartbeat(backend_id, oi_hash="", oi_synced=0.0,
                             foreign_queue_depth=FOREIGN_QUEUE_UNKNOWN,
-                            loaded_checkpoint=""):
+                            loaded_checkpoint="", headers_out=None):
             seen.append((foreign_queue_depth, loaded_checkpoint))
             if len(seen) >= beats:
                 stop.set()

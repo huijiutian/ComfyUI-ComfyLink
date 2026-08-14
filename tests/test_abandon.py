@@ -63,7 +63,7 @@ class TestAbandonJobs(unittest.IsolatedAsyncioTestCase):
     async def test_posts_to_backend_abandon_path_and_parses_count(self):
         relay = RelayClient.__new__(RelayClient)
 
-        async def fake_json(method, path, body):
+        async def fake_json(method, path, body, **kw):
             self.assertEqual(method, "POST")
             self.assertEqual(path, "/v1/backends/b1/jobs/abandon")
             # No-body contract: an empty JSON object.
@@ -77,7 +77,7 @@ class TestAbandonJobs(unittest.IsolatedAsyncioTestCase):
     async def test_missing_field_defaults_to_zero(self):
         relay = RelayClient.__new__(RelayClient)
 
-        async def fake_json(method, path, body):
+        async def fake_json(method, path, body, **kw):
             return {}  # relay omitted the count
 
         relay._json = fake_json
