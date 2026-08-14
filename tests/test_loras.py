@@ -1116,7 +1116,7 @@ class TestNothingScansWithoutTheSignal(unittest.IsolatedAsyncioTestCase):
         state = _FakeState([pairing])
         beats = asyncio.Event()
 
-        async def fake_claim_loop(relay_, worker_, pairing_, job_lock_, stop_, blocked_):
+        async def fake_claim_loop(relay_, worker_, pairing_, job_lock_, stop_, blocked_, wake_=None):
             await asyncio.wait_for(beats.wait(), 1)
             raise worker._Revoked()
 

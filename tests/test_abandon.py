@@ -126,7 +126,7 @@ class TestServePairingSweepsOnce(unittest.IsolatedAsyncioTestCase):
         # ignores it. Spelling it out rather than swallowing it in *args keeps
         # the drift visible: if the real signature changes again, this line is
         # the one that has to change with it.
-        async def fake_claim_loop(relay_, worker_, pairing_, job_lock_, stop_, blocked_):
+        async def fake_claim_loop(relay_, worker_, pairing_, job_lock_, stop_, blocked_, wake_=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("blip")

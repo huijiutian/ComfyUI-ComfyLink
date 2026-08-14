@@ -45,6 +45,7 @@ from .jobs import (
 from .log import log
 from .relay import (
     FOREIGN_QUEUE_UNKNOWN,
+    MAX_IDLE_BEAT,
     RelayClient,
     RelayError,
     _idle_sleep_hint,
@@ -950,9 +951,15 @@ async def _serve_pairing(pairing, job_lock: asyncio.Lock, session, comfy_url,
             # _PluginTooOld if the relay starts blocking mid-loop — either from a
             # claim 403 or from the latch the heartbeat arms — which lands in the
             # handler below and stops claiming.)
+            # 这两个循环之间唯一的一条线:心跳退避到几分钟一拍之后,自己没法知道
+            # 「用户回来了」——claim 一直保持着较短的周期,总是先知道的那一个,
+            # 由它把心跳叫起来去取下行信号。⛔ 挂在这里而不是 pairing 上:Pairing
+            # 会被持久化进 comfylink_state.json,塞一个 asyncio.Event 进去会坏掉。
+            wake_beat = asyncio.Event()
             hb = asyncio.create_task(
-                _heartbeat_loop(relay, pairing, stop, blocked, comfy))
-            await _claim_loop(relay, worker, pairing, job_lock, stop, blocked)
+                _heartbeat_loop(relay, pairing, stop, blocked, comfy, wake_beat))
+            await _claim_loop(relay, worker, pairing, job_lock, stop, blocked,
+                              wake_beat)
         except asyncio.CancelledError:
             raise
         except _PluginTooOld as e:
@@ -1489,7 +1496,8 @@ def _note_heartbeat_ok(backend_id: str, fails: int) -> int:
 async def _heartbeat_loop(relay: RelayClient, pairing,
                           stop: asyncio.Event | None,
                           blocked: Optional[_TooOldLatch] = None,
-                          comfy: Optional[ComfyClient] = None) -> None:
+                          comfy: Optional[ComfyClient] = None,
+                          wake: Optional[asyncio.Event] = None) -> None:
     """Keep this backend marked online. Errors are swallowed — with TWO exceptions.
 
     Every failure is a no-op for the loop (the claim loop owns revoke handling and
@@ -1572,14 +1580,24 @@ async def _heartbeat_loop(relay: RelayClient, pairing,
                 scan = _maybe_scan_models(relay, pairing, resp, scan)
                 refresh = _maybe_refresh_object_info(
                     relay, comfy, pairing, resp, refresh)
-                beat_after = _idle_sleep_hint(hdrs) or HEARTBEAT_INTERVAL
+                # ⚠️ cap 传 MAX_IDLE_BEAT,不是默认的 MAX_IDLE_SLEEP —— 后者是给
+                # claim 那一觉用的紧上限,套在心跳上会把中继调深的值静默夹回去。
+                beat_after = _idle_sleep_hint(hdrs, MAX_IDLE_BEAT) or HEARTBEAT_INTERVAL
             # ⭐ 采集**排在发送之后**,于是它有整整一个 sleep 周期(~25s)可以慢慢做完,
             # 而这一拍的耗时一秒都不受它影响。它同样是纯 dispatch:create_task,不 await。
             # ⛔ 位置很关键:挪到 relay.heartbeat 之前,就等于把一个可能 hang 住的本地
             # HTTP 请求塞进了心跳的关键路径。
             probe.kick()
-            # ⭐ 可打断的 sleep:退避态下这一觉可能有一分钟,关插件的时候不该干等它睡完。
-            await _sleep_or_stop(beat_after, stop)
+            # ⭐ 只有**确实在退避**(节奏被放慢了)时才接受 claim 那边的叫醒。
+            # ⛔ 常态节奏下也响应的话,心跳会被每一轮空闲 claim 叫起来,反而更密
+            # —— claim 是无条件置位的,判断留在这一侧(只有这里知道自己睡多深)。
+            waker = wake if beat_after > HEARTBEAT_INTERVAL else None
+            if waker is not None:
+                # 刚打完的这一拍已经把下行信号取回来了 ⇒ 之前的置位算已服务,
+                # 清掉它,好让这一觉只被**之后**发生的事叫醒。
+                waker.clear()
+            # 可打断的 sleep:退避态下这一觉可能有几分钟,关插件时不该干等它睡完。
+            await _sleep_or_stop(beat_after, stop, wake=waker)
     finally:
         # All three are this loop's children; when the pairing is torn down (unpair,
         # reconnect, shutdown) they must go with it rather than linger holding the
@@ -1839,7 +1857,8 @@ async def _announce_object_info(relay: RelayClient, pairing) -> None:
 
 async def _claim_loop(relay: RelayClient, worker: Worker, pairing,
                       job_lock: asyncio.Lock, stop: asyncio.Event | None,
-                      blocked: Optional[_TooOldLatch] = None) -> None:
+                      blocked: Optional[_TooOldLatch] = None,
+                      wake_beat: Optional[asyncio.Event] = None) -> None:
     bid = pairing.backend_id
     log.info("listening for jobs on backend %s (idle until one arrives)", bid)
     while not _stopped(stop) and STATE.get_pairing(bid) is not None:
@@ -1854,9 +1873,10 @@ async def _claim_loop(relay: RelayClient, worker: Worker, pairing,
         if blocked is not None:
             blocked.check()  # raises _PluginTooOld → _serve_pairing's handler
         try:
-            # stop 传下去有两个作用:claim 自己在拿到退避建议时会睡一会儿(空闲退避),
-            # 而这一觉必须能被停止信号叫醒。
-            job = await relay.claim(bid, stop=stop)
+            # 两个 event 各管一个方向:stop 让 claim 自己那一觉能被叫醒(退避时它会
+            # 睡一会儿);wake_beat 是反方向 —— 中继不再建议退避时由 claim 置位,
+            # 把可能正睡到几分钟一拍的心跳叫起来(它是下行信号的唯一通道)。
+            job = await relay.claim(bid, stop=stop, wake_beat=wake_beat)
         except RelayError as e:
             # Same discrimination as _register: a "plugin_too_old" 403 is a
             # version block, NOT an auth rejection, so it must never become a

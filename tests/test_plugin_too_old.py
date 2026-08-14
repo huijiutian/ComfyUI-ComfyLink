@@ -350,7 +350,7 @@ class TestServePairingNeverUnpairs(_ServeHarness, unittest.IsolatedAsyncioTestCa
 
         relay.register.side_effect = register
 
-        def claim(backend_id, stop=None):
+        def claim(backend_id, stop=None, wake_beat=None):
             stop.set()
             return None  # 204-style: no job; both loops then exit cleanly
 
@@ -409,7 +409,7 @@ class TestHeartbeatBlockStopsClaiming(_ServeHarness,
 
         relay.register.side_effect = register
 
-        async def claim(backend_id, stop=None):
+        async def claim(backend_id, stop=None, wake_beat=None):
             # Stand in for the ~28s long-poll: return only once the heartbeat has
             # been refused, i.e. this is the LAST claim before the latch bites.
             await beat.wait()
@@ -455,7 +455,7 @@ class TestHeartbeatBlockStopsClaiming(_ServeHarness,
 
         claims = {"n": 0}
 
-        async def claim(backend_id, stop=None):
+        async def claim(backend_id, stop=None, wake_beat=None):
             claims["n"] += 1
             await _real_sleep(0)
             if claims["n"] >= 3:
@@ -498,7 +498,7 @@ class TestHeartbeatBlockStopsClaiming(_ServeHarness,
 
         claims = {"n": 0}
 
-        async def claim(backend_id, stop=None):
+        async def claim(backend_id, stop=None, wake_beat=None):
             claims["n"] += 1
             if claims["n"] == 1:
                 await beat.wait()  # last claim before the latch bites

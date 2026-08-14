@@ -28,9 +28,20 @@ CLAIM_TIMEOUT = aiohttp.ClientTimeout(total=45)
 IDLE_SLEEP_HEADER = "X-ComfyLink-Idle-Sleep"
 
 # ⛔ 本地保险丝。中继侧自己有上界,但那是**另一个进程里的假设**:万一它下发一个
-# 离谱的值,用户的机器就那么久不领任务了。⇒ 上界留一份在自己这边,取「用户点了生成
-# 最坏能忍多久」的量级,而不是去猜中继的配置。
+# 离谱的值,用户的机器就那么久不干活了。⇒ 上界留一份在自己这边。
+#
+# ⚠️ **两个用途要两个上限,别共用一个** —— 它们约束的是完全不同的东西:
+#
+#   MAX_IDLE_SLEEP  claim 之间的那一觉 ⇒ 决定「一个新任务最坏多久才开始跑」。
+#                   取「用户点了生成能忍多久」的量级,必须紧。
+#   MAX_IDLE_BEAT   心跳间隔 ⇒ 决定「下行信号最坏多久到」。**有叫醒线兜着**
+#                   (用户一回来 claim 会把心跳叫起来,见 claim 的 wake_beat),
+#                   所以可以松得多。
+#
+# ⭐ 这两个曾经是同一个常量,后果是**中继把心跳退避调深根本不生效**、还没有任何
+# 症状(下发 180 被本地夹回 120)。tests/test_idle_backoff.py 有一条钉着它们不同。
 MAX_IDLE_SLEEP = 120
+MAX_IDLE_BEAT = 600
 DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 # progress(wait=True) 也是服务端持有的长轮询:中继会把请求挂起最多 ~25s 等取消。
@@ -553,7 +564,8 @@ class RelayClient:
         return int(d.get("abandoned", 0))
 
     async def claim(self, backend_id: str,
-                    stop: Optional[asyncio.Event] = None) -> Optional[dict]:
+                    stop: Optional[asyncio.Event] = None,
+                    wake_beat: Optional[asyncio.Event] = None) -> Optional[dict]:
         """Long-poll for a job. Returns the job, or None on a 204 timeout.
 
         **空闲退避**:204 的响应头里可能带一个 ``X-ComfyLink-Idle-Sleep`` —— 中继
@@ -572,6 +584,12 @@ class RelayClient:
         一小时不领任务了。保险丝要留在自己这边。
 
         ``stop`` 传进来是为了让这一觉**可以被叫醒**:关插件的时候不该干等它睡完。
+
+        ``wake_beat`` 是**反方向**的那条线:中继**不再**建议退避(用户回来了,或者这台
+        机器有活儿了)时,把它置位,好让**可能正睡到几分钟一拍的心跳**立刻起来打一拍。
+        ⭐ 心跳是下行信号(「刷新 LoRA / 重报 object_info」)的唯一通道,而它自己睡着
+        时没人能叫它 —— 于是由 claim 代劳:claim 一直保持着较短的周期,用户一回来,
+        它总是先知道的那一个。有了这条线,心跳才敢退得更深。
         """
         hint = 0
         async with self._session.get(
@@ -587,6 +605,11 @@ class RelayClient:
         # ↑ 连接已归还,再睡。
         if hint:
             await _sleep_or_stop(hint, stop)
+        elif wake_beat is not None:
+            # 没有建议 = 该恢复常态了。⚠️ 这里**每一轮空闲 claim 都会置位**,所以
+            # 「该不该被它叫醒」的判断留在心跳那边(只有它自己知道有没有在退避)——
+            # 常态节奏下响应这个信号只会让心跳变密,那是反效果。
+            wake_beat.set()
         return None
 
     async def progress(self, job_id: str, status: str, value: int, maximum: int,
@@ -711,8 +734,11 @@ def _error_payload(body: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _idle_sleep_hint(headers) -> int:
-    """从 204 的响应头里读中继的退避建议,返回秒数;**任何说不准的情况一律返回 0**。
+def _idle_sleep_hint(headers, cap: int = MAX_IDLE_SLEEP) -> int:
+    """从响应头里读中继的退避建议,返回秒数;**任何说不准的情况一律返回 0**。
+
+    ``cap`` 是本地保险丝,按用途给:claim 那一觉用默认的 MAX_IDLE_SLEEP,心跳间隔
+    传 MAX_IDLE_BEAT(见那两个常量上面的注释 —— 共用一个会让中继调不动心跳)。
 
     0 = 没有建议 = 照旧立刻重来,也就是这个功能上线之前的行为。⛔ 这条「不确定就
     回 0」的纪律是整个机制的安全侧:少省一点流量只是钱,睡过头是用户点了生成却干等。
@@ -744,13 +770,19 @@ def _idle_sleep_hint(headers) -> int:
         return 0
     if n <= 0:
         return 0
-    return min(n, MAX_IDLE_SLEEP)
+    return min(n, cap)
 
 
-async def _sleep_or_stop(seconds: int, stop: Optional[asyncio.Event]) -> None:
-    """睡 ``seconds`` 秒,但 ``stop`` 一被置位就立刻醒 —— 关插件时不该干等它睡完。
+async def _sleep_or_stop(seconds: int, stop: Optional[asyncio.Event],
+                         wake: Optional[asyncio.Event] = None) -> None:
+    """睡 ``seconds`` 秒,但 ``stop``(或 ``wake``)一被置位就立刻醒。
 
-    ``stop`` 为 None(测试/独立调用)时退化成普通 sleep。
+    * ``stop`` —— 关插件时不该干等它睡完。
+    * ``wake`` —— 「有事了,别睡了」。心跳退避到几分钟一拍之后,唤醒它的通道就是
+      claim(见 RelayClient.claim):用户一回来,claim 那边先知道,由它把心跳叫起来
+      去取下行信号,而不是让用户干等一个退避周期。
+
+    两者都为 None(测试/独立调用)时退化成普通 sleep。
 
     ⛔ **必须走 asyncio.sleep,不能用 wait_for(stop.wait(), timeout=…)。** 两者行为
     等价,但测试是靠 patch 掉 ``asyncio.sleep`` 来让这些循环飞转的(见
@@ -758,18 +790,19 @@ async def _sleep_or_stop(seconds: int, stop: Optional[asyncio.Event]) -> None:
     wait_for 的超时走的是事件循环的定时器,patch 不到它,于是整套测试会真的按秒睡,
     挂到超时。⭐ 这不只是测试的方便:**能被换掉的等待**是这类循环可测的前提。
     """
-    if stop is None:
+    events = [e for e in (stop, wake) if e is not None]
+    if not events:
         await asyncio.sleep(seconds)
         return
-    napping = asyncio.ensure_future(asyncio.sleep(seconds))
-    waking = asyncio.ensure_future(stop.wait())
+    pending = {asyncio.ensure_future(asyncio.sleep(seconds))}
+    pending |= {asyncio.ensure_future(e.wait()) for e in events}
     try:
-        await asyncio.wait({napping, waking}, return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
     finally:
-        # 谁先醒都要把另一个收掉,否则会留下一个挂着的 task(以及一条
+        # 谁先醒都要把其余的收掉,否则会留下挂着的 task(以及一条
         # "Task was destroyed but it is pending" 的噪音)。
-        napping.cancel()
-        waking.cancel()
+        for t in pending:
+            t.cancel()
 
 
 async def _check(r: aiohttp.ClientResponse) -> None:

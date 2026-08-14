@@ -203,7 +203,7 @@ class TestRevokeStrikes(unittest.IsolatedAsyncioTestCase):
         # claim loop and then the serve loop exit cleanly.
         claim_calls = {"n": 0}
 
-        def claim(backend_id, stop=None):
+        def claim(backend_id, stop=None, wake_beat=None):
             # Sync side_effect (see register_401): first call → lone 401, second →
             # stop + no job so the claim loop then the serve loop exit cleanly.
             claim_calls["n"] += 1
