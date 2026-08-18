@@ -205,7 +205,9 @@ function buildPanel(root) {
       "border-radius:4px;padding:6px;margin:8px 0;",
   });
   const wfStatus = h("div", {
-    style: "min-height:16px;margin-bottom:8px;color:var(--descrip-text,#aaa);font-size:12px;",
+    style:
+      "min-height:16px;margin-bottom:8px;color:var(--descrip-text,#aaa);" +
+      "font-size:12px;white-space:pre-line;line-height:1.5;",
   });
   const uploadBtn = h("button", {
     textContent: "Upload / update selected",
@@ -663,17 +665,29 @@ function buildPanel(root) {
     wfStatus.style.color = "var(--descrip-text,#aaa)";
     wfStatus.textContent = `Uploading ${paths.length}…`;
     try {
-      const { uploaded, errors, accounts } = await uploadSelected(paths, backendIds);
+      const { uploaded, errors, warnings, accounts } =
+        await uploadSelected(paths, backendIds);
       // Number of accounts that actually synced OK (fall back to requested set).
       const n = (accounts && accounts.length) || backendIds.length;
-      if (errors.length) {
-        wfStatus.style.color = "#ff9800";
-        const failed = errors.map((e) => nameFromPath(e.path)).join(", ");
-        wfStatus.textContent = `Uploaded ${uploaded} to ${n} account(s); ${errors.length} failed: ${failed}`;
-      } else {
-        wfStatus.style.color = "#4caf50";
-        wfStatus.textContent = `Uploaded ${uploaded} workflow(s) to ${n} account(s).`;
+      // One line per problem. Naming the workflow was never enough — the reason
+      // is what tells the user whether to install something, fix a link, or
+      // ignore it.
+      const lines = [`Uploaded ${uploaded} workflow(s) to ${n} account(s).`];
+      for (const e of errors || []) {
+        lines.push(`✗ ${nameFromPath(e.path)} — ${e.error}`);
       }
+      for (const w of warnings || []) {
+        lines.push(
+          `⚠ ${nameFromPath(w.path)} — uploaded without: ${w.dropped.join(", ")}` +
+            ` (not installed here)`
+        );
+      }
+      wfStatus.style.color = errors.length
+        ? "#ff9800"
+        : (warnings || []).length
+          ? "#ffc107"
+          : "#4caf50";
+      wfStatus.textContent = lines.join("\n");
       // Reflect new "uploaded" tags / checkboxes.
       await loadWorkflows();
     } catch (e) {
