@@ -600,7 +600,17 @@ class RelayClient:
         ) as r:
             if r.status != 204:
                 await _check(r)
-                return await r.json()
+                job = await r.json()
+                # ⭐ 领到活儿是「用户回来了」**最强**的信号,比下面那个「没有退避
+                # 建议」还强 —— 漏掉它会留一个很难看的缝:空闲很久之后用户一打开
+                # App 就提交,claim 直接返回 200,而心跳可能正睡在几分钟一拍上;
+                # job 就在这个循环里内联跑,跑完之前不会再有 claim 去叫醒它。
+                # ⛔ 而 UpdateProgress 只动 jobs 表、不刷 backends.last_seen ⇒
+                # 出图期间 App 上这台机器会显示**离线**,恰是心跳退避那条
+                # HasActiveJob 守卫要防的画面(守卫要等下一拍心跳才生效)。
+                if wake_beat is not None:
+                    wake_beat.set()
+                return job
             hint = _idle_sleep_hint(r.headers)
         # ↑ 连接已归还,再睡。
         if hint:

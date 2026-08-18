@@ -130,6 +130,66 @@ class TestSleepOrStop(unittest.IsolatedAsyncioTestCase):
         slept.assert_awaited_once_with(42)
 
 
+class _FakeResponse:
+    """够 RelayClient.claim 用的最小响应假件。"""
+
+    def __init__(self, status, headers=None, payload=None):
+        self.status = status
+        self.headers = headers or {}
+        self._payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_a):
+        return False
+
+    async def json(self):
+        return self._payload
+
+
+class TestClaimWakesTheBeat(unittest.IsolatedAsyncioTestCase):
+    """claim 这段粘合层原先没有任何用例直接执行 —— 而它坏掉的症状恰恰是
+    「零报错、流量一分不省 / 心跳永远叫不醒」。这里用一个响应假件把它跑起来。"""
+
+    def _client(self, resp):
+        from comfylink.relay import RelayClient
+
+        c = RelayClient.__new__(RelayClient)
+        c._base = "http://relay.test"
+        c._session = mock.Mock()
+        c._session.get = mock.Mock(return_value=resp)
+
+        async def _headers():
+            return {}
+
+        c._headers = _headers
+        return c
+
+    async def test_claiming_a_job_wakes_the_beat(self):
+        """⛔ 领到活儿是「用户回来了」最强的信号 —— 漏掉它,出图期间 App 上这台
+        机器会显示离线(UpdateProgress 不刷 last_seen,心跳又睡在几分钟一拍上)。"""
+        wake = asyncio.Event()
+        c = self._client(_FakeResponse(200, payload={"id": "j1"}))
+        job = await c.claim("b1", wake_beat=wake)
+        self.assertEqual(job, {"id": "j1"})
+        self.assertTrue(wake.is_set(), "领到 job 却没叫醒心跳")
+
+    async def test_idle_without_advice_also_wakes_the_beat(self):
+        wake = asyncio.Event()
+        c = self._client(_FakeResponse(204))
+        self.assertIsNone(await c.claim("b1", wake_beat=wake))
+        self.assertTrue(wake.is_set())
+
+    async def test_advice_makes_it_sleep_and_not_wake(self):
+        wake = asyncio.Event()
+        c = self._client(_FakeResponse(204, headers={"X-Comfylink-Idle-Sleep": "17"}))
+        with mock.patch.object(asyncio, "sleep", mock.AsyncMock()) as slept:
+            self.assertIsNone(await c.claim("b1", wake_beat=wake))
+        slept.assert_awaited_once_with(17)
+        self.assertFalse(wake.is_set(), "建议退避时不该叫醒心跳")
+
+
 class _FakeState:
     """够 _heartbeat_loop 用的最小 STATE(它只问「这个配对还在不在」)。"""
 
