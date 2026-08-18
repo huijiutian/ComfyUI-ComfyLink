@@ -422,7 +422,21 @@ export async function uploadSelected(paths, backendIds) {
       // throwing, but comes out with no class_type — the blob uploads "fine"
       // and only breaks later, in the app. Counting them here is the whole
       // point of this table.
-      diag.noClassType = nodes.filter((n) => !n || !n.class_type).length;
+      const badIds = Object.keys(output).filter(
+        (k) => !output[k] || !output[k].class_type
+      );
+      diag.noClassType = badIds.length;
+      if (badIds.length) {
+        // Name them. A count alone can't tell you WHICH node type is missing,
+        // and that is the only thing that leads to a fix. Ids that carry a ":"
+        // come from inside a subgraph; the rest are looked up in the saved graph.
+        const typeById = new Map(
+          ((ui && ui.nodes) || []).map((n) => [String(n.id), n.type])
+        );
+        diag.badNodes = badIds
+          .map((k) => k + "=" + (typeById.get(k) || (k.includes(":") ? "<in subgraph>" : "?")))
+          .join(", ");
+      }
       workflows.push({
         id,
         path,
