@@ -190,7 +190,12 @@ export async function convertUiToApi(ui, diag) {
     snapshot = null;
   }
   try {
-    app.loadGraphData(ui);
+    // ⛔ MUST be awaited: loadGraphData is async. Without the await we call
+    // graphToPrompt() while the graph is still being (re)built, so it converts
+    // an empty canvas and every fallback ends as "empty conversion output" —
+    // i.e. the fallback never actually worked, and any workflow whose primary
+    // path failed was guaranteed to fail here too.
+    await app.loadGraphData(ui);
     const { output } = await app.graphToPrompt();
     if (!output || Object.keys(output).length === 0) {
       note("fallback", "empty output");
@@ -203,7 +208,10 @@ export async function convertUiToApi(ui, diag) {
     // graph form that loadGraphData expects.
     try {
       if (snapshot && snapshot.workflow) {
-        app.loadGraphData(snapshot.workflow);
+        // Awaited for the same reason, plus one of its own: this runs inside a
+        // loop over several workflows. An un-awaited restore is still rebuilding
+        // the canvas when the NEXT workflow starts converting on it.
+        await app.loadGraphData(snapshot.workflow);
       }
     } catch (e) {
       console.warn("[ComfyLink] failed to restore canvas after fallback", e);
