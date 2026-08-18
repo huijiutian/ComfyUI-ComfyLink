@@ -219,6 +219,50 @@ export async function convertUiToApi(ui, diag) {
   }
 }
 
+// Drop nodes the conversion could not resolve, and clean up the links into
+// them. Returns the dropped node types (for the panel to report).
+//
+// WHY this is needed at all: a node type that is not registered in this ComfyUI
+// (its custom-node pack isn't installed) still converts WITHOUT throwing — it
+// just comes out with no `class_type`. JSON.stringify then drops that key
+// entirely, so the blob uploads "fine" and the app rejects the WHOLE workflow
+// on parse ("a node is missing class_type"). One unusable node therefore cost
+// the user the entire workflow.
+//
+// In practice these are usually UI-only helpers (group bypassers, notes, labels)
+// that the user has already bypassed and does not need — so dropping them and
+// keeping the workflow is much closer to what they want than refusing it.
+//
+// ⚠️ It is NOT free: if a dropped node sat in the middle of the graph, its
+// downstream loses an input and the render may fail server-side. That is why
+// the caller reports every drop instead of doing it silently.
+export function dropUnusableNodes(output, ui) {
+  const dropped = [];
+  const typeById = new Map(
+    ((ui && ui.nodes) || []).map((n) => [String(n.id), n.type])
+  );
+  for (const id of Object.keys(output)) {
+    const node = output[id];
+    if (node && node.class_type) continue;
+    dropped.push(
+      typeById.get(id) || (id.includes(":") ? "(node inside a subgraph)" : id)
+    );
+    delete output[id];
+  }
+  if (dropped.length) {
+    // Same cleanup graphToPrompt does for its own removals: an input pointing at
+    // a node that no longer exists would be an invalid link.
+    for (const node of Object.values(output)) {
+      for (const [name, input] of Object.entries(node.inputs || {})) {
+        if (Array.isArray(input) && input.length === 2 && !output[input[0]]) {
+          delete node.inputs[name];
+        }
+      }
+    }
+  }
+  return dropped;
+}
+
 // ---- capability / pairing / transport ------------------------------------
 
 // Returns true if the environment can sync; logs a warn + returns false if a
@@ -384,6 +428,7 @@ export async function uploadSelected(paths, backendIds) {
   const blobs = {}; // id -> API prompt, only for the ones that converted
   const errors = []; // [{ path, error }] for read/convert failures
   const diags = []; // one row per selected workflow, printed as a table below
+  const warnings = []; // [{ path, dropped:[type] }] uploaded, but with nodes removed
   const now = new Date().toISOString(); // upload time, stamped on ready entries
 
   for (const path of selected) {
@@ -414,29 +459,20 @@ export async function uploadSelected(paths, backendIds) {
     diags.push(diag);
     try {
       const output = await convertUiToApi(ui, diag);
+      // Keep the workflow usable even when a node type isn't installed here:
+      // drop what cannot run and report it, rather than shipping a blob the app
+      // will reject wholesale. See dropUnusableNodes.
+      const dropped = dropUnusableNodes(output, ui);
+      if (dropped.length) warnings.push({ path, dropped });
       blobs[id] = output;
       const nodes = Object.values(output);
       diag.status = "ready";
+      diag.dropped = dropped.join(", ");
       diag.nodes = nodes.length;
       // A node whose type is not registered in this ComfyUI converts WITHOUT
       // throwing, but comes out with no class_type — the blob uploads "fine"
       // and only breaks later, in the app. Counting them here is the whole
       // point of this table.
-      const badIds = Object.keys(output).filter(
-        (k) => !output[k] || !output[k].class_type
-      );
-      diag.noClassType = badIds.length;
-      if (badIds.length) {
-        // Name them. A count alone can't tell you WHICH node type is missing,
-        // and that is the only thing that leads to a fix. Ids that carry a ":"
-        // come from inside a subgraph; the rest are looked up in the saved graph.
-        const typeById = new Map(
-          ((ui && ui.nodes) || []).map((n) => [String(n.id), n.type])
-        );
-        diag.badNodes = badIds
-          .map((k) => k + "=" + (typeById.get(k) || (k.includes(":") ? "<in subgraph>" : "?")))
-          .join(", ");
-      }
       workflows.push({
         id,
         path,
@@ -496,6 +532,7 @@ export async function uploadSelected(paths, backendIds) {
   return {
     uploaded: Object.keys(blobs).length,
     errors,
+    warnings,
     accounts,
   };
 }
