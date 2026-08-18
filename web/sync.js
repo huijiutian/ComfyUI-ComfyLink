@@ -140,6 +140,11 @@ function uploadedIndex(manifest) {
   return map;
 }
 
+// Bumped whenever this file's behaviour changes. Printed with the diagnostics
+// so a stale copy still held by an open tab is obvious at a glance — otherwise
+// "it didn't work" and "you're running the old file" look identical.
+const SYNC_BUILD = "2026-08-18c";
+
 // ---- conversion ----------------------------------------------------------
 
 // Convert one UI graph JSON to the API prompt.
@@ -494,7 +499,9 @@ export async function uploadSelected(paths, backendIds) {
   // Diagnostic summary. Printed as a table so a user reporting a problem can
   // hand over one screenshot instead of digging through scattered warnings.
   try {
-    console.log("[ComfyLink] ---- workflow sync diagnostics ----");
+    console.log(
+      "[ComfyLink] ---- workflow sync diagnostics (build " + SYNC_BUILD + ") ----"
+    );
     console.table(diags);
   } catch (e) {
     console.log("[ComfyLink] diagnostics", diags);
