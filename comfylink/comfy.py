@@ -1,7 +1,6 @@
 """Async client for the LOCAL ComfyUI HTTP API (localhost).
 
-This is the same public API the mobile app's DirectConnection uses — the plugin
-just drives it locally, headless, on behalf of a relay job. We deliberately
+The plugin drives it locally, headless, on behalf of a relay job. We deliberately
 drive it over the STABLE REST endpoints only (/prompt, /history, /queue,
 /interrupt, /view): the websocket message format drifts across ComfyUI
 releases, while these REST shapes have been stable for years, so the worker
