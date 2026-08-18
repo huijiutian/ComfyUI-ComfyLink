@@ -151,20 +151,32 @@ function uploadedIndex(manifest) {
 // graph, app.loadGraphData(ui), graphToPrompt(), then RESTORE the snapshot in
 // a finally so the user's canvas is always put back. Used ONLY if the offscreen
 // path throws or yields empty output.
-export async function convertUiToApi(ui) {
+export async function convertUiToApi(ui, diag) {
+  // `diag` (optional) collects WHICH path ran and why the primary one was
+  // abandoned. Without it the primary failure is swallowed into a console.warn
+  // and the caller only ever sees the fallback's symptom, which makes a report
+  // like "some workflows fail to update" impossible to act on.
+  const note = (k, v) => {
+    if (diag) diag[k] = v;
+  };
   // --- primary: offscreen ---
   try {
     const LG = (typeof LiteGraph !== "undefined" && LiteGraph) || window.LiteGraph;
-    if (LG && typeof LG.LGraph === "function") {
+    if (!LG || typeof LG.LGraph !== "function") {
+      note("primary", "skipped: LiteGraph.LGraph unavailable");
+    } else {
       const g = new LG.LGraph();
       g.configure(ui);
       const { output } = await app.graphToPrompt(g);
       if (output && Object.keys(output).length > 0) {
+        note("primary", "ok");
         return output;
       }
+      note("primary", "empty output");
       // empty output -> fall through to fallback
     }
   } catch (e) {
+    note("primary", "threw: " + String((e && e.stack) || (e && e.message) || e));
     // swallow and try fallback
     console.warn("[ComfyLink] offscreen conversion failed, trying fallback", e);
   }
@@ -181,8 +193,10 @@ export async function convertUiToApi(ui) {
     app.loadGraphData(ui);
     const { output } = await app.graphToPrompt();
     if (!output || Object.keys(output).length === 0) {
+      note("fallback", "empty output");
       throw new Error("empty conversion output");
     }
+    note("fallback", "ok");
     return output;
   } finally {
     // Restore the user's canvas no matter what. snapshot.workflow is the UI
@@ -361,6 +375,7 @@ export async function uploadSelected(paths, backendIds) {
   const workflows = []; // manifest entries (ONLY the selected workflows)
   const blobs = {}; // id -> API prompt, only for the ones that converted
   const errors = []; // [{ path, error }] for read/convert failures
+  const diags = []; // one row per selected workflow, printed as a table below
   const now = new Date().toISOString(); // upload time, stamped on ready entries
 
   for (const path of selected) {
@@ -379,13 +394,27 @@ export async function uploadSelected(paths, backendIds) {
       const error = "failed to read file";
       workflows.push({ id, path, name, fingerprint, status: "error", error });
       errors.push({ path, error });
+      diags.push({ path, status: "error", error });
       continue;
     }
 
     // 2. Convert UI graph -> API prompt (offscreen, with live-graph fallback).
+    const diag = {
+      path,
+      subgraphs: (((ui && ui.definitions) || {}).subgraphs || []).length,
+    };
+    diags.push(diag);
     try {
-      const output = await convertUiToApi(ui);
+      const output = await convertUiToApi(ui, diag);
       blobs[id] = output;
+      const nodes = Object.values(output);
+      diag.status = "ready";
+      diag.nodes = nodes.length;
+      // A node whose type is not registered in this ComfyUI converts WITHOUT
+      // throwing, but comes out with no class_type — the blob uploads "fine"
+      // and only breaks later, in the app. Counting them here is the whole
+      // point of this table.
+      diag.noClassType = nodes.filter((n) => !n || !n.class_type).length;
       workflows.push({
         id,
         path,
@@ -397,9 +426,20 @@ export async function uploadSelected(paths, backendIds) {
       });
     } catch (e) {
       const error = String((e && e.message) || e);
+      diag.status = "error";
+      diag.error = error;
       workflows.push({ id, path, name, fingerprint, status: "error", error });
       errors.push({ path, error });
     }
+  }
+
+  // Diagnostic summary. Printed as a table so a user reporting a problem can
+  // hand over one screenshot instead of digging through scattered warnings.
+  try {
+    console.log("[ComfyLink] ---- workflow sync diagnostics ----");
+    console.table(diags);
+  } catch (e) {
+    console.log("[ComfyLink] diagnostics", diags);
   }
 
   // 3. Assemble the manifest (selected items only) and POST to Python.
