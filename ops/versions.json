@@ -7,7 +7,7 @@
     "remind": "(plugin only) whether the App shows its soft 'plugin update available' reminder. Default off — flip to true by hand only when there is a substantive plugin change worth nudging users about. Keep 'latest' at the real newest version regardless; 'min' (the hard block) is never affected by this switch"
   },
   "plugin": {
-    "latest": "0.2.4",
+    "latest": "0.2.5",
     "min": "0.0.0",
     "url": "https://github.com/huijiutian/ComfyUI-ComfyLink",
     "remind": true
